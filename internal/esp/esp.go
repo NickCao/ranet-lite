@@ -10,6 +10,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
 )
@@ -22,12 +23,21 @@ const (
 )
 
 // OutboundSA encrypts packets for the direction this client originates.
+// Seal is called concurrently by design — babel's Hello/IHU timer and its
+// Update timer run as independent goroutines, and both send through the
+// same peer's OutboundSA — so seq/IV assignment and the actual socket
+// write must be serialized under mu, or two packets can race onto the
+// wire out of sequence-number order (observed in practice) or, worse,
+// collide on the same seq/IV, which for AES-GCM breaks confidentiality
+// and authentication outright.
 type OutboundSA struct {
 	aead   cipher.AEAD
 	params ike.ESPAEADParams
 	salt   []byte
 	spi    uint32
-	seq    uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
+
+	mu  sync.Mutex
+	seq uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 }
 
 // InboundSA decrypts packets sent to this client's SPI.
@@ -66,6 +76,9 @@ func NewInbound(child ike.ChildSA) (*InboundSA, error) {
 // Seal wraps one tunnel-mode IP packet (nextHeader identifies its version,
 // NextHeaderIPv4/IPv6) into a full ESP packet ready for UDP encapsulation.
 func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	o.seq++
 	if o.seq > 0xffffffff {
 		// No ESN, no rekey in this minimal client: once the 32-bit sequence
