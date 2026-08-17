@@ -111,7 +111,7 @@ func main() {
 	mesh.Routes.Set(netip.PrefixFrom(peerAddr, 32), peer)
 
 	// Inbound pump: decrypt whatever arrives on the ESP channel and inject
-	// it into the stack — this is the loop cmd/ranet-client will run per peer.
+	// it into the stack — this is the loop cmd/ranet-lite will run per peer.
 	go func() {
 		for {
 			pkt, err := sess.Mux().RecvESP()

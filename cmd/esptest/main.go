@@ -136,7 +136,7 @@ func main() {
 	}
 
 	src, dst := net.ParseIP(*localAddr), net.ParseIP(*remoteAddr)
-	icmpPkt := buildICMPEcho(src, dst, 0x1234, 1, []byte("ranet-client esp interop test"))
+	icmpPkt := buildICMPEcho(src, dst, 0x1234, 1, []byte("ranet-lite esp interop test"))
 	espPkt, err := out.Seal(icmpPkt, esp.NextHeaderIPv4)
 	if err != nil {
 		log.Fatal(err)
