@@ -1,0 +1,35 @@
+# Example ranet-lite config. See internal/config/config.go for the full
+# schema and defaults, and internal/registry/testdata/registry.json for a
+# worked example of the registry.json this points at.
+
+# Identity: must match an entry for this org/node/serial in the registry
+# below, and private_key must be that organization's shared Ed25519 key.
+organization: example
+common_name: my-laptop
+serial_number: "0"
+
+private_key: /etc/ranet-lite/key.pem      # PKCS8 PEM Ed25519 private key
+registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
+
+socks5_listen: "127.0.0.1:1080"
+
+# Address assigned to the local gvisor stack — used as the source address
+# for outbound connections proxied in through SOCKS5. Distinct from
+# `originate` below.
+source_address: "10.66.0.5"
+
+# Prefixes this node announces via babel as reachable through itself
+# (e.g. its own tunnel address). Leave empty if this node only consumes
+# routes and never originates any.
+originate:
+  - "10.66.0.5/32"
+
+# One or more existing mesh nodes to dial as IKEv2/babel peers.
+peers:
+  - organization: example       # optional, defaults to the top-level organization
+    common_name: gateway
+    serial_number: "0"          # optional, picks a specific endpoint if the node has several
+
+babel:
+  hello_interval: 20s
+  update_interval: 80s
