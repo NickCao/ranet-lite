@@ -11,13 +11,6 @@ serial_number: "0"
 private_key: /etc/ranet-lite/key.pem      # PKCS8 PEM Ed25519 private key
 registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 
-socks5_listen: "127.0.0.1:1080"
-
-# Address assigned to the local gvisor stack — used as the source address
-# for outbound connections proxied in through SOCKS5. Distinct from
-# `originate` below.
-source_address: "10.66.0.5"
-
 # Prefixes this node announces via babel as reachable through itself
 # (e.g. its own tunnel address). Leave empty if this node only consumes
 # routes and never originates any.
@@ -33,3 +26,9 @@ peers:
 babel:
   hello_interval: 20s
   update_interval: 80s
+
+# ranet-lite creates a TUN device (its name is logged on startup) but
+# never touches its address or routes itself — after starting it, assign
+# it an address and add whatever routes you want yourself, e.g.:
+#   ip addr add 10.66.0.5/32 dev ranet0
+#   ip route add ::/0 dev ranet0

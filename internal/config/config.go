@@ -24,15 +24,6 @@ type Config struct {
 	PrivateKey string `yaml:"private_key"` // path to a PKCS8 PEM Ed25519 key
 	Registry   string `yaml:"registry"`    // path to a ranet registry.json
 
-	SOCKS5Listen string `yaml:"socks5_listen"` // default "127.0.0.1:1080"
-
-	// SourceAddress is the address assigned to the mesh's gvisor stack,
-	// used as the source address for outbound connections SOCKS5 dials
-	// into the mesh. Distinct from Originate: a node might advertise
-	// prefixes it doesn't itself originate traffic from (transit), or
-	// need a source address without wanting babel to announce it.
-	SourceAddress string `yaml:"source_address"`
-
 	Originate []string `yaml:"originate"` // CIDR prefixes this node announces via babel
 
 	Peers []Peer `yaml:"peers"`
@@ -70,9 +61,6 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) setDefaults() {
-	if c.SOCKS5Listen == "" {
-		c.SOCKS5Listen = "127.0.0.1:1080"
-	}
 	for i := range c.Peers {
 		if c.Peers[i].Organization == "" {
 			c.Peers[i].Organization = c.Organization

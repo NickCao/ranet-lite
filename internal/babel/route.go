@@ -6,8 +6,18 @@ import (
 	"time"
 )
 
-// routeInfo is what we know about one candidate path to a prefix, learned
-// from a single neighbor's Update TLVs.
+// routeKey identifies one routing table entry: an ordinary route has an
+// invalid (zero-value) Source, matching any source address; a
+// source-specific (SADR) route has a real Source prefix and is tracked
+// completely independently from any ordinary route to the same
+// destination, exactly as draft-ietf-babel-source-specific requires.
+type routeKey struct {
+	source netip.Prefix
+	dest   netip.Prefix
+}
+
+// routeInfo is what we know about one candidate path to a routeKey,
+// learned from a single neighbor's Update TLVs.
 type routeInfo struct {
 	neighbor  *neighborState
 	routerID  [8]byte
@@ -45,10 +55,10 @@ func seqnoGT(a, b uint16) bool {
 	return int16(a-b) > 0
 }
 
-// prefixEntry tracks every known candidate route to a prefix plus which
-// one is currently selected/installed.
-type prefixEntry struct {
-	prefix   netip.Prefix
+// keyEntry tracks every known candidate route to a routeKey plus which one
+// is currently selected/installed.
+type keyEntry struct {
+	key      routeKey
 	routes   map[*neighborState]*routeInfo // one candidate per neighbor
 	selected *routeInfo
 }
@@ -58,23 +68,23 @@ type prefixEntry struct {
 // go through mu.
 type routeTable struct {
 	mu      sync.Mutex
-	entries map[netip.Prefix]*prefixEntry
+	entries map[routeKey]*keyEntry
 }
 
 func newRouteTable() *routeTable {
-	return &routeTable{entries: map[netip.Prefix]*prefixEntry{}}
+	return &routeTable{entries: map[routeKey]*keyEntry{}}
 }
 
 // update processes one received Update and reports whether the selected
-// route for this prefix changed (so the caller can push it to
+// route for this key changed (so the caller can push it to
 // netstack.RouteTable and re-advertise to other peers).
-func (rt *routeTable) update(n *neighborState, prefix netip.Prefix, routerID [8]byte, seqno, metric uint16, ttl time.Duration) (changed bool, sel *routeInfo) {
+func (rt *routeTable) update(n *neighborState, key routeKey, routerID [8]byte, seqno, metric uint16, ttl time.Duration) (changed bool, sel *routeInfo) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	pe, ok := rt.entries[prefix]
+	ke, ok := rt.entries[key]
 	if !ok {
-		pe = &prefixEntry{prefix: prefix, routes: map[*neighborState]*routeInfo{}}
-		rt.entries[prefix] = pe
+		ke = &keyEntry{key: key, routes: map[*neighborState]*routeInfo{}}
+		rt.entries[key] = ke
 	}
 
 	cost := metric
@@ -82,30 +92,30 @@ func (rt *routeTable) update(n *neighborState, prefix netip.Prefix, routerID [8]
 		cost = saturatingAdd(n.linkCost(), metric)
 	}
 	cand := &routeInfo{neighbor: n, routerID: routerID, seqno: seqno, rxMetric: metric, cost: cost, expiresAt: time.Now().Add(ttl)}
-	pe.routes[n] = cand
+	ke.routes[n] = cand
 
-	prevSelected := pe.selected
+	prevSelected := ke.selected
 	switch {
-	case pe.selected == nil || pe.selected.neighbor == n:
+	case ke.selected == nil || ke.selected.neighbor == n:
 		// Always accept a refresh/change from the currently selected
 		// neighbor (including retraction via MetricInfinity).
-		pe.selected = cand
-	case metric < MetricInfinity && feasible(cand, pe.selected) && cand.cost < pe.selected.cost:
-		pe.selected = cand
+		ke.selected = cand
+	case metric < MetricInfinity && feasible(cand, ke.selected) && cand.cost < ke.selected.cost:
+		ke.selected = cand
 	}
 
-	if pe.selected != nil && !pe.selected.reachable() {
-		pe.selected = pe.bestReachable()
+	if ke.selected != nil && !ke.selected.reachable() {
+		ke.selected = ke.bestReachable()
 	}
 
-	changed = prevSelected != pe.selected &&
-		(prevSelected == nil || pe.selected == nil || prevSelected.neighbor != pe.selected.neighbor || prevSelected.cost != pe.selected.cost)
-	return changed, pe.selected
+	changed = prevSelected != ke.selected &&
+		(prevSelected == nil || ke.selected == nil || prevSelected.neighbor != ke.selected.neighbor || prevSelected.cost != ke.selected.cost)
+	return changed, ke.selected
 }
 
-func (pe *prefixEntry) bestReachable() *routeInfo {
+func (ke *keyEntry) bestReachable() *routeInfo {
 	var best *routeInfo
-	for _, r := range pe.routes {
+	for _, r := range ke.routes {
 		if !r.reachable() {
 			continue
 		}
@@ -117,18 +127,18 @@ func (pe *prefixEntry) bestReachable() *routeInfo {
 }
 
 // expireNeighbor drops every route learned from a neighbor that just went
-// down, re-selecting a fallback route per prefix where one exists.
-func (rt *routeTable) expireNeighbor(n *neighborState) (changed []netip.Prefix) {
+// down, re-selecting a fallback route per key where one exists.
+func (rt *routeTable) expireNeighbor(n *neighborState) (changed []routeKey) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	for prefix, pe := range rt.entries {
-		if _, ok := pe.routes[n]; !ok {
+	for key, ke := range rt.entries {
+		if _, ok := ke.routes[n]; !ok {
 			continue
 		}
-		delete(pe.routes, n)
-		if pe.selected != nil && pe.selected.neighbor == n {
-			pe.selected = pe.bestReachable()
-			changed = append(changed, prefix)
+		delete(ke.routes, n)
+		if ke.selected != nil && ke.selected.neighbor == n {
+			ke.selected = ke.bestReachable()
+			changed = append(changed, key)
 		}
 	}
 	return changed
@@ -136,28 +146,27 @@ func (rt *routeTable) expireNeighbor(n *neighborState) (changed []netip.Prefix) 
 
 // sweepExpired re-evaluates every selected route's TTL — needed because
 // update() only re-checks reachability reactively, when a fresh Update for
-// that prefix arrives. A neighbor that stops sending updates entirely
-// (not just Hello) would otherwise never be noticed. install is called
-// with the new selected route (nil if the prefix is now unreachable) for
-// every prefix whose selection changed.
-func (rt *routeTable) sweepExpired(install func(prefix netip.Prefix, sel *routeInfo)) {
+// that key arrives. A neighbor that stops sending updates entirely (not
+// just Hello) would otherwise never be noticed. install is called with the
+// new selected route (nil if the key is now unreachable) for every key
+// whose selection changed.
+func (rt *routeTable) sweepExpired(install func(key routeKey, sel *routeInfo)) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	for prefix, pe := range rt.entries {
-		if pe.selected != nil && !pe.selected.reachable() {
-			pe.selected = pe.bestReachable()
-			install(prefix, pe.selected)
+	for key, ke := range rt.entries {
+		if ke.selected != nil && !ke.selected.reachable() {
+			ke.selected = ke.bestReachable()
+			install(key, ke.selected)
 		}
 	}
 }
 
-// selectedFor returns the currently selected route for prefix, if any.
-func (rt *routeTable) selectedFor(prefix netip.Prefix) *routeInfo {
+// selectedFor returns the currently selected route for key, if any.
+func (rt *routeTable) selectedFor(key routeKey) *routeInfo {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if pe := rt.entries[prefix]; pe != nil {
-		return pe.selected
+	if ke := rt.entries[key]; ke != nil {
+		return ke.selected
 	}
 	return nil
 }
-

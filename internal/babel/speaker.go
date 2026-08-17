@@ -3,6 +3,7 @@ package babel
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
@@ -102,16 +103,6 @@ type Config struct {
 	HelloInterval  time.Duration
 	UpdateInterval time.Duration
 	Cost           CostParams
-
-	// SourceAddress is this node's own outbound source address (the same
-	// one the mesh's netstack uses for SOCKS5-proxied connections). It's
-	// the only thing that makes a source-specific (SADR) route from a
-	// peer relevant to us: we don't implement a source-and-destination
-	// keyed route table, so we can't route differently per source, but we
-	// *can* tell whether a given source-specific route covers traffic we
-	// would actually originate. If invalid (the zero value), every
-	// source-specific route is treated as inapplicable and ignored.
-	SourceAddress netip.Addr
 }
 
 func randomLinkLocal() netip.Addr {
@@ -142,7 +133,10 @@ func (c *Config) setDefaults() {
 // Speaker is a minimal Babel router: it maintains Hello/IHU state with
 // each configured peer, exchanges Update TLVs, and keeps
 // internal/netstack.RouteTable in sync with the best known route per
-// prefix. It does not use the mesh's gvisor stack for its own wire I/O —
+// (source, destination) key — including genuine source-specific (SADR)
+// routes, installed directly rather than approximated, since the mesh's
+// TUN device sees every packet's real source and destination address
+// itself. It does not use the mesh's TUN device for its own wire I/O —
 // each peer is addressed directly via its netstack.Peer send function and
 // fed received packets directly by the caller's ESP receive loop (see
 // Receive) — only the routes it *learns* go into the shared RouteTable.
@@ -311,13 +305,17 @@ func (s *Speaker) updateLoop(ctx context.Context) {
 // change (fresh Update, periodic expiry sweep, neighbor going down) goes
 // through, so `grep 'babel: route'` on the log is a full account of what
 // this node has ever installed or retracted.
-func (s *Speaker) installRoute(prefix netip.Prefix, sel *routeInfo) {
+func (s *Speaker) installRoute(key routeKey, sel *routeInfo) {
+	desc := key.dest.String()
+	if key.source.IsValid() {
+		desc = fmt.Sprintf("%s from %s", key.dest, key.source)
+	}
 	if sel != nil && sel.reachable() {
-		s.mesh.Routes.Set(prefix, sel.neighbor.peer)
-		log.Printf("babel: route %s via %s (metric %d)", prefix, sel.neighbor.peer.ID, sel.cost)
+		s.mesh.Routes.Set(key.source, key.dest, sel.neighbor.peer)
+		log.Printf("babel: route %s via %s (metric %d)", desc, sel.neighbor.peer.ID, sel.cost)
 	} else {
-		s.mesh.Routes.Remove(prefix)
-		log.Printf("babel: route %s retracted", prefix)
+		s.mesh.Routes.Remove(key.source, key.dest)
+		log.Printf("babel: route %s retracted", desc)
 	}
 }
 
@@ -448,19 +446,6 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				// state above was still updated.
 				continue
 			}
-			if u.SourcePrefix.IsValid() {
-				// Source-specific (SADR) route. We don't implement a
-				// source-and-destination-keyed route table, so the only
-				// thing we can correctly do is check whether it covers
-				// traffic we'd actually originate: if our own source
-				// address falls inside SourcePrefix, install it as an
-				// ordinary route (it does apply to us); otherwise it's
-				// meant for other sources and must be ignored, not
-				// installed as if it covered everyone.
-				if !s.cfg.SourceAddress.IsValid() || !u.SourcePrefix.Contains(s.cfg.SourceAddress) {
-					continue
-				}
-			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
 			if !ok {
 				continue
@@ -477,10 +462,17 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				// that peer.
 				continue
 			}
+			// u.SourcePrefix is the zero value for an ordinary Update,
+			// which is exactly routeKey's "any source" sentinel — a
+			// genuine source-specific (SADR) route is tracked completely
+			// independently from any ordinary route to the same
+			// destination, and the mesh's route table resolves which one
+			// applies per-packet using each packet's real source address.
+			key := routeKey{source: u.SourcePrefix, dest: prefix}
 			ttl := time.Duration(u.Interval) * 10 * time.Millisecond * 7 / 2
-			changed, sel := s.routes.update(n, prefix, curRouterID, u.Seqno, u.Metric, ttl)
+			changed, sel := s.routes.update(n, key, curRouterID, u.Seqno, u.Metric, ttl)
 			if changed {
-				s.installRoute(prefix, sel)
+				s.installRoute(key, sel)
 				s.triggerUpdate()
 			}
 
@@ -499,8 +491,8 @@ func (s *Speaker) neighborDown(n *neighborState) {
 	n.alive = false
 	n.haveReportedCost = false
 	n.mu.Unlock()
-	for _, prefix := range s.routes.expireNeighbor(n) {
-		s.installRoute(prefix, s.routes.selectedFor(prefix))
+	for _, key := range s.routes.expireNeighbor(n) {
+		s.installRoute(key, s.routes.selectedFor(key))
 	}
 	s.mesh.Routes.RemovePeer(n.peer)
 	s.triggerUpdate()

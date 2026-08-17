@@ -65,6 +65,10 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 	extra := netip.MustParsePrefix("10.66.9.9/32")
 	speakerB.Originate(extra)
 
+	// extra is an ordinary (any-source) route, so the source address
+	// passed to Lookup is irrelevant — any placeholder works.
+	dummySrc := netip.MustParseAddr("192.0.2.1")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go speakerA.Run(ctx)
@@ -72,12 +76,12 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := meshA.Routes.Lookup(extra.Addr()); ok {
+		if _, ok := meshA.Routes.Lookup(dummySrc, extra.Addr()); ok {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	peer, ok := meshA.Routes.Lookup(extra.Addr())
+	peer, ok := meshA.Routes.Lookup(dummySrc, extra.Addr())
 	if !ok {
 		t.Fatal("A never learned B's originated route within the deadline")
 	}
@@ -128,7 +132,7 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	}))
 	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
 
-	if peer, ok := meshA.Routes.Lookup(mine.Addr()); ok {
+	if peer, ok := meshA.Routes.Lookup(netip.MustParseAddr("192.0.2.1"), mine.Addr()); ok {
 		t.Fatalf("A installed a learned route for its own originated prefix via peer %q", peer.ID)
 	}
 }
@@ -163,13 +167,15 @@ func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint
 	return RawTLV{Type: TLVUpdate, Body: body}
 }
 
-// TestSpeakerSADR covers the special case requested for source-specific
-// (SADR) routes from peers that don't get full source-and-destination
-// routing support: install as an ordinary route only when the advertised
-// Source Prefix covers our own outbound source address, otherwise ignore.
+// TestSpeakerSADR covers genuine source-specific (SADR) route handling:
+// a Source Prefix sub-TLV is installed as a real (source, destination)
+// entry in the mesh's route table, not approximated by checking whether
+// it happens to cover some fixed local address. Two source-specific
+// routes to the same destination, from different peers/prefixes, must
+// coexist independently and only resolve for lookups whose source
+// address actually falls within their respective source prefix.
 func TestSpeakerSADR(t *testing.T) {
-	mySource := netip.MustParseAddr("10.66.0.1")
-	_, _, speakerA, _ := wireSpeakerPair(t, Config{SourceAddress: mySource})
+	_, _, speakerA, _ := wireSpeakerPair(t, Config{})
 
 	n := speakerA.neighbors["b"]
 	if n == nil {
@@ -177,29 +183,39 @@ func TestSpeakerSADR(t *testing.T) {
 	}
 
 	dest := netip.MustParsePrefix("10.77.0.0/24")
-	covering := netip.MustParsePrefix("10.66.0.0/16") // contains mySource
-	other := netip.MustParsePrefix("10.99.0.0/16")    // does not contain mySource
+	covering := netip.MustParsePrefix("10.66.0.0/16")
+	other := netip.MustParsePrefix("10.99.0.0/16")
 
-	// A source-specific route that doesn't cover our source address must
-	// be ignored, not installed as if it applied to everyone.
 	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
 		EncodeRouterID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}),
 		sourceSpecificUpdateTLV(dest, other, 64),
 	}))
 	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
-	if _, ok := speakerA.mesh.Routes.Lookup(dest.Addr()); ok {
-		t.Fatal("installed a source-specific route that doesn't cover our source address")
+
+	// A source inside `other`'s prefix must resolve via the
+	// source-specific route just installed.
+	if _, ok := speakerA.mesh.Routes.Lookup(netip.MustParseAddr("10.99.1.1"), dest.Addr()); !ok {
+		t.Fatal("did not install the source-specific route for a source within its prefix")
+	}
+	// A source outside `other`'s prefix, and with no any-source fallback
+	// route to dest, must not match at all.
+	if _, ok := speakerA.mesh.Routes.Lookup(netip.MustParseAddr("10.66.1.1"), dest.Addr()); ok {
+		t.Fatal("a source-specific route matched a source outside its prefix")
 	}
 
-	// A source-specific route that does cover our source address should
-	// be installed like an ordinary route.
+	// A second, independent source-specific route to the *same*
+	// destination must coexist rather than replacing the first.
 	pkt = buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
 		EncodeRouterID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}),
 		sourceSpecificUpdateTLV(dest, covering, 64),
 	}))
 	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
-	if _, ok := speakerA.mesh.Routes.Lookup(dest.Addr()); !ok {
-		t.Fatal("did not install a source-specific route that covers our source address")
+
+	if _, ok := speakerA.mesh.Routes.Lookup(netip.MustParseAddr("10.66.1.1"), dest.Addr()); !ok {
+		t.Fatal("did not install the second source-specific route")
+	}
+	if _, ok := speakerA.mesh.Routes.Lookup(netip.MustParseAddr("10.99.1.1"), dest.Addr()); !ok {
+		t.Fatal("installing a second source-specific route disturbed the first")
 	}
 }
 
@@ -209,6 +225,7 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 
 	extra := netip.MustParsePrefix("10.67.9.9/32")
 	speakerB.Originate(extra)
+	dummySrc := netip.MustParseAddr("192.0.2.1")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -218,12 +235,12 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := meshA.Routes.Lookup(extra.Addr()); ok {
+		if _, ok := meshA.Routes.Lookup(dummySrc, extra.Addr()); ok {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, ok := meshA.Routes.Lookup(extra.Addr()); !ok {
+	if _, ok := meshA.Routes.Lookup(dummySrc, extra.Addr()); !ok {
 		t.Fatal("A never learned the route before the down test could proceed")
 	}
 
@@ -231,7 +248,7 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := meshA.Routes.Lookup(extra.Addr()); !ok {
+		if _, ok := meshA.Routes.Lookup(dummySrc, extra.Addr()); !ok {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

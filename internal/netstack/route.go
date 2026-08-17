@@ -8,8 +8,8 @@ import (
 
 // Peer is one mesh neighbor: sendFn encapsulates a raw tunnel-mode IP packet
 // (nextHeader is esp.NextHeaderIPv4/IPv6) and transmits it to that peer.
-// Decoupling delivery from the gvisor plumbing this way makes the stack
-// wiring testable without real ESP/UDP (see mesh_test.go).
+// Decoupling delivery from the TUN plumbing this way makes the stack
+// wiring testable without a real TUN device or ESP/UDP (see mesh_test.go).
 type Peer struct {
 	ID     string
 	sendFn func(raw []byte, nextHeader byte) error
@@ -29,42 +29,51 @@ func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
 	return p.sendFn(raw, nextHeader)
 }
 
-// RouteTable maps destination prefixes to the peer that can reach them,
-// exactly the routes an embedded babel speaker maintains. Longest-prefix
-// match, like any IP routing table.
+// RouteTable maps (source, destination) prefix pairs to the peer that can
+// reach them — including source-specific (SADR,
+// draft-ietf-babel-source-specific) routes, which an embedded babel
+// speaker installs directly rather than approximating: since this mesh's
+// own TUN device sees every packet's real source and destination address
+// directly, there's no need to guess whether a source-specific route
+// "applies to us" the way a destination-only route table would have to.
+//
+// An invalid (zero-value) Source prefix means "any source", i.e. an
+// ordinary, non-source-specific route.
 type RouteTable struct {
 	mu     sync.RWMutex
 	routes []routeEntry
 }
 
 type routeEntry struct {
-	prefix netip.Prefix
-	peer   *Peer
+	src  netip.Prefix // invalid (zero value) means "any source"
+	dst  netip.Prefix
+	peer *Peer
 }
 
 func NewRouteTable() *RouteTable {
 	return &RouteTable{}
 }
 
-// Set installs or replaces the route to prefix.
-func (rt *RouteTable) Set(prefix netip.Prefix, peer *Peer) {
+// Set installs or replaces the route for (src, dst). src may be the zero
+// netip.Prefix{} for an ordinary, non-source-specific route.
+func (rt *RouteTable) Set(src, dst netip.Prefix, peer *Peer) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for i := range rt.routes {
-		if rt.routes[i].prefix == prefix {
+		if rt.routes[i].src == src && rt.routes[i].dst == dst {
 			rt.routes[i].peer = peer
 			return
 		}
 	}
-	rt.routes = append(rt.routes, routeEntry{prefix, peer})
+	rt.routes = append(rt.routes, routeEntry{src, dst, peer})
 }
 
-// Remove deletes the route to prefix, if any.
-func (rt *RouteTable) Remove(prefix netip.Prefix) {
+// Remove deletes the route for (src, dst), if any.
+func (rt *RouteTable) Remove(src, dst netip.Prefix) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for i := range rt.routes {
-		if rt.routes[i].prefix == prefix {
+		if rt.routes[i].src == src && rt.routes[i].dst == dst {
 			rt.routes = append(rt.routes[:i], rt.routes[i+1:]...)
 			return
 		}
@@ -91,19 +100,35 @@ func (rt *RouteTable) Debug() []string {
 	defer rt.mu.RUnlock()
 	out := make([]string, 0, len(rt.routes))
 	for _, r := range rt.routes {
-		out = append(out, fmt.Sprintf("%s via %s", r.prefix, r.peer.ID))
+		if r.src.IsValid() {
+			out = append(out, fmt.Sprintf("%s from %s via %s", r.dst, r.src, r.peer.ID))
+		} else {
+			out = append(out, fmt.Sprintf("%s via %s", r.dst, r.peer.ID))
+		}
 	}
 	return out
 }
 
-// Lookup returns the peer with the longest matching prefix for addr.
-func (rt *RouteTable) Lookup(addr netip.Addr) (*Peer, bool) {
+// Lookup finds the peer that can carry traffic from src to dst, per
+// draft-ietf-babel-source-specific's selection rule: the destination
+// match is resolved first (longest destination prefix wins); only among
+// entries tied on destination specificity does the source prefix act as a
+// tiebreaker, so a source-specific entry is preferred over an any-source
+// one at the same destination specificity, but never overrides a more
+// specific destination match.
+func (rt *RouteTable) Lookup(src, dst netip.Addr) (*Peer, bool) {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	var best *routeEntry
 	for i := range rt.routes {
 		r := &rt.routes[i]
-		if r.prefix.Contains(addr) && (best == nil || r.prefix.Bits() > best.prefix.Bits()) {
+		if !r.dst.Contains(dst) {
+			continue
+		}
+		if r.src.IsValid() && !r.src.Contains(src) {
+			continue
+		}
+		if best == nil || betterRoute(r, best) {
 			best = r
 		}
 	}
@@ -111,4 +136,20 @@ func (rt *RouteTable) Lookup(addr netip.Addr) (*Peer, bool) {
 		return nil, false
 	}
 	return best.peer, true
+}
+
+func betterRoute(a, b *routeEntry) bool {
+	if a.dst.Bits() != b.dst.Bits() {
+		return a.dst.Bits() > b.dst.Bits()
+	}
+	return srcBits(a.src) > srcBits(b.src)
+}
+
+// srcBits treats "any source" as less specific than every real prefix,
+// including /0, so it always loses a tie against a genuine source match.
+func srcBits(p netip.Prefix) int {
+	if !p.IsValid() {
+		return -1
+	}
+	return p.Bits()
 }

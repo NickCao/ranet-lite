@@ -1,4 +1,4 @@
-// babeltest brings up the full client stack (IKE + ESP + gvisor netstack)
+// babeltest brings up the full client stack (IKE + ESP + TUN device)
 // against a real strongSwan responder, then runs the Babel speaker against
 // a real peer (e.g. BIRD) on the tunnel's link-local IPv6 address, and
 // reports what routes get learned.

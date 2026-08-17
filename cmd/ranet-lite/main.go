@@ -1,11 +1,17 @@
 // Command ranet-lite is a slim client for a ranet mesh: a minimal IKEv2
-// initiator, userspace ESP, a gvisor netstack, an embedded Babel speaker,
-// and a SOCKS5 front end, all in a single binary that needs no root
-// privileges and no kernel IPsec/routing configuration on the host. It
-// reads the same registry.json and Ed25519 key files as ranet itself, but
-// has its own local configuration format (see internal/config) suited to
-// dialing out to one or a few existing mesh nodes rather than
-// participating in ranet's full N-to-N reconciliation.
+// initiator, userspace ESP, a real TUN device, and an embedded Babel
+// speaker, all in a single binary. It reads the same registry.json and
+// Ed25519 key files as ranet itself, but has its own local configuration
+// format (see internal/config) suited to dialing out to one or a few
+// existing mesh nodes rather than participating in ranet's full N-to-N
+// reconciliation.
+//
+// This binary never touches the TUN device's address or route
+// configuration — creating the device (which needs CAP_NET_ADMIN) and
+// bringing it up is all it does. Assigning it an address, adding routes
+// (e.g. a default route), and running any local routing daemon that wants
+// to peer with the embedded babel speaker are entirely up to whoever runs
+// it.
 package main
 
 import (
@@ -26,7 +32,6 @@ import (
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
-	"github.com/NickCao/ranet-lite/internal/socks5"
 )
 
 const reconnectDelay = 10 * time.Second
@@ -52,21 +57,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	var sourceAddr netip.Addr
-	if cfg.SourceAddress != "" {
-		sourceAddr, err = netip.ParseAddr(cfg.SourceAddress)
-		if err != nil {
-			log.Fatalf("config: source_address: %v", err)
-		}
-		if err := mesh.AddLocalAddress(sourceAddr); err != nil {
-			log.Fatal(err)
-		}
-	}
+	log.Printf("tun device %s created; assign it an address and add routes yourself before traffic will flow", mesh.Name)
 
 	speaker, err := babel.New(babel.Config{
 		HelloInterval:  cfg.Babel.HelloInterval,
 		UpdateInterval: cfg.Babel.UpdateInterval,
-		SourceAddress:  sourceAddr,
 	}, mesh)
 	if err != nil {
 		log.Fatal(err)
@@ -111,23 +106,8 @@ func main() {
 	for _, p := range cfg.Peers {
 		go runPeer(ctx, priv, cfg, p, reg, mesh, speaker)
 	}
-	go func() {
-		if err := speaker.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("babel: %v", err)
-		}
-	}()
-
-	srv, err := socks5.New(cfg.SOCKS5Listen, mesh)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("SOCKS5 proxy listening on %s", srv.Addr())
-	go func() {
-		<-ctx.Done()
-		srv.Close()
-	}()
-	if err := srv.Serve(); err != nil && ctx.Err() == nil {
-		log.Fatal(err)
+	if err := speaker.Run(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("babel: %v", err)
 	}
 }
 

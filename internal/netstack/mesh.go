@@ -1,159 +1,122 @@
-// Package netstack wires a gvisor userspace TCP/IP stack to the ranet mesh:
-// one NIC backed by a channel.Endpoint, with outbound packets routed to
-// whichever peer's Child SA can reach the destination (see RouteTable) and
-// inbound packets from any peer injected back into the stack. It knows
-// nothing about ESP or IKE directly — peers are just a send function plus
-// routes, so this package is testable without real crypto (mesh_test.go).
+// Package netstack wires a real Linux TUN device to the ranet mesh: outbound
+// packets the kernel routes to it are forwarded to whichever peer's Child SA
+// can reach the destination (see RouteTable), and inbound packets decrypted
+// from any peer are written back to the device as if they'd arrived over any
+// other interface. It knows nothing about ESP or IKE directly — peers are
+// just a send function plus routes, so this package is testable without real
+// crypto (mesh_test.go).
+//
+// This package never touches the device's address or route configuration —
+// creating it and bringing it up is all it does. Assigning an address,
+// adding routes (e.g. a default route), and running any local routing daemon
+// that wants to peer with the embedded babel speaker are entirely up to
+// whoever runs this binary.
 package netstack
 
 import (
-	"context"
 	"fmt"
 	"net/netip"
 
 	"github.com/NickCao/ranet-lite/internal/esp"
-	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
-const (
-	NICID      = tcpip.NICID(1)
-	DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
-)
+const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
 
 type Mesh struct {
-	Stack  *stack.Stack
 	Routes *RouteTable
-	ep     *channel.Endpoint
+	// Name is the TUN device's real interface name (e.g. "ranet0"), as
+	// reported by the kernel — needed by whoever configures its address
+	// and routes, since the kernel doesn't always honor the requested
+	// name exactly.
+	Name string
+
+	dev tun.Device
 }
 
-func New(mtu uint32) (*Mesh, error) {
+func New(mtu int) (*Mesh, error) {
 	if mtu == 0 {
 		mtu = DefaultMTU
 	}
-	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
-	})
-	ep := channel.New(256, mtu, "")
-	if err := s.CreateNIC(NICID, ep); err != nil {
-		return nil, fmt.Errorf("netstack: create NIC: %s", err)
+	dev, err := tun.CreateTUN("ranet%d", mtu)
+	if err != nil {
+		return nil, fmt.Errorf("netstack: create tun device: %w", err)
 	}
-	// This client only ever originates/terminates traffic for addresses
-	// reachable via babel-learned routes, never a fixed local subnet, so
-	// promiscuous+spoofing (accept/send for any address on the NIC) is the
-	// right posture rather than pinning a single interface address.
-	if err := s.SetSpoofing(NICID, true); err != nil {
-		return nil, fmt.Errorf("netstack: set spoofing: %s", err)
+	name, err := dev.Name()
+	if err != nil {
+		dev.Close()
+		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
-	if err := s.SetPromiscuousMode(NICID, true); err != nil {
-		return nil, fmt.Errorf("netstack: set promiscuous: %s", err)
-	}
-	s.SetRouteTable([]tcpip.Route{
-		{Destination: header.IPv4EmptySubnet, NIC: NICID},
-		{Destination: header.IPv6EmptySubnet, NIC: NICID},
-	})
-	m := &Mesh{Stack: s, ep: ep, Routes: NewRouteTable()}
+	m := &Mesh{Routes: NewRouteTable(), Name: name, dev: dev}
 	go m.outboundLoop()
 	return m, nil
 }
 
-// AddLocalAddress assigns this node's own mesh-reachable address to the
-// stack, giving gonet.Dial{TCP,UDP} a source address and letting inbound
-// connections addressed to it be delivered locally.
-func (m *Mesh) AddLocalAddress(addr netip.Addr) error {
-	proto := tcpip.NetworkProtocolNumber(ipv4.ProtocolNumber)
-	if addr.Is6() {
-		proto = ipv6.ProtocolNumber
-	}
-	protoAddr := tcpip.ProtocolAddress{
-		Protocol: proto,
-		AddressWithPrefix: tcpip.AddressWithPrefix{
-			Address:   tcpip.AddrFromSlice(addr.AsSlice()),
-			PrefixLen: addr.BitLen(),
-		},
-	}
-	if err := m.Stack.AddProtocolAddress(NICID, protoAddr, stack.AddressProperties{}); err != nil {
-		return fmt.Errorf("netstack: add local address %s: %s", addr, err)
-	}
-	return nil
-}
-
 func (m *Mesh) outboundLoop() {
+	batch := m.dev.BatchSize()
+	bufs := make([][]byte, batch)
+	sizes := make([]int, batch)
+	for i := range bufs {
+		bufs[i] = make([]byte, 65536)
+	}
 	for {
-		pkt := m.ep.ReadContext(context.Background())
-		if pkt == nil {
-			return // endpoint closed
+		n, err := m.dev.Read(bufs, sizes, 0)
+		if err != nil {
+			return // device closed
 		}
-		raw := append([]byte{}, pkt.ToView().AsSlice()...)
-		pkt.DecRef()
-		m.sendOut(raw)
+		for i := 0; i < n; i++ {
+			m.sendOut(bufs[i][:sizes[i]])
+		}
 	}
 }
 
 func (m *Mesh) sendOut(raw []byte) {
-	dst, nh, ok := destOf(raw)
+	src, dst, nh, ok := addrsOf(raw)
 	if !ok {
 		return
 	}
-	peer, ok := m.Routes.Lookup(dst)
+	peer, ok := m.Routes.Lookup(src, dst)
 	if !ok {
 		return // no route: drop, like any unreachable destination
 	}
 	_ = peer.sendFn(raw, nh)
 }
 
-func destOf(raw []byte) (netip.Addr, byte, bool) {
+// addrsOf extracts both the source and destination address from a raw IP
+// packet — the route table needs both to support source-specific (SADR)
+// routes, not just the destination.
+func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 	if len(raw) < 1 {
-		return netip.Addr{}, 0, false
+		return netip.Addr{}, netip.Addr{}, 0, false
 	}
 	switch raw[0] >> 4 {
 	case 4:
 		if len(raw) < 20 {
-			return netip.Addr{}, 0, false
+			return netip.Addr{}, netip.Addr{}, 0, false
 		}
-		a, ok := netip.AddrFromSlice(raw[16:20])
-		return a, esp.NextHeaderIPv4, ok
+		s, sok := netip.AddrFromSlice(raw[12:16])
+		d, dok := netip.AddrFromSlice(raw[16:20])
+		return s, d, esp.NextHeaderIPv4, sok && dok
 	case 6:
 		if len(raw) < 40 {
-			return netip.Addr{}, 0, false
+			return netip.Addr{}, netip.Addr{}, 0, false
 		}
-		a, ok := netip.AddrFromSlice(raw[24:40])
-		return a, esp.NextHeaderIPv6, ok
+		s, sok := netip.AddrFromSlice(raw[8:24])
+		d, dok := netip.AddrFromSlice(raw[24:40])
+		return s, d, esp.NextHeaderIPv6, sok && dok
 	default:
-		return netip.Addr{}, 0, false
+		return netip.Addr{}, netip.Addr{}, 0, false
 	}
 }
 
-// DeliverInbound injects an already-decapsulated tunnel-mode IP packet
-// (nextHeader is esp.NextHeaderIPv4/IPv6) into the stack, as if it had
-// arrived on the wire. The stack doesn't need to know which peer decrypted
-// it — only outbound routing does.
-func (m *Mesh) DeliverInbound(raw []byte, nextHeader byte) {
-	var proto tcpip.NetworkProtocolNumber
-	switch nextHeader {
-	case esp.NextHeaderIPv4:
-		proto = ipv4.ProtocolNumber
-	case esp.NextHeaderIPv6:
-		proto = ipv6.ProtocolNumber
-	default:
-		return
-	}
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(raw),
-	})
-	m.ep.InjectInbound(proto, pkt)
-	pkt.DecRef()
+// DeliverInbound injects an already-decapsulated tunnel-mode IP packet into
+// the TUN device, as if it had arrived on the wire. nextHeader is unused —
+// the packet's own version nibble is all the kernel needs — but kept for
+// symmetry with how peers hand packets to Peer.sendFn.
+func (m *Mesh) DeliverInbound(raw []byte, _ byte) {
+	m.dev.Write([][]byte{raw}, 0)
 }
 
 func (m *Mesh) Close() {
-	m.ep.Close()
-	m.Stack.Close()
+	m.dev.Close()
 }
