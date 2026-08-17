@@ -15,6 +15,7 @@ package netstack
 
 import (
 	"fmt"
+	"log"
 	"net/netip"
 
 	"github.com/NickCao/ranet-lite/internal/esp"
@@ -22,6 +23,15 @@ import (
 )
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
+
+// writeOffset is how much leading space Device.Write needs in each buffer
+// to prepend its virtio-net header (the tun package always requests
+// IFF_VNET_HDR) — the same offset wireguard-go's own device code uses
+// (device.MessageTransportOffsetContent) for exactly this reason. Passing
+// offset 0 doesn't just lose performance, it fails outright: Write()
+// computes offset-virtioNetHdrLen internally and slices from there, so a
+// too-small offset is an out-of-range slice.
+const writeOffset = 16
 
 type Mesh struct {
 	Routes *RouteTable
@@ -114,7 +124,11 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 // the packet's own version nibble is all the kernel needs — but kept for
 // symmetry with how peers hand packets to Peer.sendFn.
 func (m *Mesh) DeliverInbound(raw []byte, _ byte) {
-	m.dev.Write([][]byte{raw}, 0)
+	buf := make([]byte, writeOffset+len(raw))
+	copy(buf[writeOffset:], raw)
+	if _, err := m.dev.Write([][]byte{buf}, writeOffset); err != nil {
+		log.Printf("netstack: write to tun device: %v", err)
+	}
 }
 
 func (m *Mesh) Close() {
