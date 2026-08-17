@@ -42,7 +42,7 @@ func (r *meshRouter) Dial(ctx context.Context, network, address string, _ ...cha
 		return nil, fmt.Errorf("socks5: bad port %q: %w", portStr, err)
 	}
 
-	addr, err := resolveHost(ctx, host)
+	addr, err := r.resolveHost(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +71,13 @@ func (r *meshRouter) Bind(ctx context.Context, network, address string, _ ...cha
 // resolved via the host's normal DNS resolver — this client doesn't run
 // its own resolver, matching "minimal feature set": destinations reachable
 // only inside the mesh are expected to be addressed by IP.
-func resolveHost(ctx context.Context, host string) (netip.Addr, error) {
+//
+// A dual-stack lookup can return both A and AAAA records in either order
+// depending on the resolver; since the mesh's route table is commonly
+// IPv6-only (or IPv4-only), blindly taking the first result is a coin
+// flip that fails whenever the resolver happens to order it the "wrong"
+// way. Prefer whichever resolved address actually has a route.
+func (r *meshRouter) resolveHost(ctx context.Context, host string) (netip.Addr, error) {
 	if addr, err := netip.ParseAddr(host); err == nil {
 		return addr, nil
 	}
@@ -79,9 +85,22 @@ func resolveHost(ctx context.Context, host string) (netip.Addr, error) {
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("socks5: resolve %q: %w", host, err)
 	}
-	addr, ok := netip.AddrFromSlice(ips[0])
-	if !ok {
+	var first netip.Addr
+	for i, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		if i == 0 {
+			first = addr
+		}
+		if _, ok := r.mesh.Routes.Lookup(addr); ok {
+			return addr, nil
+		}
+	}
+	if !first.IsValid() {
 		return netip.Addr{}, fmt.Errorf("socks5: resolve %q: invalid address", host)
 	}
-	return addr.Unmap(), nil
+	return first, nil
 }
