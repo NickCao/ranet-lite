@@ -180,13 +180,26 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 			{Type: PayloadNonce, Body: EncodeNonce(ni)},
 			{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_SIGNATURE_HASH_ALGORITHMS, Data: hashAlgos})},
 		}
-		// NAT_DETECTION notifies: sent for spec compliance; ranet forces
-		// UDP encapsulation unconditionally regardless of the result, on
-		// the one explicit registry port (see transport.Mux doc comment).
-		if cfg.LocalAddr != nil {
-			srcHash := natDetectionHash(spiI, 0, cfg.LocalAddr, uint16(mux.LocalAddr().(*net.UDPAddr).Port))
-			payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_SOURCE_IP, Data: srcHash})})
-		}
+		// NAT_DETECTION_SOURCE_IP, RFC 7296 §2.23. Without this notify,
+		// the responder has nothing to compare against for our side and
+		// apparently doesn't treat the connection as NAT'd even with
+		// encap=yes configured — confirmed by inspecting the resulting
+		// kernel XFRM state (`ip xfrm state`), which had no `encap` info
+		// attached at all, causing every inbound ESP packet to be
+		// silently dropped at the kernel's encap_type check
+		// (net/xfrm/xfrm_input.c) before authentication is even
+		// attempted. strongSwan's own initiator (ike_natd.c,
+		// build_natd_payload) handles this identically when force_encap
+		// is set: rather than using its real local address (which would
+		// only force NAT-T if it happens to mismatch what the responder
+		// observes), it hashes a random IPv4 address with port 0,
+		// guaranteeing a mismatch so NAT is always assumed — do the same
+		// here rather than relying on whatever this socket's wildcard
+		// bind address happens to be.
+		var fakeAddr [4]byte
+		rand.Read(fakeAddr[:])
+		srcHash := natDetectionHash(spiI, 0, net.IP(fakeAddr[:]), 0)
+		payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_SOURCE_IP, Data: srcHash})})
 		dstHash := natDetectionHash(spiI, 0, cfg.RemoteAddr, uint16(cfg.RemotePort))
 		payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_DESTINATION_IP, Data: dstHash})})
 
