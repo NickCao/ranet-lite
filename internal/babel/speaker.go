@@ -304,19 +304,28 @@ func (s *Speaker) updateLoop(ctx context.Context) {
 	}
 }
 
+// installRoute pushes a route selection decision into the shared
+// netstack.RouteTable and logs it — the single choke point every route
+// change (fresh Update, periodic expiry sweep, neighbor going down) goes
+// through, so `grep 'babel: route'` on the log is a full account of what
+// this node has ever installed or retracted.
+func (s *Speaker) installRoute(prefix netip.Prefix, sel *routeInfo) {
+	if sel != nil && sel.reachable() {
+		s.mesh.Routes.Set(prefix, sel.neighbor.peer)
+		log.Printf("babel: route %s via %s (metric %d)", prefix, sel.neighbor.peer.ID, sel.cost)
+	} else {
+		s.mesh.Routes.Remove(prefix)
+		log.Printf("babel: route %s retracted", prefix)
+	}
+}
+
 // sweepExpired re-checks every selected route's TTL. update() only
 // re-evaluates reachability when a fresh Update for that exact prefix
 // arrives; without this periodic sweep, a neighbor that stops sending
 // Updates entirely (as opposed to just missing Hellos) would never be
 // noticed and its routes would linger forever.
 func (s *Speaker) sweepExpired() {
-	s.routes.sweepExpired(func(prefix netip.Prefix, sel *routeInfo) {
-		if sel != nil && sel.reachable() {
-			s.mesh.Routes.Set(prefix, sel.neighbor.peer)
-		} else {
-			s.mesh.Routes.Remove(prefix)
-		}
-	})
+	s.routes.sweepExpired(s.installRoute)
 }
 
 func (s *Speaker) flushUpdates() {
@@ -383,6 +392,9 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			}
 			recvTS := nowMicros()
 			n.mu.Lock()
+			if !n.alive {
+				log.Printf("babel: neighbor %s up", n.peer.ID)
+			}
 			n.alive = true
 			n.lastHelloTime = time.Now()
 			n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
@@ -466,11 +478,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			ttl := time.Duration(u.Interval) * 10 * time.Millisecond * 7 / 2
 			changed, sel := s.routes.update(n, prefix, curRouterID, u.Seqno, u.Metric, ttl)
 			if changed {
-				if sel != nil && sel.reachable() {
-					s.mesh.Routes.Set(prefix, sel.neighbor.peer)
-				} else {
-					s.mesh.Routes.Remove(prefix)
-				}
+				s.installRoute(prefix, sel)
 				s.triggerUpdate()
 			}
 
@@ -484,16 +492,13 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 }
 
 func (s *Speaker) neighborDown(n *neighborState) {
+	log.Printf("babel: neighbor %s down", n.peer.ID)
 	n.mu.Lock()
 	n.alive = false
 	n.haveReportedCost = false
 	n.mu.Unlock()
 	for _, prefix := range s.routes.expireNeighbor(n) {
-		if sel := s.routes.selectedFor(prefix); sel != nil && sel.reachable() {
-			s.mesh.Routes.Set(prefix, sel.neighbor.peer)
-		} else {
-			s.mesh.Routes.Remove(prefix)
-		}
+		s.installRoute(prefix, s.routes.selectedFor(prefix))
 	}
 	s.mesh.Routes.RemovePeer(n.peer)
 	s.triggerUpdate()

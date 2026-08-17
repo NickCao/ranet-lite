@@ -82,6 +82,32 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// SIGUSR1 dumps the current mesh route table to the log — the fastest
+	// way to see what babel has actually installed without wiring up a
+	// separate debug endpoint. Route installs/retractions and neighbor
+	// up/down transitions are also logged as they happen (see
+	// internal/babel/speaker.go's installRoute/neighborDown/TLVHello).
+	dumpRoutes := make(chan os.Signal, 1)
+	signal.Notify(dumpRoutes, syscall.SIGUSR1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-dumpRoutes:
+				routes := mesh.Routes.Debug()
+				if len(routes) == 0 {
+					log.Printf("routes: (none installed)")
+					continue
+				}
+				log.Printf("routes:")
+				for _, r := range routes {
+					log.Printf("  %s", r)
+				}
+			}
+		}
+	}()
+
 	for _, p := range cfg.Peers {
 		go runPeer(ctx, priv, cfg, p, reg, mesh, speaker)
 	}
