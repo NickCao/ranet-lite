@@ -2,6 +2,7 @@ package babel
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 )
 
@@ -76,6 +77,56 @@ func TestUpdatePrefixCompression(t *testing.T) {
 	}
 	if !got2.Prefix.Equal(net.IPv4(10, 99, 1, 2)) {
 		t.Fatalf("compressed prefix = %v, want 10.99.1.2", got2.Prefix)
+	}
+}
+
+// TestUpdateWithSourcePrefix guards real-world SADR interop (e.g. BIRD's
+// "ipv6 sadr" tables, draft-ietf-babel-source-specific): a well-formed
+// Source Prefix sub-TLV (type 128, mandatory bit set per RFC 8966 §4.4)
+// must be parsed into Update.SourcePrefix, not treated as an ordinary
+// destination-only route or blanket-ignored — Speaker decides relevance
+// by checking whether SourcePrefix covers its own source address (see
+// TestSpeakerSADR). It must still update prefix-compression state
+// regardless, since RFC 8966 requires the parser state to advance even
+// for an otherwise-ignored TLV.
+func TestUpdateWithSourcePrefix(t *testing.T) {
+	dec := &PrefixDecoder{}
+
+	// AE=IPv4, Plen=32, prefix 10.99.2.5, trailing Source Prefix sub-TLV
+	// (type 128, SourcePlen=16, source prefix 10.1.0.0/16).
+	body := []byte{
+		AEIPv4, 0, 32, 0, // AE, Flags, Plen, Omitted
+		0, 0, // Interval
+		0, 0, // Seqno
+		0, 128, // Metric
+		10, 99, 2, 5, // Prefix
+		128, 3, 16, 10, 1, // Source Prefix sub-TLV
+	}
+	got, err := dec.Decode(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Ignore {
+		t.Fatal("a well-formed Source Prefix sub-TLV should not set Ignore")
+	}
+	wantSource := netip.MustParsePrefix("10.1.0.0/16")
+	if got.SourcePrefix != wantSource {
+		t.Fatalf("SourcePrefix = %v, want %v", got.SourcePrefix, wantSource)
+	}
+	if !got.Prefix.Equal(net.IPv4(10, 99, 2, 5)) {
+		t.Fatalf("prefix = %v, want 10.99.2.5", got.Prefix)
+	}
+
+	// Compression state must still have advanced, per RFC 8966 §4.4/§4.5
+	// — a following compressed Update referencing its prefix bytes must
+	// decode correctly.
+	compressed := []byte{AEIPv4, 0, 32, 3, 0, 0, 0, 0, 0, 0, 9}
+	got2, err := dec.Decode(compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got2.Prefix.Equal(net.IPv4(10, 99, 2, 9)) {
+		t.Fatalf("compressed prefix after an ignored Update = %v, want 10.99.2.9", got2.Prefix)
 	}
 }
 

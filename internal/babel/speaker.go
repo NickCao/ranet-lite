@@ -102,6 +102,16 @@ type Config struct {
 	HelloInterval  time.Duration
 	UpdateInterval time.Duration
 	Cost           CostParams
+
+	// SourceAddress is this node's own outbound source address (the same
+	// one the mesh's netstack uses for SOCKS5-proxied connections). It's
+	// the only thing that makes a source-specific (SADR) route from a
+	// peer relevant to us: we don't implement a source-and-destination
+	// keyed route table, so we can't route differently per source, but we
+	// *can* tell whether a given source-specific route covers traffic we
+	// would actually originate. If invalid (the zero value), every
+	// source-specific route is treated as inapplicable and ignored.
+	SourceAddress netip.Addr
 }
 
 func randomLinkLocal() netip.Addr {
@@ -323,6 +333,15 @@ func (s *Speaker) flushUpdates() {
 
 	centis := uint16(s.cfg.UpdateInterval / (10 * time.Millisecond))
 
+	// This client is always a stub/leaf, never transit: it announces only
+	// what it originates itself. Redistributing routes learned from one
+	// peer to another would claim routing capability the data plane
+	// doesn't back up — the gvisor stack here has no IP forwarding
+	// enabled, so a peer trying to route through this node would just see
+	// its packets dropped.
+	if len(originate) == 0 {
+		return
+	}
 	for _, n := range neighbors {
 		var tlvs []RawTLV
 		for _, p := range originate {
@@ -331,19 +350,7 @@ func (s *Speaker) flushUpdates() {
 				AE: aeFor(p), Plen: p.Bits(), Interval: centis, Seqno: 1, Metric: 0, Prefix: net.IP(p.Addr().AsSlice()),
 			}))
 		}
-		for prefix, sel := range s.routes.snapshotSelected() {
-			if sel.neighbor == n {
-				continue // split horizon: don't advertise a route back to its source
-			}
-			tlvs = append(tlvs, EncodeRouterID(sel.routerID))
-			tlvs = append(tlvs, EncodeUpdate(Update{
-				AE: aeFor(prefix), Plen: prefix.Bits(), Interval: centis,
-				Seqno: sel.seqno, Metric: sel.rxMetric, Prefix: net.IP(prefix.Addr().AsSlice()),
-			}))
-		}
-		if len(tlvs) > 0 {
-			s.send(n, tlvs)
-		}
+		s.send(n, tlvs)
 	}
 }
 
@@ -419,6 +426,26 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			if err != nil {
 				log.Printf("babel: bad Update: %v", err)
 				continue
+			}
+			if u.Ignore {
+				// Carries some other mandatory sub-TLV we don't recognize
+				// at all, or a malformed Source Prefix. Per RFC 8966
+				// §4.4 the whole TLV is ignored; the prefix-compression
+				// state above was still updated.
+				continue
+			}
+			if u.SourcePrefix.IsValid() {
+				// Source-specific (SADR) route. We don't implement a
+				// source-and-destination-keyed route table, so the only
+				// thing we can correctly do is check whether it covers
+				// traffic we'd actually originate: if our own source
+				// address falls inside SourcePrefix, install it as an
+				// ordinary route (it does apply to us); otherwise it's
+				// meant for other sources and must be ignored, not
+				// installed as if it covered everyone.
+				if !s.cfg.SourceAddress.IsValid() || !u.SourcePrefix.Contains(s.cfg.SourceAddress) {
+					continue
+				}
 			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
 			if !ok {

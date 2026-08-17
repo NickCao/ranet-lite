@@ -161,16 +161,3 @@ func (rt *routeTable) selectedFor(prefix netip.Prefix) *routeInfo {
 	return nil
 }
 
-// snapshotSelected returns the currently selected route for every prefix,
-// for building outgoing Update TLVs without holding the lock while sending.
-func (rt *routeTable) snapshotSelected() map[netip.Prefix]*routeInfo {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	out := make(map[netip.Prefix]*routeInfo, len(rt.entries))
-	for prefix, pe := range rt.entries {
-		if pe.selected != nil {
-			out[prefix] = pe.selected
-		}
-	}
-	return out
-}

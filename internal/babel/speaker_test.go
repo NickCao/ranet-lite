@@ -133,6 +133,76 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	}
 }
 
+// sourceSpecificUpdateTLV hand-builds an Update TLV with a trailing Source
+// Prefix sub-TLV (draft-ietf-babel-source-specific §7.1) — EncodeUpdate
+// doesn't support this (we never originate source-specific routes), so
+// tests exercising receive-side handling build the bytes directly, same
+// as tlv_test.go's TestUpdateWithSourcePrefix.
+func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint16) RawTLV {
+	ae := aeFor(dest)
+	destBytes := dest.Addr().AsSlice()
+	if ae == AEIPv4 {
+		b := dest.Addr().As4()
+		destBytes = b[:]
+	}
+	srcBytes := source.Addr().AsSlice()
+	if aeFor(source) == AEIPv4 {
+		b := source.Addr().As4()
+		srcBytes = b[:]
+	}
+	srcBytes = srcBytes[:prefixByteLen(source.Bits())]
+
+	body := make([]byte, 0, 32)
+	body = append(body, ae, 0, byte(dest.Bits()), 0) // AE, Flags, Plen, Omitted
+	body = append(body, 0, 200) // Interval: 200 centiseconds, long enough to outlive the test
+	body = append(body, 0, 1) // Seqno
+	body = append(body, byte(metric>>8), byte(metric)) // Metric
+	body = append(body, destBytes[:prefixByteLen(dest.Bits())]...)
+	body = append(body, SubTLVSourcePrefix, byte(1+len(srcBytes)), byte(source.Bits()))
+	body = append(body, srcBytes...)
+	return RawTLV{Type: TLVUpdate, Body: body}
+}
+
+// TestSpeakerSADR covers the special case requested for source-specific
+// (SADR) routes from peers that don't get full source-and-destination
+// routing support: install as an ordinary route only when the advertised
+// Source Prefix covers our own outbound source address, otherwise ignore.
+func TestSpeakerSADR(t *testing.T) {
+	mySource := netip.MustParseAddr("10.66.0.1")
+	_, _, speakerA, _ := wireSpeakerPair(t, Config{SourceAddress: mySource})
+
+	n := speakerA.neighbors["b"]
+	if n == nil {
+		t.Fatal("peer \"b\" not registered")
+	}
+
+	dest := netip.MustParsePrefix("10.77.0.0/24")
+	covering := netip.MustParsePrefix("10.66.0.0/16") // contains mySource
+	other := netip.MustParsePrefix("10.99.0.0/16")    // does not contain mySource
+
+	// A source-specific route that doesn't cover our source address must
+	// be ignored, not installed as if it applied to everyone.
+	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}),
+		sourceSpecificUpdateTLV(dest, other, 64),
+	}))
+	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
+	if _, ok := speakerA.mesh.Routes.Lookup(dest.Addr()); ok {
+		t.Fatal("installed a source-specific route that doesn't cover our source address")
+	}
+
+	// A source-specific route that does cover our source address should
+	// be installed like an ordinary route.
+	pkt = buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
+		EncodeRouterID([8]byte{1, 2, 3, 4, 5, 6, 7, 8}),
+		sourceSpecificUpdateTLV(dest, covering, 64),
+	}))
+	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
+	if _, ok := speakerA.mesh.Routes.Lookup(dest.Addr()); !ok {
+		t.Fatal("did not install a source-specific route that covers our source address")
+	}
+}
+
 func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 	fast := Config{HelloInterval: 30 * time.Millisecond, UpdateInterval: 60 * time.Millisecond}
 	meshA, _, speakerA, speakerB := wireSpeakerPair(t, fast)

@@ -4,7 +4,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/netip"
 )
+
+// SubTLVSourcePrefix carries a source prefix for source-specific routing
+// (draft-ietf-babel-source-specific, a.k.a. SADR — Source Address
+// Dependent Routing; real deployments send this from e.g. BIRD's "ipv6
+// sadr" tables). Its type is 128, the first mandatory sub-TLV value (RFC
+// 8966 §4.4: types 128-255 have the mandatory bit set), so an
+// implementation that doesn't recognize it MUST ignore the whole
+// enclosing TLV rather than silently treat it as an ordinary route.
+const SubTLVSourcePrefix uint8 = 128
 
 // Update is RFC 8966 §4.6.9. We always encode with Omitted=0 (no prefix
 // compression) — that's fully spec-compliant, compression is a size
@@ -18,6 +28,23 @@ type Update struct {
 	Seqno    uint16
 	Metric   uint16 // MetricInfinity means "route retracted"
 	Prefix   net.IP
+
+	// Ignore is set when this Update carries a sub-TLV with the mandatory
+	// bit set (type 128-255, RFC 8966 §4.4) that we don't recognize at
+	// all (i.e. anything other than Source Prefix, or a malformed Source
+	// Prefix). The whole TLV must be ignored per spec — but the
+	// compression state above must still be updated from it, which is why
+	// this is a flag on a fully-decoded Update rather than a decode error.
+	Ignore bool
+
+	// SourcePrefix is set when this Update carries a well-formed Source
+	// Prefix sub-TLV (source-specific routing). We don't implement a full
+	// source-and-destination-keyed route table; the special case we do
+	// support (see Speaker) is installing it as an ordinary route exactly
+	// when SourcePrefix covers our own outbound source address — i.e.
+	// "this route applies to traffic we'd actually originate" — and
+	// ignoring it otherwise.
+	SourcePrefix netip.Prefix
 }
 
 func prefixByteLen(plen int) int { return (plen + 7) / 8 }
@@ -98,5 +125,57 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		return Update{}, fmt.Errorf("babel: Update: unsupported AE %d", ae)
 	}
 
-	return Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}, nil
+	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}
+	subs := decodeSubTLVs(sent[sentLen:])
+	for _, s := range subs {
+		if s.Type < 128 {
+			continue // non-mandatory: safe to skip if unrecognized
+		}
+		if s.Type != SubTLVSourcePrefix {
+			u.Ignore = true // some other mandatory sub-TLV we don't understand at all
+			continue
+		}
+		if sp, ok := decodeSourcePrefix(ae, s.Body); ok {
+			u.SourcePrefix = sp
+		} else {
+			u.Ignore = true // present but malformed — RFC 8966 §4.4 treats this the same as unrecognized
+		}
+	}
+	return u, nil
+}
+
+// decodeSourcePrefix parses a Source Prefix sub-TLV body (draft-ietf-babel
+// -source-specific §7.1): SourcePlen(1) + SourcePrefix bytes, ceil(plen/8)
+// of them, uncompressed, interpreted under the enclosing TLV's AE.
+func decodeSourcePrefix(ae uint8, body []byte) (netip.Prefix, bool) {
+	if len(body) < 1 {
+		return netip.Prefix{}, false
+	}
+	plen := int(body[0])
+	if plen == 0 {
+		return netip.Prefix{}, false // "This MUST NOT be 0" — treat a violation as malformed
+	}
+	n := prefixByteLen(plen)
+	if len(body)-1 < n {
+		return netip.Prefix{}, false
+	}
+	raw := body[1 : 1+n]
+	switch ae {
+	case AEIPv4:
+		if plen > 32 {
+			return netip.Prefix{}, false
+		}
+		var buf [4]byte
+		copy(buf[:], raw)
+		return netip.PrefixFrom(netip.AddrFrom4(buf), plen), true
+	case AEIPv6:
+		if plen > 128 {
+			return netip.Prefix{}, false
+		}
+		var buf [16]byte
+		copy(buf[:], raw)
+		return netip.PrefixFrom(netip.AddrFrom16(buf), plen), true
+	default:
+		return netip.Prefix{}, false
+	}
 }
