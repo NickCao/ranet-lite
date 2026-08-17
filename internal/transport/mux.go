@@ -9,6 +9,7 @@ package transport
 import (
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -26,10 +27,27 @@ type Mux struct {
 	nattPort   int
 	floated    atomic.Bool
 
-	ikeCh  chan []byte
-	espCh  chan []byte
-	errCh  chan error
-	closed atomic.Bool
+	ikeCh chan []byte
+	espCh chan []byte
+	// done is closed exactly once, on a fatal read error or Close() —
+	// closing (unlike sending on a channel) wakes every blocked receiver,
+	// not just one. RecvIKE and RecvESP run concurrently in normal use
+	// (the DPD loop and the ESP receive loop), so a single-value error
+	// channel would only ever notify whichever of them happened to be
+	// selected first, leaking the other forever.
+	done     chan struct{}
+	doneOnce sync.Once
+	doneErr  atomic.Value // error
+	closed   atomic.Bool
+}
+
+// closeDone wakes every blocked Recv* call exactly once, regardless of
+// whether it's triggered by a real read error or an explicit Close().
+func (m *Mux) closeDone(err error) {
+	m.doneOnce.Do(func() {
+		m.doneErr.Store(err)
+		close(m.done)
+	})
 }
 
 // Dial opens the shared socket. localAddr may be "" to let the OS pick an
@@ -52,7 +70,7 @@ func Dial(localAddr string, remoteIP net.IP, remotePort, nattPort int) (*Mux, er
 		nattPort:   nattPort,
 		ikeCh:      make(chan []byte, 16),
 		espCh:      make(chan []byte, 256),
-		errCh:      make(chan error, 1),
+		done:       make(chan struct{}),
 	}
 	go m.readLoop()
 	return m, nil
@@ -99,8 +117,8 @@ func (m *Mux) RecvIKE() ([]byte, error) {
 	select {
 	case b := <-m.ikeCh:
 		return b, nil
-	case err := <-m.errCh:
-		return nil, err
+	case <-m.done:
+		return nil, m.doneError()
 	}
 }
 
@@ -112,8 +130,8 @@ func (m *Mux) RecvIKEUntil(deadline time.Time) ([]byte, error) {
 	select {
 	case b := <-m.ikeCh:
 		return b, nil
-	case err := <-m.errCh:
-		return nil, err
+	case <-m.done:
+		return nil, m.doneError()
 	case <-time.After(time.Until(deadline)):
 		return nil, errTimeout
 	}
@@ -124,13 +142,21 @@ var errTimeout = fmt.Errorf("transport: receive timeout")
 // IsTimeout reports whether err was returned by RecvIKEUntil expiring.
 func IsTimeout(err error) bool { return err == errTimeout }
 
+func (m *Mux) doneError() error {
+	err, _ := m.doneErr.Load().(error)
+	if err == nil {
+		err = fmt.Errorf("transport: closed")
+	}
+	return err
+}
+
 // RecvESP returns the next raw ESP packet.
 func (m *Mux) RecvESP() ([]byte, error) {
 	select {
 	case b := <-m.espCh:
 		return b, nil
-	case err := <-m.errCh:
-		return nil, err
+	case <-m.done:
+		return nil, m.doneError()
 	}
 }
 
@@ -140,8 +166,8 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 	select {
 	case b := <-m.espCh:
 		return b, nil
-	case err := <-m.errCh:
-		return nil, err
+	case <-m.done:
+		return nil, m.doneError()
 	case <-time.After(time.Until(deadline)):
 		return nil, errTimeout
 	}
@@ -153,12 +179,10 @@ func (m *Mux) readLoop() {
 		n, _, err := m.conn.ReadFromUDP(buf)
 		if err != nil {
 			if m.closed.Load() {
+				m.closeDone(fmt.Errorf("transport: closed"))
 				return
 			}
-			select {
-			case m.errCh <- fmt.Errorf("transport: read: %w", err):
-			default:
-			}
+			m.closeDone(fmt.Errorf("transport: read: %w", err))
 			return
 		}
 		pkt := append([]byte{}, buf[:n]...)
