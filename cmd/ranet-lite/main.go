@@ -170,6 +170,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	if err != nil {
 		return err
 	}
+	log.Printf("peer %s: dialing %s:%d (serial %s)", name, remoteIP, ep.Port, ep.SerialNumber)
 
 	ikeCfg := ike.PeerConfig{
 		Organization:     cfg.Organization,
