@@ -1,0 +1,4 @@
+/*.pem
+/testpki/
+registry.json
+!internal/registry/testdata/registry.json

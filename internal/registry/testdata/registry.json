@@ -1,0 +1,92 @@
+[
+  {
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAg9VTf9Wxink8P/9Gzt35BXAoTnz71r26SpALzVQF3kI=\n-----END PUBLIC KEY-----",
+    "organization": "example",
+    "nodes": [
+      {
+        "common_name": "no-address-yet",
+        "endpoints": [
+          {
+            "serial_number": "0",
+            "address_family": "ip4",
+            "address": null,
+            "port": 13000
+          }
+        ],
+        "remarks": {}
+      },
+      {
+        "common_name": "empty-address",
+        "endpoints": [
+          {
+            "serial_number": "0",
+            "address_family": "ip4",
+            "address": "",
+            "port": 13000
+          }
+        ],
+        "remarks": {}
+      },
+      {
+        "common_name": "gateway",
+        "endpoints": [
+          {
+            "serial_number": "0",
+            "address_family": "ip4",
+            "address": "gateway.example.invalid",
+            "port": 13000
+          },
+          {
+            "serial_number": "1",
+            "address_family": "ip6",
+            "address": "gateway.example.invalid",
+            "port": 13000
+          }
+        ],
+        "remarks": {}
+      },
+      {
+        "common_name": "non-sequential-serials",
+        "endpoints": [
+          {
+            "serial_number": "4",
+            "address_family": "ip4",
+            "address": null,
+            "port": 16384
+          },
+          {
+            "serial_number": "6",
+            "address_family": "ip6",
+            "address": null,
+            "port": 16384
+          }
+        ],
+        "remarks": {}
+      }
+    ]
+  },
+  {
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEARXyW/7QhBcIGAIvRtxLHcbFqc+EJjLAK+HNWINI/EUA=\n-----END PUBLIC KEY-----",
+    "organization": "other-org",
+    "nodes": [
+      {
+        "common_name": "literal-address",
+        "endpoints": [
+          {
+            "serial_number": "0",
+            "address_family": "ip4",
+            "address": "192.0.2.1",
+            "port": 13000
+          },
+          {
+            "serial_number": "1",
+            "address_family": "ip6",
+            "address": "2001:db8::1",
+            "port": 13000
+          }
+        ],
+        "remarks": {}
+      }
+    ]
+  }
+]

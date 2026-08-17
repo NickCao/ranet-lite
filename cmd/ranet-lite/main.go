@@ -1,0 +1,226 @@
+// Command ranet-lite is a slim client for a ranet mesh: a minimal IKEv2
+// initiator, userspace ESP, a gvisor netstack, an embedded Babel speaker,
+// and a SOCKS5 front end, all in a single binary that needs no root
+// privileges and no kernel IPsec/routing configuration on the host. It
+// reads the same registry.json and Ed25519 key files as ranet itself, but
+// has its own local configuration format (see internal/config) suited to
+// dialing out to one or a few existing mesh nodes rather than
+// participating in ranet's full N-to-N reconciliation.
+package main
+
+import (
+	"context"
+	"crypto/ed25519"
+	"flag"
+	"fmt"
+	"log"
+	"net/netip"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/config"
+	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/socks5"
+)
+
+const reconnectDelay = 10 * time.Second
+
+func main() {
+	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
+	flag.Parse()
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	priv, err := registry.LoadPrivateKey(cfg.PrivateKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+	reg, err := registry.Load(cfg.Registry)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	mesh, err := netstack.New(0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var sourceAddr netip.Addr
+	if cfg.SourceAddress != "" {
+		sourceAddr, err = netip.ParseAddr(cfg.SourceAddress)
+		if err != nil {
+			log.Fatalf("config: source_address: %v", err)
+		}
+		if err := mesh.AddLocalAddress(sourceAddr); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	speaker, err := babel.New(babel.Config{
+		HelloInterval:  cfg.Babel.HelloInterval,
+		UpdateInterval: cfg.Babel.UpdateInterval,
+		SourceAddress:  sourceAddr,
+	}, mesh)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, p := range cfg.Originate {
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			log.Fatalf("config: originate %q: %v", p, err)
+		}
+		speaker.Originate(prefix)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	for _, p := range cfg.Peers {
+		go runPeer(ctx, priv, cfg, p, reg, mesh, speaker)
+	}
+	go func() {
+		if err := speaker.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("babel: %v", err)
+		}
+	}()
+
+	srv, err := socks5.New(cfg.SOCKS5Listen, mesh)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("SOCKS5 proxy listening on %s", srv.Addr())
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+	if err := srv.Serve(); err != nil && ctx.Err() == nil {
+		log.Fatal(err)
+	}
+}
+
+// runPeer maintains one peer connection for the client's lifetime,
+// reconnecting on any failure (network blip, peer restart, etc.) rather
+// than requiring a manual restart.
+func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker) {
+	name := fmt.Sprintf("%s/%s", p.Organization, p.CommonName)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := connectPeer(ctx, priv, cfg, p, reg, mesh, speaker, name); err != nil {
+			log.Printf("peer %s: %v; reconnecting in %s", name, err, reconnectDelay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconnectDelay):
+		}
+	}
+}
+
+// resolveEndpoint picks which of a node's endpoints to dial: the
+// config-specified serial if given, otherwise the first one whose address
+// actually resolves (a node commonly has endpoints for address families or
+// links that aren't currently usable, e.g. address: null).
+func resolveEndpoint(node registry.Node, serial string) (registry.Endpoint, error) {
+	if serial != "" {
+		ep, ok := node.FindEndpoint(serial)
+		if !ok {
+			return registry.Endpoint{}, fmt.Errorf("no endpoint with serial %q", serial)
+		}
+		return ep, nil
+	}
+	for _, ep := range node.Endpoints {
+		if _, err := ep.ResolveRemote(); err == nil {
+			return ep, nil
+		}
+	}
+	return registry.Endpoint{}, fmt.Errorf("no endpoint currently resolves to an address")
+}
+
+// connectPeer runs one IKE session against a peer end to end: handshake,
+// ESP setup, mesh/babel registration, and servicing the connection until
+// it dies (network failure, peer restart, DPD timeout). Returning means
+// the connection is gone; runPeer decides whether/when to retry.
+func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, name string) error {
+	org, ok := reg.FindOrganization(p.Organization)
+	if !ok {
+		return fmt.Errorf("organization %q not found in registry", p.Organization)
+	}
+	node, ok := org.FindNode(p.CommonName)
+	if !ok {
+		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
+	}
+	ep, err := resolveEndpoint(node, p.SerialNumber)
+	if err != nil {
+		return err
+	}
+	remoteIP, err := ep.ResolveRemote()
+	if err != nil {
+		return err
+	}
+	remotePub, err := org.ParsePublicKey()
+	if err != nil {
+		return err
+	}
+
+	ikeCfg := ike.PeerConfig{
+		Organization:     cfg.Organization,
+		LocalCommonName:  cfg.CommonName,
+		LocalSerial:      cfg.SerialNumber,
+		LocalPrivateKey:  priv,
+		RemoteCommonName: node.CommonName,
+		RemoteSerial:     ep.SerialNumber,
+		RemotePublicKey:  remotePub,
+		RemoteAddr:       remoteIP,
+		RemotePort:       int(ep.Port),
+	}
+	sess, err := ike.Initiate(ikeCfg)
+	if err != nil {
+		return fmt.Errorf("handshake: %w", err)
+	}
+	defer sess.Mux().Close()
+	log.Printf("peer %s: connected (SPI %08x/%08x)", name, sess.Child.LocalSPI, sess.Child.RemoteSPI)
+
+	out, err := esp.NewOutbound(sess.Child)
+	if err != nil {
+		return err
+	}
+	in, err := esp.NewInbound(sess.Child)
+	if err != nil {
+		return err
+	}
+
+	peer := netstack.NewPeer(name, func(raw []byte, nh byte) error {
+		sealed, err := out.Seal(raw, nh)
+		if err != nil {
+			return err
+		}
+		return sess.Mux().SendESP(sealed)
+	})
+	speaker.AddPeer(peer)
+
+	go sess.Run() // answers the peer's DPD liveness checks
+
+	for {
+		pkt, err := sess.Mux().RecvESP()
+		if err != nil {
+			return err
+		}
+		plain, nh, err := in.Open(pkt)
+		if err != nil {
+			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
+			continue
+		}
+		if !speaker.Receive(peer, plain) {
+			mesh.DeliverInbound(plain, nh)
+		}
+	}
+}
