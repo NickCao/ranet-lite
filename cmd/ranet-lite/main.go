@@ -246,7 +246,10 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
 			continue
 		}
-		if !speaker.Receive(peer, plain) {
+		if speaker.Receive(peer, plain) {
+			log.Printf("peer %s: received babel packet (%d bytes)", name, len(plain))
+		} else {
+			log.Printf("peer %s: received %d bytes, next header %d, delivering to mesh", name, len(plain), nh)
 			mesh.DeliverInbound(plain, nh)
 		}
 	}

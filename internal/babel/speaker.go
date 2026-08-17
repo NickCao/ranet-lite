@@ -228,7 +228,9 @@ func (s *Speaker) Run(ctx context.Context) error {
 func (s *Speaker) send(n *neighborState, tlvs []RawTLV) {
 	pkt := buildPacket(s.cfg.LinkLocalAddr, multicastGroup, EncodePacket(tlvs))
 	if err := n.peer.SendRaw(pkt, esp.NextHeaderIPv6); err != nil {
-		log.Printf("babel: send: %v", err)
+		log.Printf("babel: send to %s: %v", n.peer.ID, err)
+	} else {
+		log.Printf("babel: sent %d TLV(s), %d bytes to %s", len(tlvs), len(pkt), n.peer.ID)
 	}
 }
 
