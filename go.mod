@@ -1,4 +1,4 @@
-module github.com/nickcao/ranet-client
+module github.com/NickCao/ranet-lite
 
 go 1.26.3
 

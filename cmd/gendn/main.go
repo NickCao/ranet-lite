@@ -10,7 +10,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/nickcao/ranet-client/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/ike"
 )
 
 func main() {

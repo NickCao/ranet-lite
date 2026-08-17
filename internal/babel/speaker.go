@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nickcao/ranet-client/internal/esp"
-	"github.com/nickcao/ranet-client/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 // multicastGroup is the standard Babel link-local multicast address, RFC

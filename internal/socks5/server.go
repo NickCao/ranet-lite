@@ -17,7 +17,7 @@ import (
 	"github.com/go-gost/core/handler"
 	v5 "github.com/go-gost/x/handler/socks/v5"
 	xlogger "github.com/go-gost/x/logger"
-	"github.com/nickcao/ranet-client/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 type Server struct {

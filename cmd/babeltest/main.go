@@ -17,10 +17,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/nickcao/ranet-client/internal/babel"
-	"github.com/nickcao/ranet-client/internal/esp"
-	"github.com/nickcao/ranet-client/internal/ike"
-	"github.com/nickcao/ranet-client/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/babel"
+	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {

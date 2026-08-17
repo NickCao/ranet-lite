@@ -15,10 +15,10 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/nickcao/ranet-client/internal/esp"
-	"github.com/nickcao/ranet-client/internal/ike"
-	"github.com/nickcao/ranet-client/internal/netstack"
-	"github.com/nickcao/ranet-client/internal/socks5"
+	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/socks5"
 )
 
 func loadPriv(path string) ed25519.PrivateKey {

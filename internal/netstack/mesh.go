@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/nickcao/ranet-client/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/esp"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"

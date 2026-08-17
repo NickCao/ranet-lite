@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"testing"
 
-	"github.com/nickcao/ranet-client/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/ike"
 )
 
 func testChild(t *testing.T) ike.ChildSA {

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nickcao/ranet-client/internal/esp"
-	"github.com/nickcao/ranet-client/internal/ike"
+	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/internal/ike"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"

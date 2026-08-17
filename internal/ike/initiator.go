@@ -8,7 +8,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/nickcao/ranet-client/internal/transport"
+	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
 // PeerConfig describes everything needed to establish one IKEv2 SA with a

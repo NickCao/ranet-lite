@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nickcao/ranet-client/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 )
 
 // wireSpeakerPair connects two Speakers via a plain in-memory relay (no

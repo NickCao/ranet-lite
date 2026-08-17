@@ -8,7 +8,7 @@ import (
 	"strconv"
 
 	"github.com/go-gost/core/chain"
-	"github.com/nickcao/ranet-client/internal/netstack"
+	"github.com/NickCao/ranet-lite/internal/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
