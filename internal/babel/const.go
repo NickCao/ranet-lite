@@ -38,9 +38,11 @@ const (
 const (
 	SubTLVPad1 uint8 = 0
 	SubTLVPadN uint8 = 1
-	// SubTLVTimestamp carries TS_TX/TS_RX for RTT computation, RFC 9616
-	// ("Babel Route Selection with Metric Extensions", the RTT extension).
-	SubTLVTimestamp uint8 = 4
+	// SubTLVTimestamp carries the RTT extension's timestamps, RFC 9616 §6
+	// ("Babel Route Selection with Metric Extensions" — confirmed against
+	// both the RFC text and BIRD's actual wire encoding, which agree: 3,
+	// not the more mnemonic-seeming 4 this was initially miscoded as).
+	SubTLVTimestamp uint8 = 3
 )
 
 // Address Encodings, RFC 8966 §4.4.
@@ -49,11 +51,6 @@ const (
 	AEIPv4          uint8 = 1
 	AEIPv6          uint8 = 2
 	AEIPv6LinkLocal uint8 = 3
-)
-
-// Hello TLV flags, RFC 8966 §4.6.4.
-const (
-	HelloFlagUnicast uint16 = 0x8000
 )
 
 // Special metric value meaning "unreachable" / route retraction, RFC 8966 §4.6.9.

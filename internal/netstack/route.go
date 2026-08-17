@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"fmt"
 	"net/netip"
 	"sync"
 )
@@ -16,6 +17,16 @@ type Peer struct {
 
 func NewPeer(id string, sendFn func(raw []byte, nextHeader byte) error) *Peer {
 	return &Peer{ID: id, sendFn: sendFn}
+}
+
+// SendRaw transmits a hand-built tunnel-mode IP packet directly through
+// this peer, bypassing the mesh's route table. Used by protocols that
+// address a specific peer directly rather than by destination IP — e.g.
+// internal/babel, which multicasts through each peer's own ESP tunnel
+// rather than routing by the (link-local, often peer-agnostic) destination
+// address.
+func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
+	return p.sendFn(raw, nextHeader)
 }
 
 // RouteTable maps destination prefixes to the peer that can reach them,
@@ -71,6 +82,18 @@ func (rt *RouteTable) RemovePeer(peer *Peer) {
 		}
 	}
 	rt.routes = kept
+}
+
+// Debug returns a human-readable dump of every installed route, for
+// diagnostics/tests — not meant for programmatic use.
+func (rt *RouteTable) Debug() []string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	out := make([]string, 0, len(rt.routes))
+	for _, r := range rt.routes {
+		out = append(out, fmt.Sprintf("%s via %s", r.prefix, r.peer.ID))
+	}
+	return out
 }
 
 // Lookup returns the peer with the longest matching prefix for addr.

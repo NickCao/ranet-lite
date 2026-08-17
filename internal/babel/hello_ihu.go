@@ -6,25 +6,32 @@ import (
 	"net"
 )
 
-// Hello is RFC 8966 §4.6.4. On our topology every peer is its own
-// point-to-point link (a separate ESP tunnel), so we always set the
-// Unicast flag (§4.6.4 "Unicast Hello") — there is no shared segment to
-// multicast on.
+// Hello is RFC 8966 §4.6.4. We always send what the RFC calls a
+// "Multicast Hello" (Unicast flag clear) — a slight misnomer, since it's
+// delivered as one packet per neighbor over each point-to-point ESP
+// tunnel, not literally multicast on the wire. The classification matters
+// because implementations (e.g. BIRD) track Multicast- and Unicast-Hello
+// sequence numbers/loss-history in separate buckets per RFC 8966 §3.2.4;
+// setting the Unicast flag while actually delivering to the standard
+// multicast destination address (which our peers, like BIRD, listen on
+// regardless) puts us in the wrong bucket and the Hello is never counted.
 type Hello struct {
 	Seqno    uint16
 	Interval uint16 // centiseconds
-	TSTx     uint32 // RFC 9616 Timestamp sub-TLV; 0 if omitted
+	TxTS     uint32 // RFC 9616 §6.1 Transmit Timestamp (microseconds, arbitrary origin); 0 if omitted
 	HasTS    bool
 }
 
 func EncodeHello(h Hello) RawTLV {
 	body := make([]byte, 6)
-	binary.BigEndian.PutUint16(body[0:2], HelloFlagUnicast)
+	// Flags left at 0: this is a "Multicast Hello" per RFC 8966 §3.2.4's
+	// classification (see the Hello doc comment above) — the Unicast flag
+	// is deliberately never set.
 	binary.BigEndian.PutUint16(body[2:4], h.Seqno)
 	binary.BigEndian.PutUint16(body[4:6], h.Interval)
 	if h.HasTS {
 		ts := make([]byte, 4)
-		binary.BigEndian.PutUint32(ts, h.TSTx)
+		binary.BigEndian.PutUint32(ts, h.TxTS)
 		body = append(body, encodeSubTLVs([]SubTLV{{Type: SubTLVTimestamp, Body: ts}})...)
 	}
 	return RawTLV{Type: TLVHello, Body: body}
@@ -40,7 +47,7 @@ func DecodeHello(body []byte) (Hello, error) {
 	}
 	subs := decodeSubTLVs(body[6:])
 	if ts, ok := findSubTLV(subs, SubTLVTimestamp); ok && len(ts) >= 4 {
-		h.TSTx = binary.BigEndian.Uint32(ts)
+		h.TxTS = binary.BigEndian.Uint32(ts)
 		h.HasTS = true
 	}
 	return h, nil
@@ -52,9 +59,15 @@ func DecodeHello(body []byte) (Hello, error) {
 type IHU struct {
 	RxCost   uint16
 	Interval uint16 // centiseconds
-	TSTx     uint32 // this IHU sender's own clock, for the reverse RTT measurement
-	TSOrigin uint32 // echoes the Hello's TS_TX, RFC 9616
-	HasTS    bool
+	// OriginTS/ReceiveTS are RFC 9616 §6.2: a copy of the Transmit
+	// Timestamp from the last timestamped Hello we received from this
+	// neighbor, and our own clock's reading at the moment we received it
+	// — NOT "now" (the time we're sending this IHU). The asymmetry is the
+	// whole point: it lets the original sender subtract our processing
+	// delay out of its RTT estimate.
+	OriginTS  uint32
+	ReceiveTS uint32
+	HasTS     bool
 }
 
 func EncodeIHU(ihu IHU) RawTLV {
@@ -64,8 +77,8 @@ func EncodeIHU(ihu IHU) RawTLV {
 	binary.BigEndian.PutUint16(body[4:6], ihu.Interval)
 	if ihu.HasTS {
 		ts := make([]byte, 8)
-		binary.BigEndian.PutUint32(ts[0:4], ihu.TSTx)
-		binary.BigEndian.PutUint32(ts[4:8], ihu.TSOrigin)
+		binary.BigEndian.PutUint32(ts[0:4], ihu.OriginTS)
+		binary.BigEndian.PutUint32(ts[4:8], ihu.ReceiveTS)
 		body = append(body, encodeSubTLVs([]SubTLV{{Type: SubTLVTimestamp, Body: ts}})...)
 	}
 	return RawTLV{Type: TLVIHU, Body: body}
@@ -98,8 +111,8 @@ func DecodeIHU(body []byte) (IHU, net.IP, error) {
 	}
 	subs := decodeSubTLVs(rest)
 	if ts, ok := findSubTLV(subs, SubTLVTimestamp); ok && len(ts) >= 8 {
-		ihu.TSTx = binary.BigEndian.Uint32(ts[0:4])
-		ihu.TSOrigin = binary.BigEndian.Uint32(ts[4:8])
+		ihu.OriginTS = binary.BigEndian.Uint32(ts[0:4])
+		ihu.ReceiveTS = binary.BigEndian.Uint32(ts[4:8])
 		ihu.HasTS = true
 	}
 	return ihu, addr, nil

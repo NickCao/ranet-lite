@@ -6,7 +6,7 @@ import (
 )
 
 func TestHelloRoundTrip(t *testing.T) {
-	h := Hello{Seqno: 42, Interval: 2000, TSTx: 123456, HasTS: true}
+	h := Hello{Seqno: 42, Interval: 2000, TxTS: 123456, HasTS: true}
 	tlv := EncodeHello(h)
 	pkt := EncodePacket([]RawTLV{tlv})
 	got, err := DecodePacket(pkt)
@@ -26,7 +26,7 @@ func TestHelloRoundTrip(t *testing.T) {
 }
 
 func TestIHURoundTrip(t *testing.T) {
-	ihu := IHU{RxCost: 96, Interval: 2000, TSTx: 111, TSOrigin: 222, HasTS: true}
+	ihu := IHU{RxCost: 96, Interval: 2000, OriginTS: 111, ReceiveTS: 222, HasTS: true}
 	tlv := EncodeIHU(ihu)
 	decoded, addr, err := DecodeIHU(tlv.Body)
 	if err != nil {

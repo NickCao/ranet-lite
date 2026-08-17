@@ -3,43 +3,60 @@ package babel
 import (
 	"context"
 	"crypto/rand"
-	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/nickcao/ranet-client/internal/esp"
 	"github.com/nickcao/ranet-client/internal/netstack"
-	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
-	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
-	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// multicastGroup is the standard Babel link-local multicast address, RFC
+// 8966 §4.1. Every ranet peer link is point-to-point (its own ESP tunnel),
+// so multicast Hello sent "through" a given peer's tunnel reaches exactly
+// that one peer anyway — the same real-world behavior as BIRD's "tunnel"
+// interface mode, which still uses this address rather than unicast.
+var multicastGroup = netip.MustParseAddr("ff02::1:6")
 
 // neighborState is per-peer Hello/IHU bookkeeping. Every ranet peer is its
 // own point-to-point link (a separate ESP tunnel), so there is exactly one
 // neighborState per netstack.Peer — no interface-level neighbor discovery.
+// addr is learned from the first packet received from this peer, never
+// configured — babel here runs purely on multicast, matching the real
+// deployment this client targets.
 type neighborState struct {
-	id   string
 	peer *netstack.Peer
-	addr netip.Addr
 
-	mu               sync.Mutex
-	alive            bool
-	lastHelloTime    time.Time
-	helloInterval    time.Duration
-	lastHelloTSTx    uint32
-	haveLastHelloTS  bool
+	mu            sync.Mutex
+	addr          netip.Addr
+	alive         bool
+	lastHelloTime time.Time
+	helloInterval time.Duration
+
+	// RFC 9616 RTT extension state. theirHello* is what we need to build
+	// our own outgoing IHU (echoing their last Hello's transmit time plus
+	// our own receive time for it). ourHello* is what we need to validate
+	// and use an incoming IHU that's responding to a Hello *we* sent.
+	theirHelloTxTS uint32
+	theirHelloRxTS uint32
+	haveTheirHello bool
+	ourHelloTxTS   uint32
+	haveOurHello   bool
+
 	reportedCost     uint16 // RxCost the neighbor last told us (its cost of receiving from us)
 	haveReportedCost bool
 	ihuExpiry        time.Time
 	measuredRTT      time.Duration
 	haveRTT          bool
 	routerID         [8]byte
+}
+
+func (n *neighborState) learnAddr(addr netip.Addr) {
+	n.mu.Lock()
+	n.addr = addr
+	n.mu.Unlock()
 }
 
 func deadTimeout(interval time.Duration) time.Duration {
@@ -80,10 +97,18 @@ func (n *neighborState) shouldDeclareDown() bool {
 // defaults matching a typical tunnel-mesh deployment (20s Hello, RTT
 // costing per RFC 9616 up to 1024 over a 1024ms ceiling).
 type Config struct {
-	RouterID       [8]byte // zero => generate a random one
+	RouterID       [8]byte    // zero => generate a random one
+	LinkLocalAddr  netip.Addr // zero => generate a random fe80::/64 address
 	HelloInterval  time.Duration
 	UpdateInterval time.Duration
 	Cost           CostParams
+}
+
+func randomLinkLocal() netip.Addr {
+	var b [16]byte
+	b[0], b[1] = 0xfe, 0x80
+	rand.Read(b[8:])
+	return netip.AddrFrom16(b)
 }
 
 func (c *Config) setDefaults() {
@@ -99,82 +124,69 @@ func (c *Config) setDefaults() {
 	if c.RouterID == ([8]byte{}) {
 		rand.Read(c.RouterID[:])
 	}
+	if !c.LinkLocalAddr.IsValid() {
+		c.LinkLocalAddr = randomLinkLocal()
+	}
 }
 
 // Speaker is a minimal Babel router: it maintains Hello/IHU state with
 // each configured peer, exchanges Update TLVs, and keeps
 // internal/netstack.RouteTable in sync with the best known route per
-// prefix. Babel control traffic itself flows as ordinary UDP through the
-// mesh (see New) — it's just another application on top of the same ESP
-// tunnels, no special-casing needed anywhere else in the stack.
+// prefix. It does not use the mesh's gvisor stack for its own wire I/O —
+// each peer is addressed directly via its netstack.Peer send function and
+// fed received packets directly by the caller's ESP receive loop (see
+// Receive) — only the routes it *learns* go into the shared RouteTable.
 type Speaker struct {
 	cfg  Config
 	mesh *netstack.Mesh
-	udp4 *gonet.UDPConn
-	udp6 *gonet.UDPConn
 
 	mu        sync.Mutex
-	neighbors map[string]*neighborState
-	byAddr    map[netip.Addr]*neighborState
+	neighbors map[string]*neighborState // keyed by netstack.Peer.ID
 	originate map[netip.Prefix]struct{}
 	routes    *routeTable
 
 	changed chan struct{}
 }
 
-// newV6OnlyUDP builds a UDP listener bound to [::]:Port with IPV6_V6ONLY
-// set, so it doesn't collide with the separate IPv4 wildcard listener on
-// the same port (gonet.DialUDP offers no way to set socket options before
-// bind, hence the lower-level endpoint construction here).
-func newV6OnlyUDP(s *stack.Stack) (*gonet.UDPConn, error) {
-	var wq waiter.Queue
-	ep, err := s.NewEndpoint(udp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
-	if err != nil {
-		return nil, fmt.Errorf("new endpoint: %s", err)
-	}
-	ep.SocketOptions().SetV6Only(true)
-	if err := ep.Bind(tcpip.FullAddress{Port: Port}); err != nil {
-		ep.Close()
-		return nil, fmt.Errorf("bind: %s", err)
-	}
-	return gonet.NewUDPConn(&wq, ep), nil
-}
-
 func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 	cfg.setDefaults()
-
-	udp4, err := gonet.DialUDP(mesh.Stack, &tcpip.FullAddress{Port: Port}, nil, ipv4.ProtocolNumber)
-	if err != nil {
-		return nil, fmt.Errorf("babel: listen udp4: %w", err)
-	}
-	// The v4 and v6 listeners share one stack-wide UDP port space, so the
-	// v6 socket must opt out of dual-stack (IPV6_V6ONLY) before binding,
-	// same as on a real dual-stack OS — otherwise binding port 6696 twice
-	// (once per gonet.DialUDP call above) collides.
-	udp6, err := newV6OnlyUDP(mesh.Stack)
-	if err != nil {
-		udp4.Close()
-		return nil, fmt.Errorf("babel: listen udp6: %w", err)
-	}
-
 	return &Speaker{
-		cfg: cfg, mesh: mesh, udp4: udp4, udp6: udp6,
+		cfg: cfg, mesh: mesh,
 		neighbors: map[string]*neighborState{},
-		byAddr:    map[netip.Addr]*neighborState{},
 		originate: map[netip.Prefix]struct{}{},
 		routes:    newRouteTable(),
 		changed:   make(chan struct{}, 1),
 	}, nil
 }
 
-// AddPeer registers a Babel neighbor reachable at addr (the peer's inner
-// mesh address) via the given netstack.Peer (its ESP-backed route).
-func (s *Speaker) AddPeer(id string, addr netip.Addr, peer *netstack.Peer) {
-	n := &neighborState{id: id, peer: peer, addr: addr}
+// AddPeer registers a Babel neighbor over the given netstack.Peer (its
+// ESP-backed tunnel). Its address is learned automatically from the first
+// packet it sends — nothing needs to be configured up front.
+func (s *Speaker) AddPeer(peer *netstack.Peer) {
+	n := &neighborState{peer: peer}
 	s.mu.Lock()
-	s.neighbors[id] = n
-	s.byAddr[addr] = n
+	s.neighbors[peer.ID] = n
 	s.mu.Unlock()
+}
+
+// Receive processes a decrypted packet that arrived via peer's ESP tunnel.
+// It returns true if the packet was Babel control traffic (and so has been
+// fully handled); the caller should deliver anything else (false) to the
+// mesh's netstack as usual.
+func (s *Speaker) Receive(peer *netstack.Peer, raw []byte) bool {
+	src, payload, err := parsePacket(raw)
+	if err != nil {
+		return false
+	}
+	s.mu.Lock()
+	n := s.neighbors[peer.ID]
+	s.mu.Unlock()
+	if n == nil {
+		return false
+	}
+	n.learnAddr(src)
+	s.handlePacket(n, payload)
+	return true
 }
 
 // Originate announces prefix as reachable via this node, with a fixed
@@ -193,34 +205,20 @@ func (s *Speaker) triggerUpdate() {
 	}
 }
 
-// Run services Hello/IHU/Update timers and the receive loop until ctx is
-// canceled.
+// Run services the Hello/IHU/Update timers until ctx is canceled. Unlike
+// the timers, receiving has no loop of its own here — see Receive, which
+// the caller invokes directly from each peer's ESP receive loop.
 func (s *Speaker) Run(ctx context.Context) error {
-	go s.recvLoop(ctx, s.udp4)
-	go s.recvLoop(ctx, s.udp6)
 	go s.helloLoop(ctx)
 	go s.updateLoop(ctx)
 	<-ctx.Done()
-	s.udp4.Close()
-	s.udp6.Close()
 	return ctx.Err()
 }
 
-func (s *Speaker) conn(addr netip.Addr) *gonet.UDPConn {
-	if addr.Is4() {
-		return s.udp4
-	}
-	return s.udp6
-}
-
-func fullAddr(addr netip.Addr) *net.UDPAddr {
-	return &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: Port}
-}
-
 func (s *Speaker) send(n *neighborState, tlvs []RawTLV) {
-	pkt := EncodePacket(tlvs)
-	if _, err := s.conn(n.addr).WriteTo(pkt, fullAddr(n.addr)); err != nil {
-		log.Printf("babel: send to %s: %v", n.addr, err)
+	pkt := buildPacket(s.cfg.LinkLocalAddr, multicastGroup, EncodePacket(tlvs))
+	if err := n.peer.SendRaw(pkt, esp.NextHeaderIPv6); err != nil {
+		log.Printf("babel: send: %v", err)
 	}
 }
 
@@ -254,11 +252,13 @@ func (s *Speaker) helloLoop(ctx context.Context) {
 
 func (s *Speaker) sendHelloIHU(n *neighborState, seqno uint16) {
 	centis := uint16(s.cfg.HelloInterval / (10 * time.Millisecond))
-	tlvs := []RawTLV{EncodeHello(Hello{Seqno: seqno, Interval: centis, TSTx: nowMillis(), HasTS: true})}
+	txTS := nowMicros()
+	tlvs := []RawTLV{EncodeHello(Hello{Seqno: seqno, Interval: centis, TxTS: txTS, HasTS: true})}
 
 	n.mu.Lock()
-	haveTS := n.haveLastHelloTS
-	origin := n.lastHelloTSTx
+	n.ourHelloTxTS, n.haveOurHello = txTS, true
+	haveTheirHello := n.haveTheirHello
+	theirTxTS, theirRxTS := n.theirHelloTxTS, n.theirHelloRxTS
 	n.mu.Unlock()
 
 	rxCost := s.cfg.Cost.RxCost
@@ -269,8 +269,8 @@ func (s *Speaker) sendHelloIHU(n *neighborState, seqno uint16) {
 		rxCost = s.cfg.Cost.Cost(rtt, haveRTT)
 	}
 	ihu := IHU{RxCost: rxCost, Interval: centis}
-	if haveTS {
-		ihu.TSTx, ihu.TSOrigin, ihu.HasTS = nowMillis(), origin, true
+	if haveTheirHello {
+		ihu.OriginTS, ihu.ReceiveTS, ihu.HasTS = theirTxTS, theirRxTS, true
 	}
 	tlvs = append(tlvs, EncodeIHU(ihu))
 	s.send(n, tlvs)
@@ -356,52 +356,16 @@ func aeFor(p netip.Prefix) uint8 {
 
 // --- receiving ---
 
-func (s *Speaker) recvLoop(ctx context.Context, conn *gonet.UDPConn) {
-	buf := make([]byte, 2048) // real deployments should also raise the peer's own rx buffer past the path MTU
-	for {
-		n, addr, err := conn.ReadFrom(buf)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			return
-		}
-		src, ok := addrToNetip(addr)
-		if !ok {
-			continue
-		}
-		s.mu.Lock()
-		neigh := s.byAddr[src]
-		s.mu.Unlock()
-		if neigh == nil {
-			continue // not a configured peer; ignore rather than auto-learn
-		}
-		s.handlePacket(neigh, buf[:n])
-	}
-}
-
-func addrToNetip(a net.Addr) (netip.Addr, bool) {
-	ua, ok := a.(*net.UDPAddr)
-	if !ok {
-		return netip.Addr{}, false
-	}
-	addr, ok := netip.AddrFromSlice(ua.IP)
-	if !ok {
-		return netip.Addr{}, false
-	}
-	return addr.Unmap(), true
-}
-
 func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 	tlvs, err := DecodePacket(raw)
 	if err != nil {
-		log.Printf("babel: bad packet from %s: %v", n.addr, err)
+		log.Printf("babel: bad packet: %v", err)
 		return
 	}
 	prefixDec := &PrefixDecoder{}
 	var curRouterID [8]byte
+	var freshHelloTxTS uint32
+	var haveFreshHello bool
 
 	for _, t := range tlvs {
 		switch t.Type {
@@ -410,12 +374,14 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			if err != nil {
 				continue
 			}
+			recvTS := nowMicros()
 			n.mu.Lock()
 			n.alive = true
 			n.lastHelloTime = time.Now()
 			n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
 			if h.HasTS {
-				n.lastHelloTSTx, n.haveLastHelloTS = h.TSTx, true
+				n.theirHelloTxTS, n.theirHelloRxTS, n.haveTheirHello = h.TxTS, recvTS, true
+				freshHelloTxTS, haveFreshHello = h.TxTS, true
 			}
 			n.mu.Unlock()
 
@@ -424,13 +390,21 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			if err != nil {
 				continue
 			}
+			now := nowMicros()
 			n.mu.Lock()
 			n.reportedCost = ihu.RxCost
 			n.haveReportedCost = true
 			n.ihuExpiry = time.Now().Add(time.Duration(ihu.Interval) * 10 * time.Millisecond * 7 / 2)
-			if ihu.HasTS {
-				n.measuredRTT = time.Duration(nowMillis()-ihu.TSOrigin) * time.Millisecond
-				n.haveRTT = true
+			// RFC 9616 §3: this IHU only yields an RTT sample if it
+			// answers a Hello we actually sent (OriginTS matches) *and*
+			// the same packet also carries a fresh Hello from them — that
+			// second timestamp is what lets us subtract their processing
+			// delay back out, rather than counting it as network latency.
+			if ihu.HasTS && haveFreshHello && n.haveOurHello && ihu.OriginTS == n.ourHelloTxTS {
+				rtt := microDelta(now, n.ourHelloTxTS) - microDelta(freshHelloTxTS, ihu.ReceiveTS)
+				if rtt > 0 {
+					n.measuredRTT, n.haveRTT = rtt, true
+				}
 			}
 			n.mu.Unlock()
 
@@ -443,7 +417,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 		case TLVUpdate:
 			u, err := prefixDec.Decode(t.Body)
 			if err != nil {
-				log.Printf("babel: bad Update from %s: %v", n.addr, err)
+				log.Printf("babel: bad Update: %v", err)
 				continue
 			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
@@ -451,6 +425,17 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				continue
 			}
 			prefix := netip.PrefixFrom(addr.Unmap(), u.Plen)
+			if curRouterID == s.cfg.RouterID {
+				// This route is ours. Split horizon (RFC 8966 §3.7.4)
+				// only ever suppresses re-advertising back out the *one*
+				// interface a route was learned on, so it does nothing
+				// against our own prefix looping back via a *different*
+				// peer after crossing other nodes in an actual mesh — the
+				// router-id is the general, mesh-wide-safe check.
+				// Accepting it would redirect our own traffic out through
+				// that peer.
+				continue
+			}
 			ttl := time.Duration(u.Interval) * 10 * time.Millisecond * 7 / 2
 			changed, sel := s.routes.update(n, prefix, curRouterID, u.Seqno, u.Metric, ttl)
 			if changed {

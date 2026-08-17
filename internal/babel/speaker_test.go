@@ -2,6 +2,7 @@ package babel
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -9,63 +10,59 @@ import (
 	"github.com/nickcao/ranet-client/internal/netstack"
 )
 
-// wireMeshes connects two Mesh instances with a plain in-memory relay (no
-// ESP/crypto — that's validated separately), mirroring
-// netstack.TestTCPAcrossMesh. It gives Speaker a real gvisor stack to send
-// and receive real UDP packets over, without needing a live network.
-func wireMeshes(t *testing.T, addrA, addrB netip.Addr) (a, b *netstack.Mesh) {
+// wireSpeakerPair connects two Speakers via a plain in-memory relay (no
+// ESP/crypto — that's validated separately) that threads peer identity
+// correctly: each side's netstack.Peer represents "the other side" from
+// its own point of view, exactly as in the real client where each peer
+// object corresponds to one ESP session. Non-Babel traffic (Receive
+// returns false) falls through to the mesh, mirroring how a real
+// per-peer ESP receive loop would dispatch between babel and app traffic.
+func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, speakerA, speakerB *Speaker) {
 	t.Helper()
-	a, err := netstack.New(0)
+	var err error
+	meshA, err = netstack.New(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(a.Close)
-	b, err = netstack.New(0)
+	t.Cleanup(meshA.Close)
+	meshB, err = netstack.New(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(b.Close)
+	t.Cleanup(meshB.Close)
 
-	if err := a.AddLocalAddress(addrA); err != nil {
+	speakerA, err = New(cfg, meshA)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.AddLocalAddress(addrB); err != nil {
+	speakerB, err = New(cfg, meshB)
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	peerB := netstack.NewPeer("b", func(raw []byte, nh byte) error { b.DeliverInbound(raw, nh); return nil })
-	peerA := netstack.NewPeer("a", func(raw []byte, nh byte) error { a.DeliverInbound(raw, nh); return nil })
-	a.Routes.Set(netip.PrefixFrom(addrB, 32), peerB)
-	b.Routes.Set(netip.PrefixFrom(addrA, 32), peerA)
-	return a, b
+	var peerAForB, peerBForA *netstack.Peer
+	peerBForA = netstack.NewPeer("b", func(raw []byte, nh byte) error {
+		if !speakerB.Receive(peerAForB, raw) {
+			meshB.DeliverInbound(raw, nh)
+		}
+		return nil
+	})
+	peerAForB = netstack.NewPeer("a", func(raw []byte, nh byte) error {
+		if !speakerA.Receive(peerBForA, raw) {
+			meshA.DeliverInbound(raw, nh)
+		}
+		return nil
+	})
+	speakerA.AddPeer(peerBForA)
+	speakerB.AddPeer(peerAForB)
+	return meshA, meshB, speakerA, speakerB
 }
 
 func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
-	addrA := netip.MustParseAddr("10.66.0.1")
-	addrB := netip.MustParseAddr("10.66.0.2")
-	meshA, meshB := wireMeshes(t, addrA, addrB)
-
 	fast := Config{HelloInterval: 50 * time.Millisecond, UpdateInterval: 100 * time.Millisecond}
+	meshA, _, speakerA, speakerB := wireSpeakerPair(t, fast)
 
-	speakerA, err := New(fast, meshA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	speakerB, err := New(fast, meshB)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// A and B are each other's only neighbor, matching the real topology:
-	// each netstack.Peer is one ESP tunnel to one peer.
-	peerBForA := netstack.NewPeer("b", func(raw []byte, nh byte) error { meshB.DeliverInbound(raw, nh); return nil })
-	peerAForB := netstack.NewPeer("a", func(raw []byte, nh byte) error { meshA.DeliverInbound(raw, nh); return nil })
-	speakerA.AddPeer("b", addrB, peerBForA)
-	speakerB.AddPeer("a", addrA, peerAForB)
-
-	// B originates its own address; A should learn a route to it via babel.
 	extra := netip.MustParsePrefix("10.66.9.9/32")
-	speakerB.Originate(netip.PrefixFrom(addrB, 32))
 	speakerB.Originate(extra)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -105,30 +102,43 @@ func TestSpeakerLearnsRouteAndRTT(t *testing.T) {
 	t.Fatal("A never measured RTT to B within the deadline")
 }
 
+// TestSpeakerIgnoresEchoedOwnPrefix guards against a real bug found during
+// BIRD interop: a peer that doesn't implement split horizon (BIRD doesn't,
+// at least over "type tunnel") re-sends our own originated prefix back to
+// us. Split horizon (RFC 8966 §3.7.4) only ever suppresses re-advertising
+// back out the *one* interface a route was learned on — it says nothing
+// about our own prefix looping back via a *different* peer after crossing
+// other nodes in an actual mesh, so the real guard has to be router-id
+// based, not "did this arrive on the peer I sent it to". This injects a
+// non-compliant Update tagged with our own router-id, exactly what BIRD
+// was observed sending on the wire.
+func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
+	meshA, _, speakerA, _ := wireSpeakerPair(t, Config{})
+
+	mine := netip.MustParsePrefix("fd00:68::9/128")
+	speakerA.Originate(mine)
+
+	n := speakerA.neighbors["b"]
+	if n == nil {
+		t.Fatal("peer \"b\" not registered")
+	}
+	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
+		EncodeRouterID(speakerA.cfg.RouterID), // as if reflected back via another mesh node
+		EncodeUpdate(Update{AE: AEIPv6, Plen: mine.Bits(), Seqno: 1, Metric: 32, Prefix: net.IP(mine.Addr().AsSlice())}),
+	}))
+	speakerA.handlePacket(n, pkt[ipv6HeaderLen+udpHeaderLen:])
+
+	if peer, ok := meshA.Routes.Lookup(mine.Addr()); ok {
+		t.Fatalf("A installed a learned route for its own originated prefix via peer %q", peer.ID)
+	}
+}
+
 func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
-	addrA := netip.MustParseAddr("10.67.0.1")
-	addrB := netip.MustParseAddr("10.67.0.2")
-	meshA, meshB := wireMeshes(t, addrA, addrB)
-
 	fast := Config{HelloInterval: 30 * time.Millisecond, UpdateInterval: 60 * time.Millisecond}
-	speakerA, err := New(fast, meshA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	speakerB, err := New(fast, meshB)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	peerBForA := netstack.NewPeer("b", func(raw []byte, nh byte) error { meshB.DeliverInbound(raw, nh); return nil })
-	speakerA.AddPeer("b", addrB, peerBForA)
+	meshA, _, speakerA, speakerB := wireSpeakerPair(t, fast)
 
 	extra := netip.MustParsePrefix("10.67.9.9/32")
 	speakerB.Originate(extra)
-	// B never learns about A (one-directional is enough to prove retraction);
-	// give B no peers so it just sends Hello/Update into the void via A's
-	// mesh route, which A does receive.
-	speakerB.AddPeer("a", addrA, netstack.NewPeer("a", func(raw []byte, nh byte) error { meshA.DeliverInbound(raw, nh); return nil }))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -2,12 +2,22 @@ package babel
 
 import "time"
 
-// nowMillis is a 32-bit millisecond clock for RFC 9616 Timestamp sub-TLVs.
-// It wraps every ~49.7 days; since we only ever subtract two nearby
-// samples (this node's own clock, never compared across nodes), wraparound
-// is harmless as long as no single RTT measurement spans that long.
-func nowMillis() uint32 {
-	return uint32(time.Now().UnixMilli())
+// nowMicros is a 32-bit microsecond clock for RFC 9616 Timestamp sub-TLVs
+// (§6: "expressed in units of one microsecond ... wrap around every 4295
+// seconds"). We only ever difference two nearby samples of our own clock
+// (see microDelta), never compare across nodes' clocks directly, so that
+// ~71-minute wraparound is harmless as long as no single measurement spans
+// it.
+func nowMicros() uint32 {
+	return uint32(time.Now().UnixMicro())
+}
+
+// microDelta computes b-a as a wraparound-safe signed duration, the same
+// trick TCP uses for sequence numbers: reinterpreting the unsigned
+// difference as a signed 32-bit value is correct as long as the true gap
+// is less than half the modulus (here, well under the ~71-minute wrap).
+func microDelta(b, a uint32) time.Duration {
+	return time.Duration(int32(b-a)) * time.Microsecond
 }
 
 // CostParams configures RTT-based costing, RFC 9616. Defaults mirror a
