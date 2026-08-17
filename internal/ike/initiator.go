@@ -29,8 +29,7 @@ type PeerConfig struct {
 	LocalAddr  net.IP // "" => wildcard
 	LocalPort  int    // 0 => ephemeral
 	RemoteAddr net.IP
-	RemotePort int // ranet registry endpoint port (often non-standard, e.g. 13000)
-	NATTPort   int // 0 => 4500
+	RemotePort int // ranet registry endpoint port (often non-standard, e.g. 13000); the only port ever used, IKE and ESP alike
 }
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
@@ -67,9 +66,8 @@ type Session struct {
 func (s *Session) Mux() *transport.Mux { return s.mux }
 
 const (
-	defaultNATTPort = 4500
-	requestTimeout  = 2 * time.Second
-	maxRetransmits  = 5
+	requestTimeout = 2 * time.Second
+	maxRetransmits = 5
 )
 
 func randUint64Nonzero() uint64 {
@@ -132,20 +130,19 @@ func espProposal(spi []byte) Proposal {
 // Initiate runs IKE_SA_INIT then IKE_AUTH against cfg.RemoteAddr:RemotePort
 // and returns an established Session with one Child SA. It implements
 // exactly RFC 7815's minimal-initiator surface plus what ranet's
-// strongSwan deployments require: raw Ed25519 signature auth and forced
-// NAT-T floating (no certs, no EAP, no MOBIKE, no rekey).
+// strongSwan deployments require: raw Ed25519 signature auth and
+// unconditional UDP encapsulation on that one explicit port — every IKE
+// message, from IKE_SA_INIT onward, carries the non-ESP marker; there is
+// no NAT-T floating to a separate port (no certs, no EAP, no MOBIKE, no
+// rekey).
 func Initiate(cfg PeerConfig) (*Session, error) {
-	nattPort := cfg.NATTPort
-	if nattPort == 0 {
-		nattPort = defaultNATTPort
-	}
 	local := ""
 	if cfg.LocalAddr != nil {
 		local = cfg.LocalAddr.String()
 	}
 	local = fmt.Sprintf("%s:%d", local, cfg.LocalPort)
 
-	mux, err := transport.Dial(local, cfg.RemoteAddr, cfg.RemotePort, nattPort)
+	mux, err := transport.Dial(local, cfg.RemoteAddr, cfg.RemotePort)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +181,8 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 			{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_SIGNATURE_HASH_ALGORITHMS, Data: hashAlgos})},
 		}
 		// NAT_DETECTION notifies: sent for spec compliance; ranet forces
-		// UDP encapsulation regardless of the result (see transport.Mux.Float).
+		// UDP encapsulation unconditionally regardless of the result, on
+		// the one explicit registry port (see transport.Mux doc comment).
 		if cfg.LocalAddr != nil {
 			srcHash := natDetectionHash(spiI, 0, cfg.LocalAddr, uint16(mux.LocalAddr().(*net.UDPAddr).Port))
 			payloads = append(payloads, RawPayload{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NAT_DETECTION_SOURCE_IP, Data: srcHash})})
@@ -254,11 +252,6 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		mux.Close()
 		return nil, err
 	}
-
-	// ranet forces `encap = yes` on every connection, so we always float to
-	// the NAT-T port for IKE_AUTH onward instead of conditionally reacting
-	// to the NAT_DETECTION_* hashes (see transport.Mux doc comment).
-	mux.Float()
 
 	sess := &Session{
 		mux: mux, suite: suite,

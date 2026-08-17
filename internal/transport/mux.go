@@ -1,9 +1,11 @@
 // Package transport owns the single UDP socket shared by the IKE control
-// channel and UDP-encapsulated ESP data, exactly as a NAT-T-floated IKEv2
-// session does on the wire (RFC 3948 / RFC 7296 §2.23): once floated to the
-// NAT-T port, IKE messages are prefixed with a 4-byte zero "non-ESP marker"
-// and ESP packets are sent bare (their SPI, always nonzero, disambiguates
-// them from the marker on receive).
+// channel and UDP-encapsulated ESP data. ranet's strongSwan deployments
+// force UDP encapsulation unconditionally (`encap = yes`) on the one
+// explicit registry port — there is no separate NAT-T port and no
+// floating: every IKE message, including the very first IKE_SA_INIT
+// request, is prefixed with a 4-byte zero "non-ESP marker" (RFC 3948 /
+// RFC 7296 §2.23), and ESP packets are sent bare (their SPI, always
+// nonzero, disambiguates them from the marker on receive).
 package transport
 
 import (
@@ -24,8 +26,6 @@ type Mux struct {
 	conn       *net.UDPConn
 	remoteIP   net.IP
 	remotePort int
-	nattPort   int
-	floated    atomic.Bool
 
 	ikeCh chan []byte
 	espCh chan []byte
@@ -52,9 +52,10 @@ func (m *Mux) closeDone(err error) {
 
 // Dial opens the shared socket. localAddr may be "" to let the OS pick an
 // ephemeral port on all interfaces. remoteAddr:remotePort is the peer's
-// configured IKE endpoint (e.g. ranet registry port, commonly non-standard
-// such as 13000); nattPort is the well-known port (4500) used after floating.
-func Dial(localAddr string, remoteIP net.IP, remotePort, nattPort int) (*Mux, error) {
+// configured IKE endpoint — ranet's registry port, commonly non-standard
+// (e.g. 13000) — and is the only port ever used; there is no separate
+// NAT-T port and no floating.
+func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: resolve local addr: %w", err)
@@ -67,7 +68,6 @@ func Dial(localAddr string, remoteIP net.IP, remotePort, nattPort int) (*Mux, er
 		conn:       conn,
 		remoteIP:   remoteIP,
 		remotePort: remotePort,
-		nattPort:   nattPort,
 		ikeCh:      make(chan []byte, 16),
 		espCh:      make(chan []byte, 256),
 		done:       make(chan struct{}),
@@ -78,35 +78,23 @@ func Dial(localAddr string, remoteIP net.IP, remotePort, nattPort int) (*Mux, er
 
 func (m *Mux) LocalAddr() net.Addr { return m.conn.LocalAddr() }
 
-// Float switches all subsequent traffic to the NAT-T port and starts
-// prefixing outbound IKE messages with the non-ESP marker, per RFC 7296
-// §2.23. ranet always forces UDP encapsulation, so the initiator floats
-// unconditionally right after IKE_SA_INIT rather than relying on the
-// NAT_DETECTION_* hash comparison to decide.
-func (m *Mux) Float() {
-	m.remotePort = m.nattPort
-	m.floated.Store(true)
-}
-
-func (m *Mux) Floated() bool { return m.floated.Load() }
-
 func (m *Mux) remoteAddr() *net.UDPAddr {
 	return &net.UDPAddr{IP: m.remoteIP, Port: m.remotePort}
 }
 
-// SendIKE writes one IKE message, adding the non-ESP marker if floated.
+// SendIKE writes one IKE message, always prefixed with the non-ESP marker
+// — ranet forces UDP encapsulation unconditionally, so even the very first
+// IKE_SA_INIT request must carry it; the responder isn't listening for a
+// bare (unmarked) ISAKMP header on this port at all.
 func (m *Mux) SendIKE(b []byte) error {
-	out := b
-	if m.floated.Load() {
-		out = make([]byte, nonESPMarkerLen+len(b))
-		copy(out[nonESPMarkerLen:], b)
-	}
+	out := make([]byte, nonESPMarkerLen+len(b))
+	copy(out[nonESPMarkerLen:], b)
 	_, err := m.conn.WriteToUDP(out, m.remoteAddr())
 	return err
 }
 
-// SendESP writes one raw ESP packet. Only valid once floated (ranet always
-// forces encapsulation, so ESP is always UDP-encapsulated in this client).
+// SendESP writes one raw ESP packet, always UDP-encapsulated (bare, no
+// marker — its nonzero SPI disambiguates it from the marker on receive).
 func (m *Mux) SendESP(b []byte) error {
 	_, err := m.conn.WriteToUDP(b, m.remoteAddr())
 	return err
@@ -186,19 +174,12 @@ func (m *Mux) readLoop() {
 			return
 		}
 		pkt := append([]byte{}, buf[:n]...)
-		switch {
-		case n >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]):
+		if n >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]) {
 			select {
 			case m.ikeCh <- pkt[nonESPMarkerLen:]:
 			default:
 			}
-		case !m.floated.Load():
-			// Pre-float, IKE messages carry no marker at all.
-			select {
-			case m.ikeCh <- pkt:
-			default:
-			}
-		default:
+		} else {
 			select {
 			case m.espCh <- pkt:
 			default:

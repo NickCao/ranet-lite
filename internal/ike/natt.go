@@ -10,9 +10,11 @@ import (
 // data, RFC 7296 §2.23: SHA-1(SPIi | SPIr | Address | Port).
 //
 // ranet's strongSwan connections force UDP encapsulation (`encap: true`)
-// regardless of whether a NAT is actually present, so this client always
-// sends both notifications and unconditionally follows the responder's lead
-// on floating to port 4500 — it does not try to detect NAT itself.
+// unconditionally, on the one explicit registry port, regardless of
+// whether a NAT is actually present — this client always sends both
+// notifications for spec compliance but never acts on the comparison:
+// every IKE message is marker-prefixed from IKE_SA_INIT onward and there
+// is no separate NAT-T port to float to.
 func natDetectionHash(spiI, spiR uint64, ip net.IP, port uint16) []byte {
 	h := sha1.New()
 	var spi [16]byte
