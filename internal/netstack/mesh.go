@@ -83,8 +83,19 @@ func (m *Mesh) outboundLoop() {
 		if err != nil {
 			return // device closed
 		}
+		// Dispatch each packet's routing + ESP encryption concurrently
+		// rather than one at a time on this single goroutine: sendOut
+		// chains into a peer's Seal() (AES-GCM/ChaCha20-Poly1305, CPU-
+		// bound) and a UDP write, both safe for concurrent use — Seal
+		// only serializes sequence/IV allocation, not the encryption
+		// itself (see esp.OutboundSA.nextSeq), and net.UDPConn is safe
+		// for concurrent writes. Serializing this on one goroutine would
+		// otherwise cap the whole mesh's outbound throughput — every
+		// peer, every flow — at one CPU core's encryption rate. Each
+		// packet gets its own copy since bufs is reused by the next Read.
 		for i := 0; i < n; i++ {
-			m.sendOut(bufs[i][:sizes[i]])
+			raw := append([]byte(nil), bufs[i][:sizes[i]]...)
+			go m.sendOut(raw)
 		}
 	}
 }

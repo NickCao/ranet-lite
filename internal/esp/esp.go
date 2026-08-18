@@ -75,15 +75,17 @@ func NewInbound(child ike.ChildSA) (*InboundSA, error) {
 
 // Seal wraps one tunnel-mode IP packet (nextHeader identifies its version,
 // NextHeaderIPv4/IPv6) into a full ESP packet ready for UDP encapsulation.
+// The only part of this that needs to be serialized is sequence/IV
+// allocation (see nextSeq) — the padding and AEAD work below touch no
+// shared state, so concurrent callers each encrypt in parallel once
+// they've been handed a unique seq. Go's AEAD implementations (AES-GCM,
+// ChaCha20-Poly1305) are safe for concurrent Seal calls on the same
+// instance as long as each call uses a distinct nonce, which nextSeq
+// guarantees.
 func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	o.seq++
-	if o.seq > 0xffffffff {
-		// No ESN, no rekey in this minimal client: once the 32-bit sequence
-		// space is exhausted the SA is unusable and must be re-established.
-		return nil, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
+	seq, err := o.nextSeq()
+	if err != nil {
+		return nil, err
 	}
 
 	trailerLen := 2 // pad length + next header octets
@@ -99,13 +101,27 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 
 	out := make([]byte, headerLen+o.params.IVLen)
 	binary.BigEndian.PutUint32(out[0:4], o.spi)
-	binary.BigEndian.PutUint32(out[4:8], uint32(o.seq))
-	binary.BigEndian.PutUint64(out[8:8+o.params.IVLen], o.seq) // unique per packet, monotonic
+	binary.BigEndian.PutUint32(out[4:8], uint32(seq))
+	binary.BigEndian.PutUint64(out[8:8+o.params.IVLen], seq) // unique per packet, monotonic
 
 	nonce := append(append([]byte{}, o.salt...), out[headerLen:headerLen+o.params.IVLen]...)
 	aad := out[:headerLen]
 	ciphertext := o.aead.Seal(nil, nonce, plain, aad)
 	return append(out, ciphertext...), nil
+}
+
+// nextSeq atomically allocates the next sequence number, the only state
+// Seal needs to serialize.
+func (o *OutboundSA) nextSeq() (uint64, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.seq++
+	if o.seq > 0xffffffff {
+		// No ESN, no rekey in this minimal client: once the 32-bit sequence
+		// space is exhausted the SA is unusable and must be re-established.
+		return 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
+	}
+	return o.seq, nil
 }
 
 // Open validates and decrypts one ESP packet addressed to this SA's SPI,

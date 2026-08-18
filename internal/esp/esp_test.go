@@ -3,6 +3,9 @@ package esp
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
@@ -109,6 +112,63 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	w.commit(10000 + windowSize + 500)
 	if err := w.check(10000); err == nil {
 		t.Fatal("a sequence far behind after a large jump should be rejected as too old, not silently accepted")
+	}
+}
+
+// TestSealConcurrentUniqueSeq guards the split between nextSeq (locked)
+// and the actual AEAD compute (unlocked, safe for concurrent use) in
+// Seal: many goroutines sealing concurrently must never collide on a
+// sequence number/IV, and the receiver must decrypt every one of them
+// (Open, run sequentially here, doesn't care what order Seal calls
+// completed in — only that all resulting sequence numbers are distinct
+// and within the replay window relative to each other).
+func TestSealConcurrentUniqueSeq(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ike.ChildSA{
+		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 200
+	pkts := make([][]byte, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			pkt, err := out.Seal([]byte(fmt.Sprintf("packet-%d", i)), NextHeaderIPv4)
+			if err != nil {
+				t.Errorf("Seal: %v", err)
+				return
+			}
+			pkts[i] = pkt
+		}(i)
+	}
+	wg.Wait()
+
+	seen := map[uint32]bool{}
+	for i, pkt := range pkts {
+		if pkt == nil {
+			continue
+		}
+		seq := binary.BigEndian.Uint32(pkt[4:8])
+		if seen[seq] {
+			t.Fatalf("packet %d: sequence number %d reused", i, seq)
+		}
+		seen[seq] = true
+		if _, _, err := in.Open(pkt); err != nil {
+			t.Fatalf("packet %d (seq %d): %v", i, seq, err)
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("got %d distinct sequence numbers, want %d", len(seen), n)
 	}
 }
 
