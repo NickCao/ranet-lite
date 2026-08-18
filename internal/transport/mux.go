@@ -23,18 +23,28 @@ import (
 const nonESPMarkerLen = 4
 
 // espSendBatch bounds how many queued ESP packets sendESPLoop coalesces
-// into one sendmmsg(2) call. A CPU profile under load showed roughly half
-// of all time spent in the write syscall alone — one syscall per packet —
-// with AEAD encryption itself barely registering; batching is the direct
-// fix, mirroring netstack.Mesh's TUN write batching for the same reason.
-const espSendBatch = 128
+// into one sendmmsg(2) call, and readBatchSize how many inbound datagrams
+// readLoop reads with one recvmmsg(2) call. A CPU profile under load
+// showed roughly half of all time spent in the write syscall alone — one
+// syscall per packet — with AEAD encryption barely registering; the read
+// side has the identical problem in the opposite direction: one
+// ReadFromUDP syscall per incoming datagram is slow enough, under a fast
+// enough real sender, to risk overflowing the kernel's UDP receive
+// buffer — real, silent packet loss that happens before our replay
+// window or anything else in this codebase ever sees the packet.
+const (
+	espSendBatch   = 128
+	readBatchSize  = 128
+	readBufferSize = 65536
+)
 
-// batchWriter abstracts ipv4.PacketConn and ipv6.PacketConn's WriteBatch:
-// both Message types are aliases for the same underlying
-// golang.org/x/net/internal/socket.Message, so either concrete type
-// satisfies this identically.
-type batchWriter interface {
+// batchConn abstracts ipv4.PacketConn and ipv6.PacketConn's
+// WriteBatch/ReadBatch: both Message types are aliases for the same
+// underlying golang.org/x/net/internal/socket.Message, so either
+// concrete type satisfies this identically.
+type batchConn interface {
 	WriteBatch(ms []ipv4.Message, flags int) (int, error)
+	ReadBatch(ms []ipv4.Message, flags int) (int, error)
 }
 
 // Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
@@ -45,7 +55,7 @@ type Mux struct {
 	conn       *net.UDPConn
 	remoteIP   net.IP
 	remotePort int
-	batch      batchWriter
+	batch      batchConn
 
 	ikeCh  chan []byte
 	espCh  chan []byte
@@ -85,7 +95,7 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen: %w", err)
 	}
-	var batch batchWriter
+	var batch batchConn
 	if remoteIP.To4() != nil {
 		batch = ipv4.NewPacketConn(conn)
 	} else {
@@ -230,9 +240,14 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 }
 
 func (m *Mux) readLoop() {
-	buf := make([]byte, 65536)
+	bufs := make([][]byte, readBatchSize)
+	msgs := make([]ipv4.Message, readBatchSize)
+	for i := range bufs {
+		bufs[i] = make([]byte, readBufferSize)
+		msgs[i].Buffers = [][]byte{bufs[i]}
+	}
 	for {
-		n, _, err := m.conn.ReadFromUDP(buf)
+		n, err := m.batch.ReadBatch(msgs, 0)
 		if err != nil {
 			if m.closed.Load() {
 				m.closeDone(fmt.Errorf("transport: closed"))
@@ -241,16 +256,21 @@ func (m *Mux) readLoop() {
 			m.closeDone(fmt.Errorf("transport: read: %w", err))
 			return
 		}
-		pkt := append([]byte{}, buf[:n]...)
-		if n >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]) {
-			select {
-			case m.ikeCh <- pkt[nonESPMarkerLen:]:
-			default:
-			}
-		} else {
-			select {
-			case m.espCh <- pkt:
-			default:
+		for i := 0; i < n; i++ {
+			raw := bufs[i][:msgs[i].N]
+			pkt := append([]byte{}, raw...) // bufs[i] is reused by the next ReadBatch call
+			if len(pkt) >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]) {
+				select {
+				case m.ikeCh <- pkt[nonESPMarkerLen:]:
+				default:
+					log.Printf("transport: ikeCh full, dropping IKE message")
+				}
+			} else {
+				select {
+				case m.espCh <- pkt:
+				default:
+					log.Printf("transport: espCh full, dropping ESP packet")
+				}
 			}
 		}
 	}

@@ -105,6 +105,53 @@ func TestSendIKEUnbatchedAndMarked(t *testing.T) {
 	}
 }
 
+func testRecvESPBatch(t *testing.T, network, addr string) {
+	server := listenPeer(t, network, addr)
+	serverAddr := server.LocalAddr().(*net.UDPAddr)
+
+	m, err := Dial("", serverAddr.IP, serverAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	clientAddr := m.LocalAddr().(*net.UDPAddr)
+	// LocalAddr() on this Mux is wildcard-bound ("::" or "0.0.0.0"), which
+	// isn't a valid destination — send to the actual loopback address the
+	// test is using instead, at the port Dial picked.
+	dst := &net.UDPAddr{IP: net.ParseIP(addr), Port: clientAddr.Port}
+
+	// Sent back-to-back with no synchronization, so readLoop's ReadBatch
+	// has a real chance to pick up more than one of these in a single
+	// call — this is the actual code path under test.
+	const n = 200
+	for i := 0; i < n; i++ {
+		pkt := []byte{0xaa, 0xbb, 0xcc, 0xdd, byte(i), byte(i >> 8), 0, 1}
+		if _, err := server.WriteToUDP(pkt, dst); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	got := map[int]bool{}
+	for i := 0; i < n; i++ {
+		pkt, err := m.RecvESP()
+		if err != nil {
+			t.Fatalf("RecvESP %d/%d: %v", i, n, err)
+		}
+		got[int(pkt[4])|int(pkt[5])<<8] = true
+	}
+	if len(got) != n {
+		t.Fatalf("got %d distinct packets, want %d", len(got), n)
+	}
+}
+
+func TestRecvESPBatchIPv4(t *testing.T) {
+	testRecvESPBatch(t, "udp4", "127.0.0.1")
+}
+
+func TestRecvESPBatchIPv6(t *testing.T) {
+	testRecvESPBatch(t, "udp6", "::1")
+}
+
 // TestRecvESPAndIKEDemux confirms the receive-side demux (marker present
 // -> IKE, absent -> ESP) still works correctly regardless of whether the
 // sender used a batched or unbatched write — it's a plain UDP receiver on
