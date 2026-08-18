@@ -231,39 +231,27 @@ func (m *Mesh) DeliverInbound(raw []byte, _ byte) {
 	}
 }
 
-// inboundLoop batches decrypted packets into as few Device.Write calls as
-// possible. Writing one packet per syscall, as a naive implementation
-// would, also means the TUN device never sees more than one buffer per
-// call, so it can never exercise its own GSO/GRO coalescing for
-// same-flow packets — batching here is what lets that actually kick in,
-// on top of the more basic win of fewer syscalls under load. It only
-// batches what's *already* waiting (a non-blocking drain), so a lone
-// packet with nothing queued behind it is written immediately with no
-// added latency; batching only happens when arrivals are bursty enough
-// that there's really something to gain from it.
+// inboundLoop writes decrypted packets to the TUN device one at a time,
+// each in its own Device.Write call. This is a deliberate, temporary
+// diagnostic downgrade from batching multiple packets into one call:
+// wireguard-go's Write path always attempts GRO coalescing across every
+// buffer in a single call when the device has a virtio-net header
+// (which it always does here), and that's the one place in this
+// codebase where multiple independently-decrypted packets are ever
+// handed to the kernel together. Writing one buffer per call makes
+// coalescing structurally impossible (the GRO flow table is reset every
+// call), isolating whether that machinery is implicated in the
+// inbound-only packet loss under investigation.
 func (m *Mesh) inboundLoop() {
-	batch := m.dev.BatchSize()
-	bufs := make([][]byte, 0, batch)
 	for {
 		select {
 		case <-m.done:
 			return
 		case buf := <-m.inbound:
-			bufs = append(bufs, buf)
-		}
-	drain:
-		for len(bufs) < batch {
-			select {
-			case buf := <-m.inbound:
-				bufs = append(bufs, buf)
-			default:
-				break drain
+			if _, err := m.dev.Write([][]byte{buf}, writeOffset); err != nil {
+				log.Printf("netstack: write to tun device: %v", err)
 			}
 		}
-		if _, err := m.dev.Write(bufs, writeOffset); err != nil {
-			log.Printf("netstack: write to tun device: %v", err)
-		}
-		bufs = bufs[:0]
 	}
 }
 
