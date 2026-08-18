@@ -239,27 +239,10 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 
 	go sess.Run() // answers the peer's DPD liveness checks
 
-	// Decryption is fanned out across up to inboundWorkers goroutines —
-	// one packet at a time on a single goroutine couldn't keep up with a
-	// fast enough real sender once reads were batched (transport.Mux.
-	// readLoop), backing up and overflowing Mux's internal ESP channel:
-	// real, permanent packet loss, confirmed live via the "espCh full,
-	// dropping ESP packet" log. But delivery to mesh.DeliverInbound/
-	// speaker.Receive must still happen in the *original* arrival order:
-	// unlike outbound (see netstack.Mesh.outboundLoop's flow hashing),
-	// there's no way to know a still-encrypted packet's flow to hash on,
-	// so preserving order here means preserving *all* of it, not just
-	// per-flow — confirmed live too, as retransmits from delivery-order
-	// scrambling even after the channel-overflow fix. Each packet gets a
-	// reserved slot (a 1-buffered result channel) in its original
-	// position *before* decryption starts; a single emitter goroutine
-	// drains slots in that same order, blocking on each one only as long
-	// as it takes that specific decrypt to finish, so slow and fast
-	// packets can still complete out of order without ever being
-	// *delivered* out of order.
+	// Decrypt in parallel, but reserve result slots before dispatch so the
+	// emitter delivers packets in their original arrival order.
 	type decrypted struct {
 		plain []byte
-		nh    byte
 		err   error
 	}
 	order := make(chan chan decrypted, orderBufferSize)
@@ -273,10 +256,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 				log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
 				continue
 			}
-			if speaker.Receive(peer, r.plain) {
-				log.Printf("peer %s: received babel packet (%d bytes)", name, len(r.plain))
-			} else {
-				mesh.DeliverInbound(r.plain, r.nh)
+			if !speaker.Receive(peer, r.plain) {
+				mesh.DeliverInbound(r.plain)
 			}
 		}
 	}()
@@ -293,8 +274,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		sem <- struct{}{}
 		go func(pkt []byte, slot chan decrypted) {
 			defer func() { <-sem }()
-			plain, nh, err := in.Open(pkt)
-			slot <- decrypted{plain, nh, err}
+			plain, _, err := in.Open(pkt)
+			slot <- decrypted{plain: plain, err: err}
 		}(pkt, slot)
 	}
 }

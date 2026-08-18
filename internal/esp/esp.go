@@ -39,10 +39,9 @@ type OutboundSA struct {
 	seq atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 }
 
-// InboundSA decrypts packets sent to this client's SPI. Open is safe for
-// concurrent use — multiple peers' receive loops, or several packets from
-// one high-throughput peer, may call it from separate goroutines — via a
-// locked check-decrypt-recheck-commit pattern: the (cheap) window check
+// InboundSA decrypts packets sent to this client's SPI. Open supports calls
+// from concurrent workers using a locked check-decrypt-recheck-commit pattern:
+// the (cheap) window check
 // is done once up front to reject an obviously-bad packet before paying
 // for AEAD decryption, and again after decryption (still under lock,
 // atomically with commit) to catch a packet that raced with a concurrent

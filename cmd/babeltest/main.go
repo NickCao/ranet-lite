@@ -109,13 +109,13 @@ func main() {
 				log.Printf("mux closed: %v", err)
 				return
 			}
-			plain, nh, err := in.Open(pkt)
+			plain, _, err := in.Open(pkt)
 			if err != nil {
 				log.Printf("dropping undecryptable ESP packet: %v", err)
 				continue
 			}
 			if !speaker.Receive(peer, plain) {
-				mesh.DeliverInbound(plain, nh)
+				mesh.DeliverInbound(plain)
 			}
 		}
 	}()

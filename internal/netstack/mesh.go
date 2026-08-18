@@ -4,7 +4,7 @@
 // from any peer are written back to the device as if they'd arrived over any
 // other interface. It knows nothing about ESP or IKE directly — peers are
 // just a send function plus routes, so this package is testable without real
-// crypto (mesh_test.go).
+// crypto.
 //
 // This package never touches the device's address or route configuration —
 // creating it and bringing it up is all it does. Assigning an address,
@@ -26,9 +26,8 @@ import (
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
 
-// outboundWorkers is the number of long-lived encryption goroutines --
-// one per core, shared across every peer -- mirroring wireguard-go's
-// device.RoutineEncryption pool exactly (see outboundLoop's doc comment).
+// outboundWorkers is the number of long-lived encryption goroutines shared
+// across every peer.
 var outboundWorkers = min(runtime.NumCPU(), 16)
 
 // outboundContainerBufSize bounds how many Device.Read batches can wait for
@@ -210,7 +209,7 @@ func (m *Mesh) emitter() {
 		for i := 0; i < len(c.elems); {
 			e := c.elems[i]
 			if !e.ok {
-				m.releaseOutboundElement(e)
+				releaseOutboundElement(e)
 				i++
 				continue
 			}
@@ -225,7 +224,7 @@ func (m *Mesh) emitter() {
 			}
 			_ = peer.transmitBatchFn(sealed)
 			for _, e := range c.elems[start:i] {
-				m.releaseOutboundElement(e)
+				releaseOutboundElement(e)
 			}
 		}
 		c.elems = c.elems[:0]
@@ -233,7 +232,7 @@ func (m *Mesh) emitter() {
 	}
 }
 
-func (m *Mesh) releaseOutboundElement(e *outboundElement) {
+func releaseOutboundElement(e *outboundElement) {
 	if cap(e.raw) == outboundPacketBufferSize {
 		outboundPacketPool.Put(e.raw[:outboundPacketBufferSize])
 	}
@@ -269,13 +268,11 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 }
 
 // DeliverInbound injects an already-decapsulated tunnel-mode IP packet into
-// the TUN device, as if it had arrived on the wire. nextHeader is unused —
-// the packet's own version nibble is all the kernel needs — but kept for
-// symmetry with how peers hand packets to Peer.encryptFn. It hands off to
-// inboundLoop rather than writing directly so that packets arriving in a
+// the TUN device, as if it had arrived on the wire. It hands off to inboundLoop
+// rather than writing directly so that packets arriving in a
 // tight burst (from one or several peers concurrently) get coalesced into
 // a single Device.Write call.
-func (m *Mesh) DeliverInbound(raw []byte, _ byte) {
+func (m *Mesh) DeliverInbound(raw []byte) {
 	buf := make([]byte, writeOffset+len(raw))
 	copy(buf[writeOffset:], raw)
 	select {

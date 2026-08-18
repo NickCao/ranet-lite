@@ -148,7 +148,7 @@ func testRecvESPBatch(t *testing.T, network, addr string) {
 	// test is using instead, at the port Dial picked.
 	dst := &net.UDPAddr{IP: net.ParseIP(addr), Port: clientAddr.Port}
 
-	// Sent back-to-back with no synchronization, so readLoop's ReadBatch
+	// Sent back-to-back with no synchronization, so receiveLoop's batch read
 	// has a real chance to pick up more than one of these in a single
 	// call — this is the actual code path under test.
 	const n = 200

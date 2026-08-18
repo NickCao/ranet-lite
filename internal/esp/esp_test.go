@@ -167,8 +167,8 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	}
 }
 
-// TestSealConcurrentUniqueSeq guards the split between nextSeq (locked)
-// and the actual AEAD compute (unlocked, safe for concurrent use) in
+// TestSealConcurrentUniqueSeq guards the split between atomic sequence
+// allocation and the actual AEAD compute (unlocked, safe for concurrent use) in
 // Seal: many goroutines sealing concurrently must never collide on a
 // sequence number/IV, and the receiver must decrypt every one of them
 // (Open, run sequentially here, doesn't care what order Seal calls

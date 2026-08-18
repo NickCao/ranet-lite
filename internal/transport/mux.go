@@ -9,7 +9,6 @@
 package transport
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -41,20 +40,9 @@ const (
 	espOutBatchSize = 64
 )
 
-// Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
-// into IKE and ESP streams. It's built on wireguard-go's conn.Bind (the
-// same package used for the mesh's tun device) rather than a hand-rolled
-// socket: StdNetBind already does everything a hand-rolled implementation
-// would have to reinvent for this workload -- batched sendmmsg/recvmmsg,
-// forcing the kernel receive buffer past its default via SO_RCVBUFFORCE
-// (the exact fix for a real, confirmed packet-loss bug this package used
-// to carry by hand), and, the actual reason to prefer it, real UDP GSO/GRO:
-// letting the kernel carry many ESP datagrams through its networking stack
-// as one segmented unit instead of iterating the stack once per datagram
-// even inside a batched syscall. See
-// https://tailscale.com/blog/more-throughput for why that distinction
-// matters -- sendmmsg/recvmmsg batching alone tops out well short of what
-// UDP GSO/GRO reaches on the same hardware.
+// Mux is a UDP socket to one peer, demultiplexing inbound packets into IKE
+// and ESP streams. wireguard-go's conn.Bind provides socket buffers, batched
+// syscalls, and UDP GSO/GRO.
 type Mux struct {
 	bind     conn.Bind
 	endpoint conn.Endpoint
@@ -74,79 +62,6 @@ type Mux struct {
 	doneOnce sync.Once
 	doneErr  atomic.Value // error
 	closed   atomic.Bool
-
-	gaps seqGapTracker // temporary diagnostic, see seqGapTracker's doc comment
-}
-
-// seqGapTracker is a temporary diagnostic for locating real, direction-
-// specific packet loss that survived every other instrumented check
-// (channel overflows, kernel UDP/tun/backlog drops, replay window, GC,
-// delivery reordering): does every packet the sender transmits actually
-// reach this socket at all. ESP's sequence number is sent in the clear
-// (RFC 4303 -- only the SPI and sequence number are unencrypted), strictly
-// incrementing per packet, so gaps in it observed here -- at the earliest,
-// single-threaded point after the read syscall, before any concurrent
-// processing -- prove real loss between the sender and this socket.
-//
-// A sequence jump alone proves nothing by itself: the skipped numbers may
-// simply be in flight and arrive slightly later (real reordering, not
-// loss), so a gap is only reported once it's stayed open long enough that
-// a late arrival is implausible (lossLogAfter, generously beyond any real
-// RTT on a local link) rather than on the first jump.
-type seqGapTracker struct {
-	mu      sync.Mutex
-	seen    map[uint32]bool // per-SPI: has any packet been seen yet
-	highest map[uint32]uint32
-	pending map[uint32]map[uint32]time.Time // per-SPI: seq -> when the gap opened
-}
-
-const lossLogAfter = 200 * time.Millisecond
-
-// maxTrackedGap bounds how large a sequence jump this will track
-// individually — well beyond any real burst of loss expected on a
-// functioning link, but small enough to never turn a single packet into
-// an unbounded amount of map-filling work.
-const maxTrackedGap = 8192
-
-func (g *seqGapTracker) observe(spi, seq uint32) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.seen == nil {
-		g.seen = make(map[uint32]bool)
-		g.highest = make(map[uint32]uint32)
-		g.pending = make(map[uint32]map[uint32]time.Time)
-	}
-	if !g.seen[spi] {
-		g.seen[spi] = true
-		g.highest[spi] = seq
-		return
-	}
-	pending := g.pending[spi]
-	if _, ok := pending[seq]; ok {
-		delete(pending, seq) // arrived late: reordering, not loss
-	} else if gap := seq - g.highest[spi] - 1; seq > g.highest[spi]+1 && gap <= maxTrackedGap {
-		// A jump this large is either a fresh/reset SA (nothing to
-		// compare against) or too big to mean anything useful here; only
-		// track individually-sized gaps worth suspecting as real loss.
-		if pending == nil {
-			pending = make(map[uint32]time.Time)
-			g.pending[spi] = pending
-		}
-		now := time.Now()
-		for s := g.highest[spi] + 1; s < seq; s++ {
-			pending[s] = now
-		}
-	}
-	if seq > g.highest[spi] {
-		g.highest[spi] = seq
-	}
-	now := time.Now()
-	for s, t := range pending {
-		if now.Sub(t) > lossLogAfter {
-			log.Printf("transport: SPI %08x seq %d never arrived at the socket (%s elapsed, %d packets ahead) — confirmed lost, not reordering", spi, s, lossLogAfter, g.highest[spi]-s)
-			delete(pending, s)
-		}
-	}
 }
 
 // closeDone wakes every blocked Recv* call exactly once, regardless of
@@ -220,11 +135,8 @@ func (m *Mux) SendIKE(b []byte) error {
 	return m.bind.Send([][]byte{out}, m.endpoint)
 }
 
-// SendESP queues one raw ESP packet, always UDP-encapsulated (bare, no
-// marker — its nonzero SPI disambiguates it from the marker on receive),
-// for a batched Send by sendESPLoop. Safe for concurrent callers (e.g.
-// netstack.Mesh's per-flow outbound workers all sending through the same
-// peer): it's just a channel send.
+// SendESP queues one raw ESP packet for callers that do not already have a
+// batch. Data-plane traffic normally uses SendESPBatch.
 func (m *Mux) SendESP(b []byte) error {
 	return m.SendESPBatch([][]byte{b})
 }
@@ -399,16 +311,13 @@ func (m *Mux) receiveLoop(fn conn.ReceiveFunc) {
 			}
 			raw := bufs[i][:sizes[i]]
 			pkt := append([]byte{}, raw...) // bufs[i] is reused by the next call
-			if len(pkt) >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]) {
+			if len(pkt) >= nonESPMarkerLen && pkt[0]|pkt[1]|pkt[2]|pkt[3] == 0 {
 				select {
 				case m.ikeCh <- pkt[nonESPMarkerLen:]:
 				default:
 					log.Printf("transport: ikeCh full, dropping IKE message")
 				}
 			} else {
-				if len(pkt) >= 8 {
-					m.gaps.observe(binary.BigEndian.Uint32(pkt[0:4]), binary.BigEndian.Uint32(pkt[4:8]))
-				}
 				select {
 				case m.espCh <- pkt:
 				default:
@@ -417,15 +326,6 @@ func (m *Mux) receiveLoop(fn conn.ReceiveFunc) {
 			}
 		}
 	}
-}
-
-func isZero(b []byte) bool {
-	for _, c := range b {
-		if c != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func (m *Mux) Close() error {

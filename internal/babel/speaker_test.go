@@ -40,22 +40,20 @@ func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, spe
 		t.Fatal(err)
 	}
 
-	// No real crypto here (validated separately, see esp_test.go/mux_test.go)
-	// -- encryptFn is a no-op passthrough, and all the delivery logic lives
-	// in transmitFn, matching the single combined sendFn this test used
-	// before Peer split the two steps.
+	// Crypto and transport are tested separately; this pair only exercises
+	// Babel and mesh delivery.
 	noopEncrypt := func(raw []byte, nh byte) ([]byte, error) { return raw, nil }
 
 	var peerAForB, peerBForA *netstack.Peer
 	peerBForA = netstack.NewPeer("b", noopEncrypt, func(raw []byte) error {
 		if !speakerB.Receive(peerAForB, raw) {
-			meshB.DeliverInbound(raw, 0)
+			meshB.DeliverInbound(raw)
 		}
 		return nil
 	})
 	peerAForB = netstack.NewPeer("a", noopEncrypt, func(raw []byte) error {
 		if !speakerA.Receive(peerBForA, raw) {
-			meshA.DeliverInbound(raw, 0)
+			meshA.DeliverInbound(raw)
 		}
 		return nil
 	})
@@ -163,9 +161,9 @@ func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint
 	srcBytes = srcBytes[:prefixByteLen(source.Bits())]
 
 	body := make([]byte, 0, 32)
-	body = append(body, ae, 0, byte(dest.Bits()), 0) // AE, Flags, Plen, Omitted
-	body = append(body, 0, 200) // Interval: 200 centiseconds, long enough to outlive the test
-	body = append(body, 0, 1) // Seqno
+	body = append(body, ae, 0, byte(dest.Bits()), 0)   // AE, Flags, Plen, Omitted
+	body = append(body, 0, 200)                        // Interval: 200 centiseconds, long enough to outlive the test
+	body = append(body, 0, 1)                          // Seqno
 	body = append(body, byte(metric>>8), byte(metric)) // Metric
 	body = append(body, destBytes[:prefixByteLen(dest.Bits())]...)
 	body = append(body, SubTLVSourcePrefix, byte(1+len(srcBytes)), byte(source.Bits()))

@@ -7,46 +7,28 @@ import (
 	"sync"
 )
 
-// Peer is one mesh neighbor: encryptFn encrypts a raw tunnel-mode IP packet
-// (nextHeader is esp.NextHeaderIPv4/IPv6), and the transmit functions hand
-// sealed results to the wire. They're kept separate, rather
-// than one combined send step, so Mesh.outboundLoop can run the expensive
-// part -- encryption -- across as many parallel workers as there are
-// cores for any peer's traffic, while still calling transmitFn for one
-// peer's packets in their original relative order (see outboundLoop's doc
-// comment for why that matters and why this split, rather than pinning a
-// peer or flow to one fixed worker, is what lets a single peer actually
-// use every core). Decoupling delivery from the TUN plumbing this way
-// also makes the stack wiring testable without a real TUN device or
-// ESP/UDP (see mesh_test.go).
+// Peer separates parallel packet encryption from ordered, batched transport.
 type Peer struct {
 	ID              string
 	encryptFn       func(raw []byte, nextHeader byte) ([]byte, error)
-	transmitFn      func(sealed []byte) error
 	transmitBatchFn func(sealed [][]byte) error
 }
 
 func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
-	return &Peer{
-		ID: id, encryptFn: encryptFn, transmitFn: transmitFn,
-		transmitBatchFn: func(sealed [][]byte) error {
-			for _, packet := range sealed {
-				if err := transmitFn(packet); err != nil {
-					return err
-				}
+	return NewPeerBatched(id, encryptFn, func(sealed [][]byte) error {
+		for _, packet := range sealed {
+			if err := transmitFn(packet); err != nil {
+				return err
 			}
-			return nil
-		},
-	}
+		}
+		return nil
+	})
 }
 
 // NewPeerBatched preserves completed TUN batches through the transport handoff.
 func NewPeerBatched(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
 	return &Peer{
 		ID: id, encryptFn: encryptFn, transmitBatchFn: transmitBatchFn,
-		transmitFn: func(sealed []byte) error {
-			return transmitBatchFn([][]byte{sealed})
-		},
 	}
 }
 
@@ -62,7 +44,7 @@ func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
 	if err != nil {
 		return err
 	}
-	return p.transmitFn(sealed)
+	return p.transmitBatchFn([][]byte{sealed})
 }
 
 // RouteTable maps (source, destination) prefix pairs to the peer that can
