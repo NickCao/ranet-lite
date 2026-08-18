@@ -81,6 +81,9 @@ func (s *Session) SetChildHandler(fn func(ChildSA) error) {
 }
 
 func (s *Session) replaceChild(child ChildSA) error {
+	if err := s.mux.RegisterESP(child.LocalSPI); err != nil {
+		return err
+	}
 	s.handlerMu.RLock()
 	fn := s.onChild
 	s.handlerMu.RUnlock()
@@ -475,6 +478,11 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte, error) {
 	reqHdr, err := decodeHeader(req)
 	if err != nil {
+		return nil, err
+	}
+	// Register before the first transmission so a response cannot race the
+	// receive loop on a shared hub.
+	if err := mux.RegisterIKE(reqHdr.SPIInitiator); err != nil {
 		return nil, err
 	}
 	for attempt := 0; attempt < maxRetransmits; attempt++ {

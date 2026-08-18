@@ -142,6 +142,9 @@ func testRecvESPBatch(t *testing.T, network, addr string) {
 		t.Fatal(err)
 	}
 	defer m.Close()
+	if err := m.RegisterESP(0xaabbccdd); err != nil {
+		t.Fatal(err)
+	}
 	clientAddr := m.LocalAddr().(*net.UDPAddr)
 	// LocalAddr() on this Mux is wildcard-bound ("::" or "0.0.0.0"), which
 	// isn't a valid destination — send to the actual loopback address the
@@ -201,13 +204,19 @@ func TestRecvESPAndIKEDemux(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
+	if err := m.RegisterESP(0xaabbccdd); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RegisterIKE(0x696b650000000000); err != nil {
+		t.Fatal(err)
+	}
 
 	clientAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: m.LocalAddr().(*net.UDPAddr).Port}
 	espPkt := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0, 0, 0, 1, 'e', 's', 'p'}
 	if _, err := server.WriteToUDP(espPkt, clientAddr); err != nil {
 		t.Fatal(err)
 	}
-	ikePkt := append([]byte{0, 0, 0, 0}, []byte("ike")...)
+	ikePkt := append([]byte{0, 0, 0, 0}, append([]byte("ike"), make([]byte, 5)...)...)
 	if _, err := server.WriteToUDP(ikePkt, clientAddr); err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +232,52 @@ func TestRecvESPAndIKEDemux(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecvIKE: %v", err)
 	}
-	if string(gotIKE) != "ike" {
-		t.Fatalf("IKE payload mismatch: got %q want %q", gotIKE, "ike")
+	if string(gotIKE[:3]) != "ike" {
+		t.Fatalf("IKE payload mismatch: got %q want %q", gotIKE[:3], "ike")
+	}
+}
+
+func TestHubRoutesBySPIAndMuxCloseDoesNotCloseHub(t *testing.T) {
+	server := listenPeer(t, "udp4", "127.0.0.1")
+	serverAddr := server.LocalAddr().(*net.UDPAddr)
+	hub, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hub.Close()
+	first, err := hub.NewMux(serverAddr.IP, serverAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := hub.NewMux(serverAddr.IP, serverAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.RegisterIKE(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.RegisterESP(2); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: hub.LocalAddr().(*net.UDPAddr).Port}
+	ikePkt := append([]byte{0, 0, 0, 0}, append([]byte{0, 0, 0, 0, 0, 0, 0, 1}, []byte("ike")...)...)
+	if _, err := server.WriteToUDP(ikePkt, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := first.RecvIKEUntil(time.Now().Add(time.Second)); err != nil || string(got) != string(ikePkt[4:]) {
+		t.Fatalf("RecvIKE = %x, %v", got, err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	espPkt := []byte{0, 0, 0, 2, 'e', 's', 'p'}
+	if _, err := server.WriteToUDP(espPkt, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := second.RecvESPUntil(time.Now().Add(time.Second)); err != nil || string(got) != string(espPkt) {
+		t.Fatalf("RecvESP = %x, %v", got, err)
 	}
 }
