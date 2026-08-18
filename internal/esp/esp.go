@@ -100,22 +100,29 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 	total := len(innerIPPacket) + trailerLen
 	padLen := (4 - total%4) % 4
 
-	plain := make([]byte, 0, len(innerIPPacket)+padLen+trailerLen)
-	plain = append(plain, innerIPPacket...)
-	for i := 1; i <= padLen; i++ {
-		plain = append(plain, byte(i))
-	}
-	plain = append(plain, byte(padLen), nextHeader)
-
-	out := make([]byte, headerLen+o.params.IVLen)
+	framingLen := headerLen + o.params.IVLen
+	plainLen := len(innerIPPacket) + padLen + trailerLen
+	packetLen := framingLen + plainLen + o.params.ICVLen
+	nonceLen := o.aead.NonceSize()
+	storage := make([]byte, nonceLen+framingLen+plainLen, nonceLen+packetLen)
+	nonce := storage[:nonceLen]
+	out := storage[nonceLen : nonceLen+framingLen+plainLen]
 	binary.BigEndian.PutUint32(out[0:4], o.spi)
 	binary.BigEndian.PutUint32(out[4:8], uint32(seq))
-	binary.BigEndian.PutUint64(out[8:8+o.params.IVLen], seq) // unique per packet, monotonic
+	binary.BigEndian.PutUint64(out[8:framingLen], seq) // unique per packet, monotonic
 
-	nonce := append(append([]byte{}, o.salt...), out[headerLen:headerLen+o.params.IVLen]...)
+	plain := out[framingLen:]
+	copy(plain, innerIPPacket)
+	for i := 1; i <= padLen; i++ {
+		plain[len(innerIPPacket)+i-1] = byte(i)
+	}
+	plain[len(plain)-2] = byte(padLen)
+	plain[len(plain)-1] = nextHeader
+
+	copy(nonce, o.salt)
+	copy(nonce[len(o.salt):], out[headerLen:framingLen])
 	aad := out[:headerLen]
-	ciphertext := o.aead.Seal(nil, nonce, plain, aad)
-	return append(out, ciphertext...), nil
+	return o.aead.Seal(out[:framingLen], nonce, plain, aad), nil
 }
 
 // nextSeq atomically allocates the next sequence number, the only state

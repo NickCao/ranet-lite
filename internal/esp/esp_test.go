@@ -54,6 +54,57 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRoundTripChaCha20Poly1305(t *testing.T) {
+	key := make([]byte, 36) // 32-byte key + 4-byte salt
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	child := ike.ChildSA{
+		EncrID:   ike.ENCR_CHACHA20_POLY1305,
+		LocalSPI: 0x11111111, RemoteSPI: 0x22222222,
+		InboundKey: key, OutboundKey: key,
+	}
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ike.ChildSA{
+		EncrID: child.EncrID, LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("chacha20-poly1305 packet")
+	pkt, err := out.Seal(payload, NextHeaderIPv4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, nh, err := in.Open(pkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nh != NextHeaderIPv4 || !bytes.Equal(got, payload) {
+		t.Fatalf("round trip mismatch: header %d, payload %q", nh, got)
+	}
+}
+
+func TestSealAllocations(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 1400)
+	allocs := testing.AllocsPerRun(100, func() {
+		if _, err := out.Seal(payload, NextHeaderIPv4); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("Seal allocated %.1f times per packet, want at most one output buffer", allocs)
+	}
+}
+
 func TestReplayRejected(t *testing.T) {
 	child := testChild(t)
 	out, _ := NewOutbound(child)

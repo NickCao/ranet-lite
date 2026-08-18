@@ -240,6 +240,7 @@ func (m *Mux) SendESP(b []byte) error {
 // immediately, batching only kicks in under real load.
 func (m *Mux) sendESPLoop() {
 	bufs := make([][]byte, 0, espSendBatch)
+	var packed []byte
 	for {
 		select {
 		case <-m.done:
@@ -256,11 +257,36 @@ func (m *Mux) sendESPLoop() {
 				break drain
 			}
 		}
+		if len(bufs) > 1 {
+			packed = packForGSO(packed, bufs)
+		}
 		if err := m.bind.Send(bufs, m.endpoint); err != nil {
 			log.Printf("transport: batch send of %d packets: %v", len(bufs), err)
 		}
 		bufs = bufs[:0]
 	}
+}
+
+// packForGSO copies a send batch into one contiguous allocation. Each packet's
+// slice retains capacity through the end of that allocation, which lets
+// wireguard-go's Bind append following packets to a GSO base packet in place.
+// The destination is reused after the synchronous Bind.Send call returns.
+func packForGSO(dst []byte, bufs [][]byte) []byte {
+	total := 0
+	for _, buf := range bufs {
+		total += len(buf)
+	}
+	if cap(dst) < total {
+		dst = make([]byte, 0, total)
+	} else {
+		dst = dst[:0]
+	}
+	for i, buf := range bufs {
+		start := len(dst)
+		dst = append(dst, buf...)
+		bufs[i] = dst[start:len(dst)]
+	}
+	return dst
 }
 
 // RecvIKE returns the next decoded (marker-stripped) IKE message.

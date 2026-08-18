@@ -67,6 +67,34 @@ func TestSendESPBatchIPv6(t *testing.T) {
 	testSendESPBatch(t, "udp6", "::1")
 }
 
+func TestPackForGSOProvidesCoalescingCapacity(t *testing.T) {
+	bufs := [][]byte{
+		[]byte("first packet"),
+		[]byte("second packet"),
+		[]byte("tail"),
+	}
+	want := make([][]byte, len(bufs))
+	for i := range bufs {
+		want[i] = append([]byte(nil), bufs[i]...)
+	}
+
+	packed := packForGSO(nil, bufs)
+	for i := range bufs {
+		if string(bufs[i]) != string(want[i]) {
+			t.Fatalf("packet %d changed: got %q want %q", i, bufs[i], want[i])
+		}
+	}
+	if spare := cap(bufs[0]) - len(bufs[0]); spare < len(bufs[1])+len(bufs[2]) {
+		t.Fatalf("first packet has %d bytes spare capacity, want at least %d", spare, len(bufs[1])+len(bufs[2]))
+	}
+
+	// The sender retains and reuses the packed allocation after Bind.Send.
+	reused := packForGSO(packed, bufs[:2])
+	if cap(reused) != cap(packed) {
+		t.Fatalf("packed allocation was not reused: capacity changed from %d to %d", cap(packed), cap(reused))
+	}
+}
+
 // TestSendIKEUnbatchedAndMarked confirms SendIKE still writes immediately
 // (not queued through the ESP batching path) and always carries the
 // 4-byte non-ESP marker, including for what would be the very first
