@@ -10,13 +10,32 @@ package transport
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const nonESPMarkerLen = 4
+
+// espSendBatch bounds how many queued ESP packets sendESPLoop coalesces
+// into one sendmmsg(2) call. A CPU profile under load showed roughly half
+// of all time spent in the write syscall alone — one syscall per packet —
+// with AEAD encryption itself barely registering; batching is the direct
+// fix, mirroring netstack.Mesh's TUN write batching for the same reason.
+const espSendBatch = 128
+
+// batchWriter abstracts ipv4.PacketConn and ipv6.PacketConn's WriteBatch:
+// both Message types are aliases for the same underlying
+// golang.org/x/net/internal/socket.Message, so either concrete type
+// satisfies this identically.
+type batchWriter interface {
+	WriteBatch(ms []ipv4.Message, flags int) (int, error)
+}
 
 // Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
 // into IKE and ESP streams and handling the initial-port -> NAT-T-port
@@ -26,9 +45,11 @@ type Mux struct {
 	conn       *net.UDPConn
 	remoteIP   net.IP
 	remotePort int
+	batch      batchWriter
 
-	ikeCh chan []byte
-	espCh chan []byte
+	ikeCh  chan []byte
+	espCh  chan []byte
+	espOut chan []byte // queued outbound ESP packets awaiting a batched write
 	// done is closed exactly once, on a fatal read error or Close() —
 	// closing (unlike sending on a channel) wakes every blocked receiver,
 	// not just one. RecvIKE and RecvESP run concurrently in normal use
@@ -64,15 +85,24 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen: %w", err)
 	}
+	var batch batchWriter
+	if remoteIP.To4() != nil {
+		batch = ipv4.NewPacketConn(conn)
+	} else {
+		batch = ipv6.NewPacketConn(conn)
+	}
 	m := &Mux{
 		conn:       conn,
 		remoteIP:   remoteIP,
 		remotePort: remotePort,
+		batch:      batch,
 		ikeCh:      make(chan []byte, 16),
 		espCh:      make(chan []byte, 256),
+		espOut:     make(chan []byte, 256),
 		done:       make(chan struct{}),
 	}
 	go m.readLoop()
+	go m.sendESPLoop()
 	return m, nil
 }
 
@@ -93,11 +123,49 @@ func (m *Mux) SendIKE(b []byte) error {
 	return err
 }
 
-// SendESP writes one raw ESP packet, always UDP-encapsulated (bare, no
-// marker — its nonzero SPI disambiguates it from the marker on receive).
+// SendESP queues one raw ESP packet, always UDP-encapsulated (bare, no
+// marker — its nonzero SPI disambiguates it from the marker on receive),
+// for a batched write by sendESPLoop. Safe for concurrent callers (e.g.
+// netstack.Mesh's per-flow outbound workers all sending through the same
+// peer): it's just a channel send.
 func (m *Mux) SendESP(b []byte) error {
-	_, err := m.conn.WriteToUDP(b, m.remoteAddr())
-	return err
+	select {
+	case m.espOut <- b:
+		return nil
+	case <-m.done:
+		return m.doneError()
+	}
+}
+
+// sendESPLoop batches whatever's currently queued into as few sendmmsg(2)
+// calls (via WriteBatch) as possible — the same non-blocking-drain
+// pattern as netstack.Mesh's inboundLoop: a lone packet with nothing
+// queued behind it still goes out immediately, batching only kicks in
+// under real load.
+func (m *Mux) sendESPLoop() {
+	addr := m.remoteAddr()
+	msgs := make([]ipv4.Message, 0, espSendBatch)
+	for {
+		select {
+		case <-m.done:
+			return
+		case b := <-m.espOut:
+			msgs = append(msgs, ipv4.Message{Buffers: [][]byte{b}, Addr: addr})
+		}
+	drain:
+		for len(msgs) < espSendBatch {
+			select {
+			case b := <-m.espOut:
+				msgs = append(msgs, ipv4.Message{Buffers: [][]byte{b}, Addr: addr})
+			default:
+				break drain
+			}
+		}
+		if n, err := m.batch.WriteBatch(msgs, 0); err != nil {
+			log.Printf("transport: batch send: %d/%d packets sent: %v", n, len(msgs), err)
+		}
+		msgs = msgs[:0]
+	}
 }
 
 // RecvIKE returns the next decoded (marker-stripped) IKE message.
