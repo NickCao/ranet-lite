@@ -35,7 +35,7 @@ type OutboundSA struct {
 	salt   []byte
 	spi    uint32
 
-	seq atomic.Uint64 // next ESN sequence number to use; 0 is never sent
+	seq atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 }
 
 // InboundSA decrypts packets sent to this client's SPI. Open supports calls
@@ -102,10 +102,9 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 	plainLen := len(innerIPPacket) + padLen + trailerLen
 	packetLen := framingLen + plainLen + o.params.ICVLen
 	nonceLen := o.aead.NonceSize()
-	storage := make([]byte, nonceLen+headerLen+4+framingLen+plainLen, nonceLen+headerLen+4+packetLen)
+	storage := make([]byte, nonceLen+framingLen+plainLen, nonceLen+packetLen)
 	nonce := storage[:nonceLen]
-	aad := storage[nonceLen : nonceLen+headerLen+4]
-	out := storage[nonceLen+headerLen+4 : nonceLen+headerLen+4+framingLen+plainLen]
+	out := storage[nonceLen : nonceLen+framingLen+plainLen]
 	binary.BigEndian.PutUint32(out[0:4], o.spi)
 	binary.BigEndian.PutUint32(out[4:8], uint32(seq))
 	binary.BigEndian.PutUint64(out[8:framingLen], seq) // unique per packet, monotonic
@@ -120,17 +119,18 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 
 	copy(nonce, o.salt)
 	copy(nonce[len(o.salt):], out[headerLen:framingLen])
-	copy(aad[:headerLen], out[:headerLen])
-	binary.BigEndian.PutUint32(aad[headerLen:], uint32(seq>>32))
+	aad := out[:headerLen]
 	return o.aead.Seal(out[:framingLen], nonce, plain, aad), nil
 }
 
-// nextSeq atomically allocates the next extended sequence number, the only state
+// nextSeq atomically allocates the next sequence number, the only state
 // Seal needs to serialize.
 func (o *OutboundSA) nextSeq() (uint64, error) {
 	seq := o.seq.Add(1)
-	if seq == 0 {
-		return 0, fmt.Errorf("esp: extended sequence number space exhausted")
+	if seq > 0xffffffff {
+		// No ESN: once the 32-bit sequence space is exhausted this SA is
+		// unusable and the session must be re-established or rekeyed.
+		return 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
 	}
 	return seq, nil
 }
@@ -146,9 +146,8 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	if spi != in.spi {
 		return nil, 0, fmt.Errorf("esp: SPI mismatch (got %08x, want %08x)", spi, in.spi)
 	}
-	seqLow := binary.BigEndian.Uint32(pkt[4:8])
+	seq := binary.BigEndian.Uint32(pkt[4:8])
 	in.mu.Lock()
-	seq := in.window.sequence(seqLow)
 	err := in.window.check(seq)
 	in.mu.Unlock()
 	if err != nil {
@@ -158,15 +157,13 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	iv := pkt[headerLen : headerLen+in.params.IVLen]
 	ciphertext := pkt[headerLen+in.params.IVLen:]
 	nonce := append(append([]byte{}, in.salt...), iv...)
-	var aad [headerLen + 4]byte
-	copy(aad[:headerLen], pkt[:headerLen])
-	binary.BigEndian.PutUint32(aad[headerLen:], uint32(seq>>32))
+	aad := pkt[:headerLen]
 
 	// The AEAD compute itself touches no shared state, so it runs
 	// unlocked — this is the expensive part, and the whole point of
 	// checking once before it (fail fast) and again after (see below) is
 	// to avoid holding the lock for its duration.
-	plain, err := in.aead.Open(nil, nonce, ciphertext, aad[:])
+	plain, err := in.aead.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, 0, fmt.Errorf("esp: authentication failed: %w", err)
 	}

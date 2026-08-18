@@ -160,7 +160,7 @@ func espProposal(spi []byte) Proposal {
 			{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 256},
 			{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128},
 			{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305},
-			{Type: TransESN, ID: ESN_YES},
+			{Type: TransESN, ID: ESN_NO},
 		},
 	}
 }
@@ -456,10 +456,6 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	}
 	if len(cp.SPI) != 4 {
 		return fmt.Errorf("ike: unexpected child SPI size %d", len(cp.SPI))
-	}
-	esn, ok := cp.ChosenTransform(TransESN)
-	if !ok || esn.ID != ESN_YES {
-		return fmt.Errorf("ike: responder did not select required ESN")
 	}
 	remoteSPI := binary.BigEndian.Uint32(cp.SPI)
 

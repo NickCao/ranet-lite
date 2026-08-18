@@ -24,27 +24,11 @@ type replayWindow struct {
 	mask [windowWords]uint64 // mask[i] bit j set => sequence (last - (i*64+j)) already received
 }
 
-// sequence reconstructs the high ESN bits from the current replay window per
-// RFC 4303 appendix A. The 64-bit result is authenticated before acceptance.
-func (w *replayWindow) sequence(low uint32) uint64 {
-	if w.last == 0 {
-		return uint64(low)
-	}
-	high, lastLow := w.last>>32, uint32(w.last)
-	if low < lastLow && lastLow-low > 1<<31 {
-		return (high+1)<<32 | uint64(low)
-	}
-	if low > lastLow && low-lastLow > 1<<31 && high > 0 {
-		return (high-1)<<32 | uint64(low)
-	}
-	return high<<32 | uint64(low)
-}
-
-func (w *replayWindow) check(seq uint64) error {
+func (w *replayWindow) check(seq uint32) error {
 	if seq == 0 {
 		return fmt.Errorf("esp: sequence number 0 is invalid")
 	}
-	s := seq
+	s := uint64(seq)
 	if w.last == 0 {
 		return nil // first packet ever seen on this SA
 	}
@@ -62,8 +46,8 @@ func (w *replayWindow) check(seq uint64) error {
 	return nil
 }
 
-func (w *replayWindow) commit(seq uint64) {
-	s := seq
+func (w *replayWindow) commit(seq uint32) {
+	s := uint64(seq)
 	switch {
 	case w.last == 0:
 		w.mask[0] = 1
