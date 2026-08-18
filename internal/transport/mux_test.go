@@ -20,6 +20,44 @@ func listenPeer(t *testing.T, network, addr string) *net.UDPConn {
 	return conn
 }
 
+// TestSendESPShardsDeliverConcurrently verifies SendESP's shard argument
+// actually reaches an independent goroutine/channel (not just accepted and
+// ignored): packets sent across many distinct shard values, including ones
+// well beyond sendShards (exercising the shard%len(m.espOut) wraparound),
+// must all still arrive.
+func TestSendESPShardsDeliverConcurrently(t *testing.T) {
+	peer := listenPeer(t, "udp4", "127.0.0.1")
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+
+	m, err := Dial("", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		// Deliberately exceeds sendShards for some i, to exercise the
+		// modulo wraparound rather than assuming callers stay in range.
+		if err := m.SendESP(i*7, []byte{byte(i), byte(i >> 8)}); err != nil {
+			t.Fatalf("SendESP %d: %v", i, err)
+		}
+	}
+
+	got := map[int]bool{}
+	buf := make([]byte, 64)
+	peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for i := 0; i < n; i++ {
+		if _, _, err := peer.ReadFromUDP(buf); err != nil {
+			t.Fatalf("read %d/%d: %v", i, n, err)
+		}
+		got[int(buf[0])|int(buf[1])<<8] = true
+	}
+	if len(got) != n {
+		t.Fatalf("got %d distinct packets across shards, want %d", len(got), n)
+	}
+}
+
 func testSendESPBatch(t *testing.T, network, addr string) {
 	peer := listenPeer(t, network, addr)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
@@ -30,13 +68,13 @@ func testSendESPBatch(t *testing.T, network, addr string) {
 	}
 	defer m.Close()
 
-	// Sent back-to-back with no synchronization, so sendESPLoop's
-	// non-blocking drain has a real chance to coalesce more than one of
-	// these into a single WriteBatch call — this is the actual code path
-	// under test, not just "does a single SendESP still work".
+	// Sent back-to-back with no synchronization, all on the same shard, so
+	// sendESPLoop's non-blocking drain has a real chance to coalesce more
+	// than one of these into a single WriteBatch call — this is the actual
+	// code path under test, not just "does a single SendESP still work".
 	const n = 200
 	for i := 0; i < n; i++ {
-		if err := m.SendESP([]byte{byte(i), byte(i >> 8)}); err != nil {
+		if err := m.SendESP(0, []byte{byte(i), byte(i >> 8)}); err != nil {
 			t.Fatalf("SendESP %d: %v", i, err)
 		}
 	}

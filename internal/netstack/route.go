@@ -8,14 +8,18 @@ import (
 
 // Peer is one mesh neighbor: sendFn encapsulates a raw tunnel-mode IP packet
 // (nextHeader is esp.NextHeaderIPv4/IPv6) and transmits it to that peer.
-// Decoupling delivery from the TUN plumbing this way makes the stack
-// wiring testable without a real TUN device or ESP/UDP (see mesh_test.go).
+// shard is the flow-hash worker index the packet was dispatched to by
+// Mesh.outboundLoop (see its doc comment) -- sendFn's transport is expected
+// to use it to keep that same flow's send-syscall work on a consistent,
+// parallelizable lane, the same way encryption already is. Decoupling
+// delivery from the TUN plumbing this way makes the stack wiring testable
+// without a real TUN device or ESP/UDP (see mesh_test.go).
 type Peer struct {
 	ID     string
-	sendFn func(raw []byte, nextHeader byte) error
+	sendFn func(shard int, raw []byte, nextHeader byte) error
 }
 
-func NewPeer(id string, sendFn func(raw []byte, nextHeader byte) error) *Peer {
+func NewPeer(id string, sendFn func(shard int, raw []byte, nextHeader byte) error) *Peer {
 	return &Peer{ID: id, sendFn: sendFn}
 }
 
@@ -24,9 +28,10 @@ func NewPeer(id string, sendFn func(raw []byte, nextHeader byte) error) *Peer {
 // address a specific peer directly rather than by destination IP — e.g.
 // internal/babel, which multicasts through each peer's own ESP tunnel
 // rather than routing by the (link-local, often peer-agnostic) destination
-// address.
+// address. There's no flow to shard by for control traffic like this, and
+// no throughput concern either, so it always uses shard 0.
 func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
-	return p.sendFn(raw, nextHeader)
+	return p.sendFn(0, raw, nextHeader)
 }
 
 // RouteTable maps (source, destination) prefix pairs to the peer that can

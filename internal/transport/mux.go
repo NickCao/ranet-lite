@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,20 @@ const (
 	espChanSize  = 4096
 )
 
+// sendShards is the number of independent (channel, goroutine) pairs
+// SendESP's outbound traffic is split across, indexed by the caller's
+// shard argument. This uses the exact formula netstack.outboundWorkers
+// does (both derived from the same live runtime.NumCPU()), so a flow's
+// encrypt worker and its send-syscall goroutine end up as the same shard
+// end-to-end without the two packages needing to coordinate explicitly --
+// without this, every flow's encrypted packets funnel back into one send
+// goroutine regardless of how many encrypt workers ran them, capping a
+// multi-stream transfer's syscall-heavy work to a single core no matter
+// how many flows there are. SendESP indexes shards mod len(), so an exact
+// match isn't required for correctness, just for the two packages' worker
+// counts to line up for maximum parallelism.
+var sendShards = min(runtime.NumCPU(), 16)
+
 // Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
 // into IKE and ESP streams. It's built on wireguard-go's conn.Bind (the
 // same package used for the mesh's tun device) rather than a hand-rolled
@@ -61,7 +76,7 @@ type Mux struct {
 
 	ikeCh  chan []byte
 	espCh  chan []byte
-	espOut chan []byte // queued outbound ESP packets awaiting a batched Send
+	espOut []chan []byte // sendShards queues of outbound ESP packets awaiting a batched Send, indexed by SendESP's shard argument
 
 	// done is closed exactly once, on a fatal read error or Close() —
 	// closing (unlike sending on a channel) wakes every blocked receiver,
@@ -195,13 +210,16 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 		port:     actualPort,
 		ikeCh:    make(chan []byte, 16),
 		espCh:    make(chan []byte, espChanSize),
-		espOut:   make(chan []byte, espChanSize),
+		espOut:   make([]chan []byte, sendShards),
 		done:     make(chan struct{}),
 	}
 	for _, fn := range fns {
 		go m.receiveLoop(fn)
 	}
-	go m.sendESPLoop()
+	for i := range m.espOut {
+		m.espOut[i] = make(chan []byte, espChanSize)
+		go m.sendESPLoop(m.espOut[i])
+	}
 	return m, nil
 }
 
@@ -221,36 +239,44 @@ func (m *Mux) SendIKE(b []byte) error {
 
 // SendESP queues one raw ESP packet, always UDP-encapsulated (bare, no
 // marker — its nonzero SPI disambiguates it from the marker on receive),
-// for a batched Send by sendESPLoop. Safe for concurrent callers (e.g.
-// netstack.Mesh's per-flow outbound workers all sending through the same
-// peer): it's just a channel send.
-func (m *Mux) SendESP(b []byte) error {
+// for a batched Send by one of sendShards sendESPLoop goroutines. shard
+// selects which one -- callers with a flow to be consistent about (e.g.
+// netstack.Mesh's per-flow outbound workers) should pass the same shard
+// index every time for a given flow, so that flow's packets stay in
+// relative order through the batching below; callers without one (e.g.
+// babel control traffic via Peer.SendRaw) can pass any fixed value. Safe
+// for concurrent callers on different shards: each is just a channel send.
+func (m *Mux) SendESP(shard int, b []byte) error {
+	ch := m.espOut[shard%len(m.espOut)]
 	select {
-	case m.espOut <- b:
+	case ch <- b:
 		return nil
 	case <-m.done:
 		return m.doneError()
 	}
 }
 
-// sendESPLoop batches whatever's currently queued into as few Bind.Send
-// calls as possible (each of which UDP-GSO-coalesces its buffers into as
-// few underlying datagrams as the kernel supports) — a non-blocking-drain
-// pattern: a lone packet with nothing queued behind it still goes out
-// immediately, batching only kicks in under real load.
-func (m *Mux) sendESPLoop() {
+// sendESPLoop batches whatever's currently queued on ch into as few
+// Bind.Send calls as possible (each of which UDP-GSO-coalesces its buffers
+// into as few underlying datagrams as the kernel supports) — a
+// non-blocking-drain pattern: a lone packet with nothing queued behind it
+// still goes out immediately, batching only kicks in under real load.
+// sendShards of these run concurrently, one per shard, so that
+// syscall-heavy send work spreads across cores the same way encryption
+// already does upstream in netstack.Mesh.outboundLoop.
+func (m *Mux) sendESPLoop(ch chan []byte) {
 	bufs := make([][]byte, 0, espSendBatch)
 	for {
 		select {
 		case <-m.done:
 			return
-		case b := <-m.espOut:
+		case b := <-ch:
 			bufs = append(bufs, b)
 		}
 	drain:
 		for len(bufs) < espSendBatch {
 			select {
-			case b := <-m.espOut:
+			case b := <-ch:
 				bufs = append(bufs, b)
 			default:
 				break drain

@@ -93,12 +93,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	peer := netstack.NewPeer("bird", func(raw []byte, nh byte) error {
+	peer := netstack.NewPeer("bird", func(shard int, raw []byte, nh byte) error {
 		sealed, err := out.Seal(raw, nh)
 		if err != nil {
 			return err
 		}
-		return sess.Mux().SendESP(sealed)
+		return sess.Mux().SendESP(shard, sealed)
 	})
 
 	speaker, err := babel.New(babel.Config{HelloInterval: 4 * time.Second}, mesh)

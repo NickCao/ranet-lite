@@ -141,7 +141,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := sess.Mux().SendESP(espPkt); err != nil {
+	if err := sess.Mux().SendESP(0, espPkt); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("sent ESP-encapsulated ICMP echo request")
