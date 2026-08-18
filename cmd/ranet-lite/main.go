@@ -26,7 +26,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
 
@@ -40,10 +39,16 @@ import (
 
 const reconnectDelay = 10 * time.Second
 
-// inboundWorkers bounds how many goroutines decrypt+deliver a single
-// peer's inbound ESP traffic concurrently — see connectPeer's doc
-// comment for why this needs to be parallel at all.
+// inboundWorkers bounds how many goroutines decrypt a single peer's
+// inbound ESP traffic concurrently — see connectPeer's doc comment for
+// why this needs to be parallel at all. orderBufferSize bounds how many
+// packets can be mid-decrypt (reserved a delivery slot but not yet
+// resolved) at once; it doesn't need to match any particular buffer
+// elsewhere, just be comfortably larger than inboundWorkers so a slow
+// packet doesn't immediately stall new reads.
 var inboundWorkers = min(runtime.NumCPU(), 16)
+
+const orderBufferSize = 4096
 
 func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
@@ -240,44 +245,62 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 
 	go sess.Run() // answers the peer's DPD liveness checks
 
-	// Decrypt+deliver is fanned out across a bounded worker pool rather
-	// than done one packet at a time on this goroutine: a fast enough
-	// real sender (a regular kernel IPsec peer, not throttled by
-	// anything on our end now that reads are batched — see
-	// transport.Mux.readLoop) can otherwise decrypt slower than packets
-	// arrive, backing up and overflowing Mux's internal ESP channel —
+	// Decryption is fanned out across up to inboundWorkers goroutines —
+	// one packet at a time on a single goroutine couldn't keep up with a
+	// fast enough real sender once reads were batched (transport.Mux.
+	// readLoop), backing up and overflowing Mux's internal ESP channel:
 	// real, permanent packet loss, confirmed live via the "espCh full,
-	// dropping ESP packet" log. AES-GCM/ChaCha20-Poly1305 Open calls on
-	// one InboundSA are safe concurrently (see esp.InboundSA's doc
-	// comment); mesh.DeliverInbound and speaker.Receive are as well.
-	pkts := make(chan []byte, 256)
-	var wg sync.WaitGroup
-	for i := 0; i < inboundWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for pkt := range pkts {
-				plain, nh, err := in.Open(pkt)
-				if err != nil {
-					log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
-					continue
-				}
-				if speaker.Receive(peer, plain) {
-					log.Printf("peer %s: received babel packet (%d bytes)", name, len(plain))
-				} else {
-					mesh.DeliverInbound(plain, nh)
-				}
-			}
-		}()
+	// dropping ESP packet" log. But delivery to mesh.DeliverInbound/
+	// speaker.Receive must still happen in the *original* arrival order:
+	// unlike outbound (see netstack.Mesh.outboundLoop's flow hashing),
+	// there's no way to know a still-encrypted packet's flow to hash on,
+	// so preserving order here means preserving *all* of it, not just
+	// per-flow — confirmed live too, as retransmits from delivery-order
+	// scrambling even after the channel-overflow fix. Each packet gets a
+	// reserved slot (a 1-buffered result channel) in its original
+	// position *before* decryption starts; a single emitter goroutine
+	// drains slots in that same order, blocking on each one only as long
+	// as it takes that specific decrypt to finish, so slow and fast
+	// packets can still complete out of order without ever being
+	// *delivered* out of order.
+	type decrypted struct {
+		plain []byte
+		nh    byte
+		err   error
 	}
+	order := make(chan chan decrypted, orderBufferSize)
+	sem := make(chan struct{}, inboundWorkers)
+	emitterDone := make(chan struct{})
+	go func() {
+		defer close(emitterDone)
+		for slot := range order {
+			r := <-slot
+			if r.err != nil {
+				log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
+				continue
+			}
+			if speaker.Receive(peer, r.plain) {
+				log.Printf("peer %s: received babel packet (%d bytes)", name, len(r.plain))
+			} else {
+				mesh.DeliverInbound(r.plain, r.nh)
+			}
+		}
+	}()
 
 	for {
 		pkt, err := sess.Mux().RecvESP()
 		if err != nil {
-			close(pkts)
-			wg.Wait()
+			close(order)
+			<-emitterDone
 			return err
 		}
-		pkts <- pkt
+		slot := make(chan decrypted, 1)
+		order <- slot
+		sem <- struct{}{}
+		go func(pkt []byte, slot chan decrypted) {
+			defer func() { <-sem }()
+			plain, nh, err := in.Open(pkt)
+			slot <- decrypted{plain, nh, err}
+		}(pkt, slot)
 	}
 }
