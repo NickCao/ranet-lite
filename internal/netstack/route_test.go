@@ -178,3 +178,106 @@ func TestAddrsOfRejectsShortOrUnknownPackets(t *testing.T) {
 		t.Fatal("expected reject on unknown IP version")
 	}
 }
+
+// TestRouteTableTrieRealBranching forces the destination trie to actually
+// fork: several prefixes share increasingly long common prefixes, which
+// the old linear scan never had to distinguish (it just compared each
+// entry independently) but which exercises insertDest's branch-node
+// creation directly. Every prefix here differs in its *installed*
+// specificity, so each must resolve to exactly the one that covers it
+// most precisely, regardless of how the trie chose to structure itself
+// internally.
+func TestRouteTableTrieRealBranching(t *testing.T) {
+	rt := NewRouteTable()
+	root := NewPeer("root", nil, nil)     // 10.0.0.0/8
+	mid := NewPeer("mid", nil, nil)       // 10.64.0.0/10
+	narrow := NewPeer("narrow", nil, nil) // 10.64.5.0/24
+	other := NewPeer("other", nil, nil)   // 10.128.0.0/9 -- diverges from mid/narrow high up
+
+	rt.Set(netip.Prefix{}, mustPrefix("10.0.0.0/8"), root)
+	rt.Set(netip.Prefix{}, mustPrefix("10.64.0.0/10"), mid)
+	rt.Set(netip.Prefix{}, mustPrefix("10.64.5.0/24"), narrow)
+	rt.Set(netip.Prefix{}, mustPrefix("10.128.0.0/9"), other)
+
+	cases := []struct {
+		addr string
+		want *Peer
+	}{
+		{"10.64.5.7", narrow}, // matches all four ancestors; most specific wins
+		{"10.64.9.1", mid},    // inside mid, outside narrow
+		{"10.200.0.1", other}, // inside other, outside mid/narrow
+		{"10.1.2.3", root},    // only the broadest covers it
+	}
+	for _, c := range cases {
+		peer, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr(c.addr))
+		if !ok || peer != c.want {
+			t.Fatalf("lookup(%s): got %v, %v; want %s", c.addr, peer, ok, c.want.ID)
+		}
+	}
+	if _, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr("11.0.0.1")); ok {
+		t.Fatal("expected no route outside 10.0.0.0/8 entirely")
+	}
+}
+
+// TestRouteTableTrieCompactionPreservesSiblings removes one of two
+// routes that fork from a shared synthetic branch node (neither 10.0.0.0/9
+// nor 10.128.0.0/9 has an ancestor/descendant relationship with the
+// other -- inserting both forces insertDest to create a branch node with
+// no route of its own, just to fork them apart) and verifies the
+// remaining sibling still resolves correctly afterward, i.e. removeNode's
+// splice-and-recurse-upward compaction doesn't corrupt anything besides
+// the route actually being removed.
+func TestRouteTableTrieCompactionPreservesSiblings(t *testing.T) {
+	rt := NewRouteTable()
+	a := NewPeer("a", nil, nil)
+	b := NewPeer("b", nil, nil)
+	rt.Set(netip.Prefix{}, mustPrefix("10.0.0.0/9"), a)
+	rt.Set(netip.Prefix{}, mustPrefix("10.128.0.0/9"), b)
+
+	rt.Remove(netip.Prefix{}, mustPrefix("10.0.0.0/9"))
+
+	if _, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr("10.1.2.3")); ok {
+		t.Fatal("removed route still resolves")
+	}
+	peer, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr("10.129.0.1"))
+	if !ok || peer != b {
+		t.Fatalf("sibling route corrupted by removal: got %v, %v; want b, true", peer, ok)
+	}
+
+	// The now-pointless branch node forking these two apart should have
+	// been compacted away entirely -- Debug should show exactly b's route.
+	debug := rt.Debug()
+	if len(debug) != 1 {
+		t.Fatalf("expected exactly one remaining route after compaction, got %v", debug)
+	}
+}
+
+// TestRouteTableTrieRemovePeerCompactsAcrossFamilies exercises RemovePeer
+// walking both the IPv4 and IPv6 tries with several branching entries in
+// each, confirming compaction leaves unrelated peers' routes intact in
+// both address families.
+func TestRouteTableTrieRemovePeerCompactsAcrossFamilies(t *testing.T) {
+	rt := NewRouteTable()
+	a := NewPeer("a", nil, nil)
+	b := NewPeer("b", nil, nil)
+
+	rt.Set(netip.Prefix{}, mustPrefix("10.0.0.0/9"), a)
+	rt.Set(netip.Prefix{}, mustPrefix("10.128.0.0/9"), a)
+	rt.Set(netip.Prefix{}, mustPrefix("10.64.0.0/10"), b)
+	rt.Set(netip.Prefix{}, mustPrefix("2001:db8:1::/48"), a)
+	rt.Set(netip.Prefix{}, mustPrefix("2001:db8:2::/48"), b)
+
+	rt.RemovePeer(a)
+
+	for _, addr := range []string{"10.1.2.3", "10.200.0.1", "2001:db8:1::5"} {
+		if _, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr(addr)); ok {
+			t.Fatalf("a's route for %s should be gone", addr)
+		}
+	}
+	if peer, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr("10.64.1.1")); !ok || peer != b {
+		t.Fatalf("b's IPv4 route should be unaffected, got %v, %v", peer, ok)
+	}
+	if peer, ok := rt.Lookup(mustAddr("1.2.3.4"), mustAddr("2001:db8:2::5")); !ok || peer != b {
+		t.Fatalf("b's IPv6 route should be unaffected, got %v, %v", peer, ok)
+	}
+}
