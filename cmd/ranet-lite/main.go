@@ -158,6 +158,26 @@ func main() {
 // than requiring a manual restart.
 func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, local config.Endpoint, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, hub *transport.Hub) {
 	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
+	if p.SerialNumber != "" {
+		org, ok := reg.FindOrganization(p.Organization)
+		if !ok {
+			log.Printf("peer %s: organization %q not found", name, p.Organization)
+			return
+		}
+		node, ok := org.FindNode(p.CommonName)
+		if !ok {
+			log.Printf("peer %s: node not found", name)
+			return
+		}
+		ep, ok := node.FindEndpoint(p.SerialNumber)
+		if !ok {
+			log.Printf("peer %s: endpoint serial %q not found", name, p.SerialNumber)
+			return
+		}
+		if ep.AddressFamily != local.AddressFamily {
+			return
+		}
+	}
 	for {
 		if ctx.Err() != nil {
 			return
