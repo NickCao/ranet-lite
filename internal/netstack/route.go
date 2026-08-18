@@ -6,27 +6,41 @@ import (
 	"sync"
 )
 
-// Peer is one mesh neighbor: sendFn encapsulates a raw tunnel-mode IP packet
-// (nextHeader is esp.NextHeaderIPv4/IPv6) and transmits it to that peer.
-// Decoupling delivery from the TUN plumbing this way makes the stack
-// wiring testable without a real TUN device or ESP/UDP (see mesh_test.go).
+// Peer is one mesh neighbor: encryptFn encrypts a raw tunnel-mode IP packet
+// (nextHeader is esp.NextHeaderIPv4/IPv6) for this peer, and transmitFn
+// hands the sealed result off to the wire. They're kept separate, rather
+// than one combined send step, so Mesh.outboundLoop can run the expensive
+// part -- encryption -- across as many parallel workers as there are
+// cores for any peer's traffic, while still calling transmitFn for one
+// peer's packets in their original relative order (see outboundLoop's doc
+// comment for why that matters and why this split, rather than pinning a
+// peer or flow to one fixed worker, is what lets a single peer actually
+// use every core). Decoupling delivery from the TUN plumbing this way
+// also makes the stack wiring testable without a real TUN device or
+// ESP/UDP (see mesh_test.go).
 type Peer struct {
-	ID     string
-	sendFn func(raw []byte, nextHeader byte) error
+	ID         string
+	encryptFn  func(raw []byte, nextHeader byte) ([]byte, error)
+	transmitFn func(sealed []byte) error
 }
 
-func NewPeer(id string, sendFn func(raw []byte, nextHeader byte) error) *Peer {
-	return &Peer{ID: id, sendFn: sendFn}
+func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
+	return &Peer{ID: id, encryptFn: encryptFn, transmitFn: transmitFn}
 }
 
 // SendRaw transmits a hand-built tunnel-mode IP packet directly through
-// this peer, bypassing the mesh's route table. Used by protocols that
-// address a specific peer directly rather than by destination IP — e.g.
-// internal/babel, which multicasts through each peer's own ESP tunnel
-// rather than routing by the (link-local, often peer-agnostic) destination
-// address.
+// this peer, bypassing the mesh's route table and its order-preserving
+// pipeline. Used by protocols that address a specific peer directly
+// rather than by destination IP — e.g. internal/babel, which multicasts
+// through each peer's own ESP tunnel rather than routing by the
+// (link-local, often peer-agnostic) destination address. Low volume, and
+// already strictly sequential relative to itself, so no ordering concern.
 func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
-	return p.sendFn(raw, nextHeader)
+	sealed, err := p.encryptFn(raw, nextHeader)
+	if err != nil {
+		return err
+	}
+	return p.transmitFn(sealed)
 }
 
 // RouteTable maps (source, destination) prefix pairs to the peer that can

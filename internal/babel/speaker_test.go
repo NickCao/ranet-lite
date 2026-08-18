@@ -40,16 +40,22 @@ func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, spe
 		t.Fatal(err)
 	}
 
+	// No real crypto here (validated separately, see esp_test.go/mux_test.go)
+	// -- encryptFn is a no-op passthrough, and all the delivery logic lives
+	// in transmitFn, matching the single combined sendFn this test used
+	// before Peer split the two steps.
+	noopEncrypt := func(raw []byte, nh byte) ([]byte, error) { return raw, nil }
+
 	var peerAForB, peerBForA *netstack.Peer
-	peerBForA = netstack.NewPeer("b", func(raw []byte, nh byte) error {
+	peerBForA = netstack.NewPeer("b", noopEncrypt, func(raw []byte) error {
 		if !speakerB.Receive(peerAForB, raw) {
-			meshB.DeliverInbound(raw, nh)
+			meshB.DeliverInbound(raw, 0)
 		}
 		return nil
 	})
-	peerAForB = netstack.NewPeer("a", func(raw []byte, nh byte) error {
+	peerAForB = netstack.NewPeer("a", noopEncrypt, func(raw []byte) error {
 		if !speakerA.Receive(peerBForA, raw) {
-			meshA.DeliverInbound(raw, nh)
+			meshA.DeliverInbound(raw, 0)
 		}
 		return nil
 	})

@@ -234,13 +234,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		return err
 	}
 
-	peer := netstack.NewPeer(name, func(raw []byte, nh byte) error {
-		sealed, err := out.Seal(raw, nh)
-		if err != nil {
-			return err
-		}
-		return sess.Mux().SendESP(sealed)
-	})
+	peer := netstack.NewPeer(name, out.Seal, sess.Mux().SendESP)
 	speaker.AddPeer(peer)
 
 	go sess.Run() // answers the peer's DPD liveness checks

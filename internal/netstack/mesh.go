@@ -15,7 +15,6 @@ package netstack
 
 import (
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net/netip"
 	"runtime"
@@ -26,10 +25,10 @@ import (
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
 
-// outboundWorkers bounds how many goroutines process outbound packets
-// concurrently. Packets are assigned to a worker by flow hash (see
-// flowHash), not round-robin, specifically so parallelism happens across
-// flows rather than within one — see outboundLoop's doc comment.
+// outboundWorkers bounds how many packets can have encryption in flight
+// concurrently across all peers combined -- see outboundLoop's doc
+// comment for why this is a shared pool rather than work pinned to a
+// fixed worker per peer or flow.
 var outboundWorkers = min(runtime.NumCPU(), 16)
 
 // writeOffset is how much leading space Device.Write needs in each buffer
@@ -58,10 +57,9 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	dev      tun.Device
-	inbound  chan []byte
-	outbound []chan []byte // indexed by flowHash(raw) % len(outbound)
-	done     chan struct{}
+	dev     tun.Device
+	inbound chan []byte
+	done    chan struct{}
 }
 
 func New(mtu int) (*Mesh, error) {
@@ -78,31 +76,35 @@ func New(mtu int) (*Mesh, error) {
 		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
 	m := &Mesh{
-		Routes:   NewRouteTable(),
-		Name:     name,
-		dev:      dev,
-		inbound:  make(chan []byte, chanBufSize),
-		outbound: make([]chan []byte, outboundWorkers),
-		done:     make(chan struct{}),
-	}
-	for i := range m.outbound {
-		m.outbound[i] = make(chan []byte, chanBufSize)
-		go m.outboundWorker(m.outbound[i])
+		Routes:  NewRouteTable(),
+		Name:    name,
+		dev:     dev,
+		inbound: make(chan []byte, chanBufSize),
+		done:    make(chan struct{}),
 	}
 	go m.outboundLoop()
 	go m.inboundLoop()
 	return m, nil
 }
 
-// outboundLoop reads packets from the TUN device and fans them out across
-// outboundWorkers by flow hash. Parallelism has to happen *across* flows,
-// not *within* one: encryption completing (and hitting the wire) out of
-// the order packets were read is invisible to a protocol like UDP, but a
-// TCP receiver reads it as loss and asks the sender to retransmit, which
-// is pure waste since nothing was actually lost. Hashing by flow keeps
-// every packet of one connection going to the same worker — and so
-// staying in relative order — while unrelated flows (e.g. iperf3 -P 8's
-// separate streams) still get encrypted fully in parallel across cores.
+// outboundLoop reads packets from the TUN device, encrypting them across
+// as many parallel workers as there are cores regardless of which peer or
+// flow a packet belongs to -- mirroring wireguard-go's own device.
+// RoutineEncryption pool (one instance per core, shared across every
+// peer, not pinned by flow). Parallel encryption completing out of the
+// order packets were read is invisible to a protocol like UDP, but a TCP
+// receiver reads it as loss and asks the sender to retransmit, which is
+// pure waste since nothing was actually lost -- so before a packet's
+// encryption even starts, it reserves a delivery slot in read order (a
+// 1-buffered result channel), and a single emitter drains slots in that
+// same order, calling Peer.transmitFn once each one resolves. Slow and
+// fast packets can still finish encrypting out of order without ever
+// being *transmitted* out of order. This lets a single peer's single flow
+// use every core for encryption, unlike hashing work to a fixed worker
+// (which caps one flow to whatever one worker's throughput is), and keeps
+// transmitFn calls funneling through one path per peer so its own
+// batching/GSO coalescing sees the full stream rather than fragments of
+// it.
 func (m *Mesh) outboundLoop() {
 	batch := m.dev.BatchSize()
 	bufs := make([][]byte, batch)
@@ -110,11 +112,30 @@ func (m *Mesh) outboundLoop() {
 	for i := range bufs {
 		bufs[i] = make([]byte, 65536)
 	}
-	defer func() {
-		for _, w := range m.outbound {
-			close(w)
+
+	type job struct {
+		peer   *Peer
+		sealed []byte
+		ok     bool
+	}
+	order := make(chan chan job, chanBufSize)
+	sem := make(chan struct{}, outboundWorkers)
+	emitterDone := make(chan struct{})
+	go func() {
+		defer close(emitterDone)
+		for slot := range order {
+			j := <-slot
+			if !j.ok {
+				continue // malformed packet, no route, or Seal failure: drop
+			}
+			_ = j.peer.transmitFn(j.sealed)
 		}
 	}()
+	defer func() {
+		close(order)
+		<-emitterDone
+	}()
+
 	for {
 		n, err := m.dev.Read(bufs, sizes, 0)
 		if err != nil {
@@ -122,32 +143,38 @@ func (m *Mesh) outboundLoop() {
 		}
 		for i := 0; i < n; i++ {
 			raw := append([]byte(nil), bufs[i][:sizes[i]]...)
-			w := m.outbound[flowHash(raw)%uint32(len(m.outbound))]
+			slot := make(chan job, 1)
 			select {
-			case w <- raw:
+			case order <- slot:
 			case <-m.done:
 				return
 			}
+			select {
+			case sem <- struct{}{}:
+			case <-m.done:
+				return
+			}
+			go func(raw []byte, slot chan job) {
+				defer func() { <-sem }()
+				src, dst, nh, ok := addrsOf(raw)
+				if !ok {
+					slot <- job{}
+					return
+				}
+				peer, ok := m.Routes.Lookup(src, dst)
+				if !ok {
+					slot <- job{} // no route: drop, like any unreachable destination
+					return
+				}
+				sealed, err := peer.encryptFn(raw, nh)
+				if err != nil {
+					slot <- job{}
+					return
+				}
+				slot <- job{peer: peer, sealed: sealed, ok: true}
+			}(raw, slot)
 		}
 	}
-}
-
-func (m *Mesh) outboundWorker(ch chan []byte) {
-	for raw := range ch {
-		m.sendOut(raw)
-	}
-}
-
-func (m *Mesh) sendOut(raw []byte) {
-	src, dst, nh, ok := addrsOf(raw)
-	if !ok {
-		return
-	}
-	peer, ok := m.Routes.Lookup(src, dst)
-	if !ok {
-		return // no route: drop, like any unreachable destination
-	}
-	_ = peer.sendFn(raw, nh)
 }
 
 // addrsOf extracts both the source and destination address from a raw IP
@@ -177,48 +204,10 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 	}
 }
 
-// flowHash deterministically hashes a raw IP packet's flow — source,
-// destination, protocol, and (for TCP/UDP) ports — so the same flow
-// always lands on the same outbound worker. It's a best-effort
-// approximation (e.g. IPv6 extension headers before TCP/UDP aren't
-// walked), which is fine: getting this wrong only affects load
-// distribution across workers, never correctness.
-func flowHash(raw []byte) uint32 {
-	h := fnv.New32a()
-	if len(raw) < 1 {
-		return 0
-	}
-	switch raw[0] >> 4 {
-	case 4:
-		if len(raw) < 20 {
-			return 0
-		}
-		h.Write(raw[12:20]) // src + dst
-		proto := raw[9]
-		h.Write([]byte{proto})
-		if (proto == 6 || proto == 17) && len(raw) >= 24 {
-			h.Write(raw[20:24]) // src port + dst port
-		}
-	case 6:
-		if len(raw) < 40 {
-			return 0
-		}
-		h.Write(raw[8:40]) // src + dst
-		proto := raw[6]
-		h.Write([]byte{proto})
-		if (proto == 6 || proto == 17) && len(raw) >= 44 {
-			h.Write(raw[40:44]) // src port + dst port
-		}
-	default:
-		return 0
-	}
-	return h.Sum32()
-}
-
 // DeliverInbound injects an already-decapsulated tunnel-mode IP packet into
 // the TUN device, as if it had arrived on the wire. nextHeader is unused —
 // the packet's own version nibble is all the kernel needs — but kept for
-// symmetry with how peers hand packets to Peer.sendFn. It hands off to
+// symmetry with how peers hand packets to Peer.encryptFn. It hands off to
 // inboundLoop rather than writing directly so that packets arriving in a
 // tight burst (from one or several peers concurrently) get coalesced into
 // a single Device.Write call.
