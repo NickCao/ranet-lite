@@ -143,6 +143,10 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) error {
 	if !ok || encr.ID != child.EncrID || encr.KeyLengthBits != child.EncrKeyBits {
 		return s.respondNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
+	esn, ok := props[0].ChosenTransform(TransESN)
+	if !ok || esn.ID != ESN_YES {
+		return s.respondNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
 	var spi [4]byte
 	for binary.BigEndian.Uint32(spi[:]) == 0 {
 		if _, err := rand.Read(spi[:]); err != nil {

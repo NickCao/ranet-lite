@@ -138,19 +138,19 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	// A packet ~3000 sequence numbers behind is well within a 64-packet
 	// window's rejection range but must be accepted by the wider window.
 	late := uint32(10000 - 3000)
-	if err := w.check(late); err != nil {
+	if err := w.check(uint64(late)); err != nil {
 		t.Fatalf("packet %d positions behind should be accepted with a %d window: %v", 3000, windowSize, err)
 	}
-	w.commit(late)
+	w.commit(uint64(late))
 
 	// The same late packet replayed again must still be rejected.
-	if err := w.check(late); err == nil {
+	if err := w.check(uint64(late)); err == nil {
 		t.Fatal("exact duplicate of a far-behind packet was accepted")
 	}
 
 	// A packet beyond windowSize behind must be rejected as too old.
 	tooOld := uint32(10000 - windowSize - 1)
-	if err := w.check(tooOld); err == nil {
+	if err := w.check(uint64(tooOld)); err == nil {
 		t.Fatal("packet beyond the window was accepted")
 	}
 
@@ -162,6 +162,18 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	w.commit(10000 + windowSize + 500)
 	if err := w.check(10000); err == nil {
 		t.Fatal("a sequence far behind after a large jump should be rejected as too old, not silently accepted")
+	}
+}
+
+func TestReplayWindowReconstructsESNHighBits(t *testing.T) {
+	var w replayWindow
+	w.commit(0x00000001ffffffff)
+	if got := w.sequence(0); got != 0x0000000200000000 {
+		t.Fatalf("wrapped sequence = %016x, want 0000000200000000", got)
+	}
+	w.commit(0x0000000200000001)
+	if got := w.sequence(0xffffffff); got != 0x00000001ffffffff {
+		t.Fatalf("previous sequence = %016x, want 00000001ffffffff", got)
 	}
 }
 
