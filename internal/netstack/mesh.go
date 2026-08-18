@@ -75,22 +75,30 @@ type Mesh struct {
 	done       chan struct{}
 }
 
-func New(mtu int) (*Mesh, error) {
+// New creates an automatically named TUN device.
+func New(mtu int) (*Mesh, error) { return NewNamed(mtu, "") }
+
+// NewNamed attaches to or creates name through wireguard-go's TUN backend.
+// An empty name retains the project's automatically assigned ranet%d name.
+func NewNamed(mtu int, name string) (*Mesh, error) {
 	if mtu == 0 {
 		mtu = DefaultMTU
 	}
-	dev, err := tun.CreateTUN("ranet%d", mtu)
+	if name == "" {
+		name = "ranet%d"
+	}
+	dev, err := tun.CreateTUN(name, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("netstack: create tun device: %w", err)
 	}
-	name, err := dev.Name()
+	actualName, err := dev.Name()
 	if err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
 	m := &Mesh{
 		Routes:     NewRouteTable(),
-		Name:       name,
+		Name:       actualName,
 		dev:        dev,
 		inbound:    make(chan []byte, chanBufSize),
 		encryption: make(chan *outboundElement, chanBufSize),

@@ -27,7 +27,12 @@ babel:
   hello_interval: 20s
   update_interval: 80s
 
-# ranet-lite creates a TUN device (its name is logged on startup) but
+# Optional: use this TUN name. WireGuard's TUN backend attaches when the
+# interface already exists, or creates it if it does not. Omit it to create
+# an automatically named ranet%d interface.
+# tun: ranet0
+
+# ranet-lite creates a TUN device by default (its name is logged on startup) but
 # never touches its address or routes itself — after starting it, assign
 # it an address and add whatever routes you want yourself, e.g.:
 #   ip addr add 10.66.0.5/32 dev ranet0

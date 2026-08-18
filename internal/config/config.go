@@ -25,6 +25,9 @@ type Config struct {
 	Registry   string `yaml:"registry"`    // path to a ranet registry.json
 
 	Originate []string `yaml:"originate"` // CIDR prefixes this node announces via babel
+	// TUN names an existing TUN device to attach to, or the device to create
+	// when it does not exist. Empty creates an automatically named ranet%d.
+	TUN string `yaml:"tun"`
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`

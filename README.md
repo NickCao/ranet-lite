@@ -51,7 +51,8 @@ packet's real source address as it arrives on the TUN device — not an
 approximation based on a single configured "our address".
 
 **ranet-lite never manages the TUN device's address or routes.** It
-creates the device and brings it up; everything else — assigning it an
+creates the device and brings it up, or attaches to the configured `tun`
+device; everything else — assigning it an
 address, adding a default route or more specific routes, or running a
 separate routing daemon (e.g. BIRD) that peers with the embedded Babel
 speaker over the device for fully automatic route installation — is up to
@@ -102,6 +103,10 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 # Prefixes this node announces via babel as reachable through itself.
 originate:
   - "10.66.0.5/32"
+
+# Optional fixed TUN name. It attaches to an existing compatible device or
+# creates it when absent. Omit to create an automatically named ranet%d device.
+# tun: ranet0
 
 # One or more existing mesh nodes to dial as IKEv2/babel peers.
 peers:

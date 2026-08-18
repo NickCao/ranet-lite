@@ -83,11 +83,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	mesh, err := netstack.New(0)
+	mesh, err := netstack.NewNamed(0, cfg.TUN)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("tun device %s created; assign it an address and add routes yourself before traffic will flow", mesh.Name)
+	if cfg.TUN == "" {
+		log.Printf("tun device %s created; assign it an address and add routes yourself before traffic will flow", mesh.Name)
+	} else {
+		log.Printf("using tun device %s", mesh.Name)
+	}
 
 	speaker, err := babel.New(babel.Config{
 		HelloInterval:  cfg.Babel.HelloInterval,
