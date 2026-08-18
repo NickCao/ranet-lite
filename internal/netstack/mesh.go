@@ -15,14 +15,22 @@ package netstack
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net/netip"
+	"runtime"
 
 	"github.com/NickCao/ranet-lite/internal/esp"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
+
+// outboundWorkers bounds how many goroutines process outbound packets
+// concurrently. Packets are assigned to a worker by flow hash (see
+// flowHash), not round-robin, specifically so parallelism happens across
+// flows rather than within one — see outboundLoop's doc comment.
+var outboundWorkers = min(runtime.NumCPU(), 16)
 
 // writeOffset is how much leading space Device.Write needs in each buffer
 // to prepend its virtio-net header (the tun package always requests
@@ -41,9 +49,10 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	dev     tun.Device
-	inbound chan []byte
-	done    chan struct{}
+	dev      tun.Device
+	inbound  chan []byte
+	outbound []chan []byte // indexed by flowHash(raw) % len(outbound)
+	done     chan struct{}
 }
 
 func New(mtu int) (*Mesh, error) {
@@ -60,17 +69,31 @@ func New(mtu int) (*Mesh, error) {
 		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
 	m := &Mesh{
-		Routes:  NewRouteTable(),
-		Name:    name,
-		dev:     dev,
-		inbound: make(chan []byte, 256),
-		done:    make(chan struct{}),
+		Routes:   NewRouteTable(),
+		Name:     name,
+		dev:      dev,
+		inbound:  make(chan []byte, 256),
+		outbound: make([]chan []byte, outboundWorkers),
+		done:     make(chan struct{}),
+	}
+	for i := range m.outbound {
+		m.outbound[i] = make(chan []byte, 256)
+		go m.outboundWorker(m.outbound[i])
 	}
 	go m.outboundLoop()
 	go m.inboundLoop()
 	return m, nil
 }
 
+// outboundLoop reads packets from the TUN device and fans them out across
+// outboundWorkers by flow hash. Parallelism has to happen *across* flows,
+// not *within* one: encryption completing (and hitting the wire) out of
+// the order packets were read is invisible to a protocol like UDP, but a
+// TCP receiver reads it as loss and asks the sender to retransmit, which
+// is pure waste since nothing was actually lost. Hashing by flow keeps
+// every packet of one connection going to the same worker — and so
+// staying in relative order — while unrelated flows (e.g. iperf3 -P 8's
+// separate streams) still get encrypted fully in parallel across cores.
 func (m *Mesh) outboundLoop() {
 	batch := m.dev.BatchSize()
 	bufs := make([][]byte, batch)
@@ -78,25 +101,31 @@ func (m *Mesh) outboundLoop() {
 	for i := range bufs {
 		bufs[i] = make([]byte, 65536)
 	}
+	defer func() {
+		for _, w := range m.outbound {
+			close(w)
+		}
+	}()
 	for {
 		n, err := m.dev.Read(bufs, sizes, 0)
 		if err != nil {
 			return // device closed
 		}
-		// Dispatch each packet's routing + ESP encryption concurrently
-		// rather than one at a time on this single goroutine: sendOut
-		// chains into a peer's Seal() (AES-GCM/ChaCha20-Poly1305, CPU-
-		// bound) and a UDP write, both safe for concurrent use — Seal
-		// only serializes sequence/IV allocation, not the encryption
-		// itself (see esp.OutboundSA.nextSeq), and net.UDPConn is safe
-		// for concurrent writes. Serializing this on one goroutine would
-		// otherwise cap the whole mesh's outbound throughput — every
-		// peer, every flow — at one CPU core's encryption rate. Each
-		// packet gets its own copy since bufs is reused by the next Read.
 		for i := 0; i < n; i++ {
 			raw := append([]byte(nil), bufs[i][:sizes[i]]...)
-			go m.sendOut(raw)
+			w := m.outbound[flowHash(raw)%uint32(len(m.outbound))]
+			select {
+			case w <- raw:
+			case <-m.done:
+				return
+			}
 		}
+	}
+}
+
+func (m *Mesh) outboundWorker(ch chan []byte) {
+	for raw := range ch {
+		m.sendOut(raw)
 	}
 }
 
@@ -137,6 +166,44 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 	default:
 		return netip.Addr{}, netip.Addr{}, 0, false
 	}
+}
+
+// flowHash deterministically hashes a raw IP packet's flow — source,
+// destination, protocol, and (for TCP/UDP) ports — so the same flow
+// always lands on the same outbound worker. It's a best-effort
+// approximation (e.g. IPv6 extension headers before TCP/UDP aren't
+// walked), which is fine: getting this wrong only affects load
+// distribution across workers, never correctness.
+func flowHash(raw []byte) uint32 {
+	h := fnv.New32a()
+	if len(raw) < 1 {
+		return 0
+	}
+	switch raw[0] >> 4 {
+	case 4:
+		if len(raw) < 20 {
+			return 0
+		}
+		h.Write(raw[12:20]) // src + dst
+		proto := raw[9]
+		h.Write([]byte{proto})
+		if (proto == 6 || proto == 17) && len(raw) >= 24 {
+			h.Write(raw[20:24]) // src port + dst port
+		}
+	case 6:
+		if len(raw) < 40 {
+			return 0
+		}
+		h.Write(raw[8:40]) // src + dst
+		proto := raw[6]
+		h.Write([]byte{proto})
+		if (proto == 6 || proto == 17) && len(raw) >= 44 {
+			h.Write(raw[40:44]) // src port + dst port
+		}
+	default:
+		return 0
+	}
+	return h.Sum32()
 }
 
 // DeliverInbound injects an already-decapsulated tunnel-mode IP packet into

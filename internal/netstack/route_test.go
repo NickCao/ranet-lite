@@ -1,6 +1,7 @@
 package netstack
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"testing"
 )
@@ -164,6 +165,67 @@ func TestAddrsOfIPv6(t *testing.T) {
 	}
 	if nh != 41 {
 		t.Fatalf("next header = %d, want 41 (IPv6)", nh)
+	}
+}
+
+func buildTCPPacket(t *testing.T, src, dst string, srcPort, dstPort uint16) []byte {
+	t.Helper()
+	sa, da := mustAddr(src), mustAddr(dst)
+	if sa.Is4() != da.Is4() {
+		t.Fatalf("mismatched address families: %s / %s", src, dst)
+	}
+	var raw []byte
+	if sa.Is4() {
+		raw = make([]byte, 24)
+		raw[0] = 0x45
+		copy(raw[12:16], sa.AsSlice())
+		copy(raw[16:20], da.AsSlice())
+		raw[9] = 6 // TCP
+		binary.BigEndian.PutUint16(raw[20:22], srcPort)
+		binary.BigEndian.PutUint16(raw[22:24], dstPort)
+	} else {
+		raw = make([]byte, 44)
+		raw[0] = 0x60
+		copy(raw[8:24], sa.AsSlice())
+		copy(raw[24:40], da.AsSlice())
+		raw[6] = 6 // TCP
+		binary.BigEndian.PutUint16(raw[40:42], srcPort)
+		binary.BigEndian.PutUint16(raw[42:44], dstPort)
+	}
+	return raw
+}
+
+func TestFlowHashSameFlowIsStable(t *testing.T) {
+	a := buildTCPPacket(t, "10.0.0.1", "10.0.0.2", 1234, 443)
+	b := buildTCPPacket(t, "10.0.0.1", "10.0.0.2", 1234, 443)
+	if flowHash(a) != flowHash(b) {
+		t.Fatal("identical flows hashed to different values")
+	}
+}
+
+func TestFlowHashDistinguishesFlows(t *testing.T) {
+	base := buildTCPPacket(t, "10.0.0.1", "10.0.0.2", 1234, 443)
+	diffPort := buildTCPPacket(t, "10.0.0.1", "10.0.0.2", 5678, 443)
+	diffDst := buildTCPPacket(t, "10.0.0.1", "10.0.0.3", 1234, 443)
+
+	// Not a strict guarantee for an arbitrary hash function, but for
+	// these deliberately distinct 4-tuples with a well-distributed
+	// 32-bit hash, a collision would indicate a bug (e.g. forgetting to
+	// mix in the port bytes) rather than bad luck.
+	if flowHash(base) == flowHash(diffPort) {
+		t.Fatal("different source ports hashed identically")
+	}
+	if flowHash(base) == flowHash(diffDst) {
+		t.Fatal("different destinations hashed identically")
+	}
+}
+
+func TestFlowHashRejectsGracefully(t *testing.T) {
+	if flowHash(nil) != 0 {
+		t.Fatal("expected 0 for empty input")
+	}
+	if flowHash([]byte{0x45, 0, 0}) != 0 {
+		t.Fatal("expected 0 for truncated IPv4 header")
 	}
 }
 

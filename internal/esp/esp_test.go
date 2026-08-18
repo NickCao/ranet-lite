@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
@@ -169,6 +170,96 @@ func TestSealConcurrentUniqueSeq(t *testing.T) {
 	}
 	if len(seen) != n {
 		t.Fatalf("got %d distinct sequence numbers, want %d", len(seen), n)
+	}
+}
+
+// TestOpenConcurrent seals a batch of distinct packets up front (as a
+// single-threaded sender would), then opens all of them concurrently —
+// exercising Open's locked-check/unlocked-decrypt/locked-recheck-commit
+// split under the race detector. Every packet must decrypt successfully
+// exactly once.
+func TestOpenConcurrent(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ike.ChildSA{
+		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 200
+	pkts := make([][]byte, n)
+	for i := range pkts {
+		pkt, err := out.Seal([]byte(fmt.Sprintf("packet-%d", i)), NextHeaderIPv4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkts[i] = pkt
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failed int
+	for _, pkt := range pkts {
+		wg.Add(1)
+		go func(pkt []byte) {
+			defer wg.Done()
+			if _, _, err := in.Open(pkt); err != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				t.Errorf("concurrent Open: %v", err)
+			}
+		}(pkt)
+	}
+	wg.Wait()
+	if failed != 0 {
+		t.Fatalf("%d/%d concurrent opens failed", failed, n)
+	}
+}
+
+// TestOpenConcurrentReplayRejected races many goroutines opening the
+// *exact same* packet simultaneously: exactly one must succeed (the
+// first-check optimization racing the second locked check-and-commit
+// must never let two winners through).
+func TestOpenConcurrentReplayRejected(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ike.ChildSA{
+		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := out.Seal([]byte("replay me"), NextHeaderIPv4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 50
+	var wg sync.WaitGroup
+	var successes atomic.Int32
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := in.Open(pkt); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := successes.Load(); got != 1 {
+		t.Fatalf("got %d successful opens of the same packet, want exactly 1", got)
 	}
 }
 

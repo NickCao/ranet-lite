@@ -10,6 +10,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
@@ -38,12 +39,21 @@ type OutboundSA struct {
 	seq atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 }
 
-// InboundSA decrypts packets sent to this client's SPI.
+// InboundSA decrypts packets sent to this client's SPI. Open is safe for
+// concurrent use — multiple peers' receive loops, or several packets from
+// one high-throughput peer, may call it from separate goroutines — via a
+// locked check-decrypt-recheck-commit pattern: the (cheap) window check
+// is done once up front to reject an obviously-bad packet before paying
+// for AEAD decryption, and again after decryption (still under lock,
+// atomically with commit) to catch a packet that raced with a concurrent
+// decrypt of the same or a newer sequence number in between.
 type InboundSA struct {
 	aead   cipher.AEAD
 	params ike.ESPAEADParams
 	salt   []byte
 	spi    uint32
+
+	mu     sync.Mutex
 	window replayWindow
 }
 
@@ -132,7 +142,10 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 		return nil, 0, fmt.Errorf("esp: SPI mismatch (got %08x, want %08x)", spi, in.spi)
 	}
 	seq := binary.BigEndian.Uint32(pkt[4:8])
-	if err := in.window.check(seq); err != nil {
+	in.mu.Lock()
+	err := in.window.check(seq)
+	in.mu.Unlock()
+	if err != nil {
 		return nil, 0, err
 	}
 
@@ -141,6 +154,10 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	nonce := append(append([]byte{}, in.salt...), iv...)
 	aad := pkt[:headerLen]
 
+	// The AEAD compute itself touches no shared state, so it runs
+	// unlocked — this is the expensive part, and the whole point of
+	// checking once before it (fail fast) and again after (see below) is
+	// to avoid holding the lock for its duration.
 	plain, err := in.aead.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, 0, fmt.Errorf("esp: authentication failed: %w", err)
@@ -153,6 +170,20 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	if padLen+2 > len(plain) {
 		return nil, 0, fmt.Errorf("esp: invalid padding")
 	}
-	in.window.commit(seq)
+
+	// Re-check under the same lock as commit: another goroutine may have
+	// committed this exact sequence, or advanced the window far enough
+	// to make it stale, while this decrypt was in flight. Without this,
+	// two concurrent decrypts of the same replayed packet could both
+	// pass the first check and both get delivered.
+	in.mu.Lock()
+	err = in.window.check(seq)
+	if err == nil {
+		in.window.commit(seq)
+	}
+	in.mu.Unlock()
+	if err != nil {
+		return nil, 0, err
+	}
 	return plain[:len(plain)-2-padLen], nextHeader, nil
 }
