@@ -234,12 +234,12 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		return err
 	}
 
-	peer := netstack.NewPeer(name, func(shard int, raw []byte, nh byte) error {
+	peer := netstack.NewPeer(name, func(raw []byte, nh byte) error {
 		sealed, err := out.Seal(raw, nh)
 		if err != nil {
 			return err
 		}
-		return sess.Mux().SendESP(shard, sealed)
+		return sess.Mux().SendESP(sealed)
 	})
 	speaker.AddPeer(peer)
 

@@ -87,7 +87,7 @@ func New(mtu int) (*Mesh, error) {
 	}
 	for i := range m.outbound {
 		m.outbound[i] = make(chan []byte, chanBufSize)
-		go m.outboundWorker(i, m.outbound[i])
+		go m.outboundWorker(m.outbound[i])
 	}
 	go m.outboundLoop()
 	go m.inboundLoop()
@@ -132,21 +132,13 @@ func (m *Mesh) outboundLoop() {
 	}
 }
 
-func (m *Mesh) outboundWorker(shard int, ch chan []byte) {
+func (m *Mesh) outboundWorker(ch chan []byte) {
 	for raw := range ch {
-		m.sendOut(shard, raw)
+		m.sendOut(raw)
 	}
 }
 
-// sendOut hands raw to whichever peer's route covers it, passing along the
-// flow shard (this worker's own index) it was already dispatched to. A
-// peer's sendFn threads shard through to the transport so its send-syscall
-// work can be parallelized across cores by the same flow, the same way
-// outboundLoop already parallelizes encryption -- without this, every
-// flow's encrypted packets funnel back into one send goroutine regardless
-// of how many encrypt workers ran them, capping a multi-stream transfer's
-// syscall-heavy work to a single core no matter how many flows there are.
-func (m *Mesh) sendOut(shard int, raw []byte) {
+func (m *Mesh) sendOut(raw []byte) {
 	src, dst, nh, ok := addrsOf(raw)
 	if !ok {
 		return
@@ -155,7 +147,7 @@ func (m *Mesh) sendOut(shard int, raw []byte) {
 	if !ok {
 		return // no route: drop, like any unreachable destination
 	}
-	_ = peer.sendFn(shard, raw, nh)
+	_ = peer.sendFn(raw, nh)
 }
 
 // addrsOf extracts both the source and destination address from a raw IP

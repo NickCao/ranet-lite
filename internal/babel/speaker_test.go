@@ -41,13 +41,13 @@ func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, spe
 	}
 
 	var peerAForB, peerBForA *netstack.Peer
-	peerBForA = netstack.NewPeer("b", func(shard int, raw []byte, nh byte) error {
+	peerBForA = netstack.NewPeer("b", func(raw []byte, nh byte) error {
 		if !speakerB.Receive(peerAForB, raw) {
 			meshB.DeliverInbound(raw, nh)
 		}
 		return nil
 	})
-	peerAForB = netstack.NewPeer("a", func(shard int, raw []byte, nh byte) error {
+	peerAForB = netstack.NewPeer("a", func(raw []byte, nh byte) error {
 		if !speakerA.Receive(peerBForA, raw) {
 			meshA.DeliverInbound(raw, nh)
 		}
