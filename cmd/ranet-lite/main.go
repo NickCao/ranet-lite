@@ -20,9 +20,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof" // registered on DefaultServeMux only if -pprof is set, see below
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -38,7 +41,22 @@ const reconnectDelay = 10 * time.Second
 
 func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
+	pprofAddr := flag.String("pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling — CPU: /debug/pprof/profile, flamegraph: go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	flag.Parse()
+
+	if *pprofAddr != "" {
+		// Mutex/block contention profiling is directly relevant to a
+		// concurrent packet-processing pipeline like this one and cheap
+		// enough to leave on whenever profiling is requested at all.
+		runtime.SetMutexProfileFraction(1)
+		runtime.SetBlockProfileRate(1)
+		go func() {
+			log.Printf("pprof listening on http://%s/debug/pprof/", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("pprof: %v", err)
+			}
+		}()
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
