@@ -20,7 +20,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/NickCao/ranet-lite/internal/esp"
+	"github.com/NickCao/ranet-lite/esp"
 	"golang.zx2c4.com/wireguard/tun"
 )
 

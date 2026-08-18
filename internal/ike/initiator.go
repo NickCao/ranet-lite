@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
@@ -37,14 +38,7 @@ type PeerConfig struct {
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
 // the esp package after a successful handshake.
-type ChildSA struct {
-	EncrID      uint16
-	EncrKeyBits uint16
-	LocalSPI    uint32 // our inbound SPI == the SPI peer sends packets to
-	RemoteSPI   uint32 // peer's inbound SPI == the SPI we send packets to
-	InboundKey  []byte // key||salt used to decrypt packets sent to LocalSPI
-	OutboundKey []byte // key||salt used to encrypt packets sent to RemoteSPI
-}
+type ChildSA = esp.ChildSA
 
 // Session is an established IKE SA: it owns the shared UDP mux and can
 // still service the peer's INFORMATIONAL exchanges (DPD liveness checks,

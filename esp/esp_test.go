@@ -8,15 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-
-	"github.com/NickCao/ranet-lite/internal/ike"
 )
 
-func testChild(t *testing.T) ike.ChildSA {
+func testChild(t *testing.T) ChildSA {
 	t.Helper()
 	key := make([]byte, 20) // AES-128-GCM: 16-byte key + 4-byte salt
 	rand.Read(key)
-	return ike.ChildSA{
+	return ChildSA{
 		EncrID: 20, EncrKeyBits: 128,
 		LocalSPI: 0x11111111, RemoteSPI: 0x22222222,
 		InboundKey: key, OutboundKey: key,
@@ -29,7 +27,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := NewInbound(ike.ChildSA{
+	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
@@ -59,8 +57,8 @@ func TestRoundTripChaCha20Poly1305(t *testing.T) {
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)
 	}
-	child := ike.ChildSA{
-		EncrID:   ike.ENCR_CHACHA20_POLY1305,
+	child := ChildSA{
+		EncrID:   ENCRChaCha20Poly1305,
 		LocalSPI: 0x11111111, RemoteSPI: 0x22222222,
 		InboundKey: key, OutboundKey: key,
 	}
@@ -68,7 +66,7 @@ func TestRoundTripChaCha20Poly1305(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := NewInbound(ike.ChildSA{
+	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
 	if err != nil {
@@ -108,7 +106,7 @@ func TestSealAllocations(t *testing.T) {
 func TestReplayRejected(t *testing.T) {
 	child := testChild(t)
 	out, _ := NewOutbound(child)
-	in, _ := NewInbound(ike.ChildSA{
+	in, _ := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
@@ -180,7 +178,7 @@ func TestSealConcurrentUniqueSeq(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := NewInbound(ike.ChildSA{
+	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
@@ -235,7 +233,7 @@ func TestOpenConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := NewInbound(ike.ChildSA{
+	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
@@ -284,7 +282,7 @@ func TestOpenConcurrentReplayRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := NewInbound(ike.ChildSA{
+	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})
@@ -317,7 +315,7 @@ func TestOpenConcurrentReplayRejected(t *testing.T) {
 func TestTamperedPacketRejected(t *testing.T) {
 	child := testChild(t)
 	out, _ := NewOutbound(child)
-	in, _ := NewInbound(ike.ChildSA{
+	in, _ := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
 	})

@@ -147,39 +147,6 @@ func aeadParams(encrID uint16, keyLenBits uint16) (AEADParams, error) {
 	}
 }
 
-// ESPAEADParams exposes the wire-format parameters (salt/IV/ICV lengths) an
-// ESP AEAD transform needs, so package esp doesn't duplicate the transform
-// table already negotiated here.
-type ESPAEADParams struct {
-	KeyLen  int
-	SaltLen int
-	IVLen   int
-	ICVLen  int
-}
-
-// NewESPAEAD builds an AEAD cipher for ESP packet processing from Child SA
-// keying material (key||salt, as produced by ChildSAKeymat) and returns the
-// wire-format parameters needed to frame packets.
-func NewESPAEAD(encrID uint16, encrKeyBits uint16, keyAndSalt []byte) (cipher.AEAD, ESPAEADParams, error) {
-	ap, err := aeadParams(encrID, encrKeyBits)
-	if err != nil {
-		return nil, ESPAEADParams{}, err
-	}
-	if len(keyAndSalt) != ap.KeyLen+ap.SaltLen {
-		return nil, ESPAEADParams{}, fmt.Errorf("ike: key length %d does not match suite (want %d)", len(keyAndSalt), ap.KeyLen+ap.SaltLen)
-	}
-	aead, err := newAEAD(encrID, keyAndSalt[:ap.KeyLen])
-	if err != nil {
-		return nil, ESPAEADParams{}, err
-	}
-	return aead, ESPAEADParams{KeyLen: ap.KeyLen, SaltLen: ap.SaltLen, IVLen: ap.IVLen, ICVLen: ap.ICVLen}, nil
-}
-
-// ESPSalt returns the salt portion of key||salt keying material.
-func ESPSalt(p ESPAEADParams, keyAndSalt []byte) []byte {
-	return keyAndSalt[p.KeyLen:]
-}
-
 func newAEAD(encrID uint16, key []byte) (cipher.AEAD, error) {
 	switch encrID {
 	case ENCR_AES_GCM_16:
@@ -198,19 +165,19 @@ func newAEAD(encrID uint16, key []byte) (cipher.AEAD, error) {
 // --- IKE SA key derivation, RFC 7296 §2.14, RFC 5282 §2 (AEAD variant) ---
 
 type SASuite struct {
-	EncrID        uint16
-	EncrKeyBits   uint16
-	PRFID         uint16
-	DHGroup       uint16
+	EncrID      uint16
+	EncrKeyBits uint16
+	PRFID       uint16
+	DHGroup     uint16
 }
 
 type IKEKeys struct {
-	Suite    SASuite
-	SKd      []byte
-	SKei     []byte // initiator's encryption key || salt
-	SKer     []byte // responder's encryption key || salt
-	SKpi     []byte
-	SKpr     []byte
+	Suite SASuite
+	SKd   []byte
+	SKei  []byte // initiator's encryption key || salt
+	SKer  []byte // responder's encryption key || salt
+	SKpi  []byte
+	SKpr  []byte
 }
 
 // DeriveIKEKeys computes SKEYSEED and the SK_* keys for the IKE SA.

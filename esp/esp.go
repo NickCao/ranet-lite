@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-
-	"github.com/NickCao/ranet-lite/internal/ike"
 )
 
 const (
@@ -33,7 +31,7 @@ const (
 // authentication outright.
 type OutboundSA struct {
 	aead   cipher.AEAD
-	params ike.ESPAEADParams
+	params aeadParams
 	salt   []byte
 	spi    uint32
 
@@ -49,7 +47,7 @@ type OutboundSA struct {
 // decrypt of the same or a newer sequence number in between.
 type InboundSA struct {
 	aead   cipher.AEAD
-	params ike.ESPAEADParams
+	params aeadParams
 	salt   []byte
 	spi    uint32
 
@@ -57,26 +55,26 @@ type InboundSA struct {
 	window replayWindow
 }
 
-func NewOutbound(child ike.ChildSA) (*OutboundSA, error) {
-	aead, params, err := ike.NewESPAEAD(child.EncrID, child.EncrKeyBits, child.OutboundKey)
+func NewOutbound(child ChildSA) (*OutboundSA, error) {
+	aead, params, err := newESPAEAD(child.EncrID, child.EncrKeyBits, child.OutboundKey)
 	if err != nil {
 		return nil, err
 	}
 	return &OutboundSA{
 		aead: aead, params: params,
-		salt: ike.ESPSalt(params, child.OutboundKey),
+		salt: child.OutboundKey[params.keyLen:],
 		spi:  child.RemoteSPI,
 	}, nil
 }
 
-func NewInbound(child ike.ChildSA) (*InboundSA, error) {
-	aead, params, err := ike.NewESPAEAD(child.EncrID, child.EncrKeyBits, child.InboundKey)
+func NewInbound(child ChildSA) (*InboundSA, error) {
+	aead, params, err := newESPAEAD(child.EncrID, child.EncrKeyBits, child.InboundKey)
 	if err != nil {
 		return nil, err
 	}
 	return &InboundSA{
 		aead: aead, params: params,
-		salt: ike.ESPSalt(params, child.InboundKey),
+		salt: child.InboundKey[params.keyLen:],
 		spi:  child.LocalSPI,
 	}, nil
 }
