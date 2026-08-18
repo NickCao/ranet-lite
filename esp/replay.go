@@ -24,18 +24,27 @@ type replayWindow struct {
 	mask [windowWords]uint64 // mask[i] bit j set => sequence (last - (i*64+j)) already received
 }
 
-// sequence reconstructs the high ESN bits from the current replay window per
-// RFC 4303 appendix A. The 64-bit result is authenticated before acceptance.
+// sequence reconstructs the high ESN bits from the current replay-window edge
+// per RFC 4303 appendix A. This mirrors Linux XFRM's xfrm_replay_seqhi.
+// The 64-bit result is authenticated before acceptance.
 func (w *replayWindow) sequence(low uint32) uint64 {
 	if w.last == 0 {
 		return uint64(low)
 	}
 	high, lastLow := w.last>>32, uint32(w.last)
-	if low < lastLow && lastLow-low > 1<<31 {
-		return (high+1)<<32 | uint64(low)
+	bottom := lastLow - windowSize + 1
+	if lastLow >= windowSize-1 {
+		if low < bottom {
+			high++
+		}
+	} else if low >= bottom && high > 0 {
+		// The window wraps into the preceding 32-bit subspace.
+		high--
 	}
-	if low > lastLow && low-lastLow > 1<<31 && high > 0 {
-		return (high-1)<<32 | uint64(low)
+	if high == 0 && low == 0 {
+		// Sequence zero is rejected by check; keep it in the initial subspace
+		// so that it cannot be misclassified as a wrapped packet.
+		return 0
 	}
 	return high<<32 | uint64(low)
 }
