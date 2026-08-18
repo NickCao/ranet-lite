@@ -425,6 +425,13 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	idrRecv := respMsg.find(PayloadIDr)
 	authRecv := respMsg.find(PayloadAUTH)
 	saRecv := respMsg.find(PayloadSA)
+	if saRecv == nil {
+		if n := respMsg.find(PayloadN); n != nil {
+			if nt, err := DecodeNotify(n.Body); err == nil {
+				return fmt.Errorf("ike: Child SA rejected: notify type %d", nt.Type)
+			}
+		}
+	}
 	if idrRecv == nil || authRecv == nil || saRecv == nil {
 		return fmt.Errorf("ike: incomplete IKE_AUTH response")
 	}
