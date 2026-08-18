@@ -41,6 +41,15 @@ var outboundWorkers = min(runtime.NumCPU(), 16)
 // too-small offset is an out-of-range slice.
 const writeOffset = 16
 
+// chanBufSize sizes the internal channels absorbing bursts between
+// pipeline stages. outboundLoop and inboundLoop both block on these
+// channels rather than dropping, so too small a buffer doesn't lose a
+// packet directly — it stalls the read loop feeding it, which in turn
+// lets the kernel's own fixed-size queue (the tun device's qdisc, 500
+// slots by default) back up and drop instead. Matches transport.
+// espChanSize for the same underlying reason.
+const chanBufSize = 4096
+
 type Mesh struct {
 	Routes *RouteTable
 	// Name is the TUN device's real interface name (e.g. "ranet0"), as
@@ -72,12 +81,12 @@ func New(mtu int) (*Mesh, error) {
 		Routes:   NewRouteTable(),
 		Name:     name,
 		dev:      dev,
-		inbound:  make(chan []byte, 256),
+		inbound:  make(chan []byte, chanBufSize),
 		outbound: make([]chan []byte, outboundWorkers),
 		done:     make(chan struct{}),
 	}
 	for i := range m.outbound {
-		m.outbound[i] = make(chan []byte, 256)
+		m.outbound[i] = make(chan []byte, chanBufSize)
 		go m.outboundWorker(m.outbound[i])
 	}
 	go m.outboundLoop()
