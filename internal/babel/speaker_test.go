@@ -19,19 +19,12 @@ import (
 // per-peer ESP receive loop would dispatch between babel and app traffic.
 func wireSpeakerPair(t *testing.T, cfg Config) (meshA, meshB *netstack.Mesh, speakerA, speakerB *Speaker) {
 	t.Helper()
-	var err error
-	meshA, err = netstack.New(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(meshA.Close)
-	meshB, err = netstack.New(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(meshB.Close)
+	// Babel only uses Mesh.Routes. Avoid creating a privileged TUN device for
+	// protocol tests that never inject non-Babel data into the mesh.
+	meshA = &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	meshB = &netstack.Mesh{Routes: netstack.NewRouteTable()}
 
-	speakerA, err = New(cfg, meshA)
+	speakerA, err := New(cfg, meshA)
 	if err != nil {
 		t.Fatal(err)
 	}
