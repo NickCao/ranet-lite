@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -234,10 +235,48 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		return err
 	}
 
-	peer := netstack.NewPeerBatched(name, out.Seal, sess.Mux().SendESPBatch)
+	// A peer-initiated rekey installs its new SAs before its IKE response is
+	// sent. Retain the immediately preceding inbound SA for packets already
+	// in flight on the replaced SPI (RFC 7296 section 2.8 overlap).
+	var saMu sync.RWMutex
+	inbound := []*esp.InboundSA{in}
+	sess.SetChildHandler(func(child ike.ChildSA) error {
+		newOut, err := esp.NewOutbound(child)
+		if err != nil {
+			return err
+		}
+		newIn, err := esp.NewInbound(child)
+		if err != nil {
+			return err
+		}
+		saMu.Lock()
+		out, in = newOut, newIn
+		inbound = append([]*esp.InboundSA{in}, inbound...)
+		if len(inbound) > 2 {
+			inbound = inbound[:2]
+		}
+		saMu.Unlock()
+		return nil
+	})
+	peer := netstack.NewPeerBatched(name, func(raw []byte, nextHeader byte) ([]byte, error) {
+		saMu.RLock()
+		sa := out
+		saMu.RUnlock()
+		sealed, err := sa.Seal(raw, nextHeader)
+		if err != nil {
+			// A non-ESN SA cannot safely keep transmitting after sequence
+			// exhaustion. Tear it down so runPeer establishes fresh SAs.
+			sess.Mux().Close()
+		}
+		return sealed, err
+	}, sess.Mux().SendESPBatch)
 	speaker.AddPeer(peer)
 
-	go sess.Run() // answers the peer's DPD liveness checks
+	go func() {
+		if err := sess.Run(); err != nil && ctx.Err() == nil {
+			log.Printf("peer %s: IKE control session ended: %v", name, err)
+		}
+	}()
 
 	// Decrypt in parallel, but reserve result slots before dispatch so the
 	// emitter delivers packets in their original arrival order.
@@ -274,7 +313,20 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		sem <- struct{}{}
 		go func(pkt []byte, slot chan decrypted) {
 			defer func() { <-sem }()
-			plain, _, err := in.Open(pkt)
+			saMu.RLock()
+			candidates := append([]*esp.InboundSA(nil), inbound...)
+			saMu.RUnlock()
+			var plain []byte
+			var err error
+			for _, sa := range candidates {
+				plain, _, err = sa.Open(pkt)
+				if err == nil {
+					break
+				}
+			}
+			if err == nil {
+				sess.NoteTraffic()
+			}
 			slot <- decrypted{plain: plain, err: err}
 		}(pkt, slot)
 	}

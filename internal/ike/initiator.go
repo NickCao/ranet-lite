@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -60,10 +62,48 @@ type Session struct {
 	selfMID uint32 // next Message ID *we* allocate for a self-initiated request
 	peerMID uint32 // next Message ID expected from a peer-initiated request
 
-	Child ChildSA
+	childMu sync.RWMutex
+	Child   ChildSA
+
+	handlerMu   sync.RWMutex
+	onChild     func(ChildSA) error
+	lastTraffic atomic.Int64
 }
 
 func (s *Session) Mux() *transport.Mux { return s.mux }
+
+// SetChildHandler installs replacement ESP SAs before Run acknowledges a
+// peer-initiated rekey, as required by RFC 7296 section 2.8.
+func (s *Session) SetChildHandler(fn func(ChildSA) error) {
+	s.handlerMu.Lock()
+	s.onChild = fn
+	s.handlerMu.Unlock()
+}
+
+func (s *Session) replaceChild(child ChildSA) error {
+	s.handlerMu.RLock()
+	fn := s.onChild
+	s.handlerMu.RUnlock()
+	if fn != nil {
+		if err := fn(child); err != nil {
+			return err
+		}
+	}
+	s.childMu.Lock()
+	s.Child = child
+	s.childMu.Unlock()
+	return nil
+}
+
+func (s *Session) currentChild() ChildSA {
+	s.childMu.RLock()
+	defer s.childMu.RUnlock()
+	return s.Child
+}
+
+// NoteTraffic records successfully authenticated ESP traffic for the DPD
+// policy. RFC 7296 section 2.4 treats it as proof that the IKE SA is alive.
+func (s *Session) NoteTraffic() { s.lastTraffic.Store(time.Now().UnixNano()) }
 
 const (
 	requestTimeout = 2 * time.Second
@@ -151,11 +191,11 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	group := uint16(DH_CURVE25519)
 
 	var (
-		req      []byte
-		respRaw  []byte
-		resp     *Message
-		dh       *DHKeyPair
-		ni       []byte
+		req     []byte
+		respRaw []byte
+		resp    *Message
+		dh      *DHKeyPair
+		ni      []byte
 	)
 
 	// The responder may reject our preferred DH group with
@@ -412,10 +452,12 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	if err != nil {
 		return err
 	}
-	s.Child = ChildSA{
+	if err := s.replaceChild(ChildSA{
 		EncrID: encr.ID, EncrKeyBits: kb,
 		LocalSPI: mySPI, RemoteSPI: remoteSPI,
 		InboundKey: respKey, OutboundKey: initKey,
+	}); err != nil {
+		return err
 	}
 	return nil
 }

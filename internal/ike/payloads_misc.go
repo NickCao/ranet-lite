@@ -24,7 +24,7 @@ func DecodeKE(body []byte) (group uint16, pub []byte, err error) {
 
 // --- Nonce payload, RFC 7296 §3.9 ---
 
-func EncodeNonce(n []byte) []byte { return n }
+func EncodeNonce(n []byte) []byte    { return n }
 func DecodeNonce(body []byte) []byte { return body }
 
 // --- Notify payload, RFC 7296 §3.10 ---
@@ -84,6 +84,21 @@ func EncodeDelete(d Delete) []byte {
 	return b
 }
 
+func DecodeDelete(body []byte) (Delete, error) {
+	if len(body) < 4 {
+		return Delete{}, fmt.Errorf("ike: short delete payload")
+	}
+	spiSize, count := int(body[1]), int(binary.BigEndian.Uint16(body[2:4]))
+	if len(body) != 4+spiSize*count {
+		return Delete{}, fmt.Errorf("ike: invalid delete payload length")
+	}
+	d := Delete{Protocol: ProtocolID(body[0])}
+	for rest := body[4:]; len(rest) > 0; rest = rest[spiSize:] {
+		d.SPIs = append(d.SPIs, append([]byte(nil), rest[:spiSize]...))
+	}
+	return d, nil
+}
+
 // --- Identification payload, RFC 7296 §3.5 ---
 
 func EncodeID(idType uint8, data []byte) []byte {
@@ -108,8 +123,8 @@ const (
 )
 
 type TrafficSelector struct {
-	Type     uint8
-	Protocol uint8 // 0 = any
+	Type      uint8
+	Protocol  uint8 // 0 = any
 	StartPort uint16
 	EndPort   uint16
 	StartAddr net.IP

@@ -1,7 +1,8 @@
 // Package esp implements userspace ESP (RFC 4303) tunnel-mode AEAD
 // encapsulation/decapsulation for exactly the Child SA negotiated by
-// package ike: AES-GCM or ChaCha20-Poly1305, no ESN, one SA per direction,
-// no rekey. Packets are carried UDP-encapsulated (RFC 3948) since ranet's
+// package ike: AES-GCM or ChaCha20-Poly1305, no ESN, one SA per direction.
+// Peer-initiated Child SA rekeys replace these instances in the production
+// data plane. Packets are carried UDP-encapsulated (RFC 3948) since ranet's
 // strongSwan deployments force that unconditionally; see
 // internal/transport.Mux for the shared socket.
 package esp
@@ -129,8 +130,8 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 func (o *OutboundSA) nextSeq() (uint64, error) {
 	seq := o.seq.Add(1)
 	if seq > 0xffffffff {
-		// No ESN, no rekey in this minimal client: once the 32-bit sequence
-		// space is exhausted the SA is unusable and must be re-established.
+		// No ESN: once the 32-bit sequence space is exhausted this SA is
+		// unusable and the session must be re-established or rekeyed.
 		return 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
 	}
 	return seq, nil
