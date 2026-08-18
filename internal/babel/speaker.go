@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
@@ -222,9 +222,9 @@ func (s *Speaker) Run(ctx context.Context) error {
 func (s *Speaker) send(n *neighborState, tlvs []RawTLV) {
 	pkt := buildPacket(s.cfg.LinkLocalAddr, multicastGroup, EncodePacket(tlvs))
 	if err := n.peer.SendRaw(pkt, esp.NextHeaderIPv6); err != nil {
-		log.Printf("babel: send to %s: %v", n.peer.ID, err)
+		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
 	} else {
-		log.Printf("babel: sent %d TLV(s), %d bytes to %s", len(tlvs), len(pkt), n.peer.ID)
+		slog.Debug("babel sent packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
 	}
 }
 
@@ -312,10 +312,10 @@ func (s *Speaker) installRoute(key routeKey, sel *routeInfo) {
 	}
 	if sel != nil && sel.reachable() {
 		s.mesh.Routes.Set(key.source, key.dest, sel.neighbor.peer)
-		log.Printf("babel: route %s via %s (metric %d)", desc, sel.neighbor.peer.ID, sel.cost)
+		slog.Info("babel route installed", "route", desc, "peer", sel.neighbor.peer.ID, "metric", sel.cost)
 	} else {
 		s.mesh.Routes.Remove(key.source, key.dest)
-		log.Printf("babel: route %s retracted", desc)
+		slog.Info("babel route retracted", "route", desc)
 	}
 }
 
@@ -375,7 +375,7 @@ func aeFor(p netip.Prefix) uint8 {
 func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 	tlvs, err := DecodePacket(raw)
 	if err != nil {
-		log.Printf("babel: bad packet: %v", err)
+		slog.Warn("babel bad packet", "err", err)
 		return
 	}
 	prefixDec := &PrefixDecoder{}
@@ -393,7 +393,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			recvTS := nowMicros()
 			n.mu.Lock()
 			if !n.alive {
-				log.Printf("babel: neighbor %s up", n.peer.ID)
+				slog.Info("babel neighbor up", "peer", n.peer.ID)
 			}
 			n.alive = true
 			n.lastHelloTime = time.Now()
@@ -436,7 +436,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 		case TLVUpdate:
 			u, err := prefixDec.Decode(t.Body)
 			if err != nil {
-				log.Printf("babel: bad Update: %v", err)
+				slog.Warn("babel bad update", "err", err)
 				continue
 			}
 			if u.Ignore {
@@ -486,7 +486,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 }
 
 func (s *Speaker) neighborDown(n *neighborState) {
-	log.Printf("babel: neighbor %s down", n.peer.ID)
+	slog.Info("babel neighbor down", "peer", n.peer.ID)
 	n.mu.Lock()
 	n.alive = false
 	n.haveReportedCost = false

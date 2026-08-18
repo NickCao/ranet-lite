@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	_ "net/http/pprof" // registered on DefaultServeMux only if -pprof is set, see below
 	"net/netip"
@@ -56,7 +57,13 @@ func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
 	pprofAddr := flag.String("pprof", "", "if set, serve net/http/pprof on this address (e.g. 127.0.0.1:6060) for profiling — CPU: /debug/pprof/profile, flamegraph: go tool pprof -http=:8081 'http://<addr>/debug/pprof/profile?seconds=30'")
 	contentionProfiles := flag.Bool("contention-profiles", false, "record every mutex and blocking event while pprof is enabled (high overhead)")
+	logLevel := flag.String("log-level", "info", "minimum log level: debug, info, warn, or error")
 	flag.Parse()
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+		log.Fatalf("invalid -log-level %q: %v", *logLevel, err)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
 	if *pprofAddr != "" {
 		if *contentionProfiles {
