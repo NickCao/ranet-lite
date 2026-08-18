@@ -207,19 +207,38 @@ func (m *Mesh) encryptionWorker() {
 func (m *Mesh) emitter() {
 	for c := range m.order {
 		c.Wait()
-		for _, e := range c.elems {
-			if e.ok {
-				_ = e.peer.transmitFn(e.sealed)
+		for i := 0; i < len(c.elems); {
+			e := c.elems[i]
+			if !e.ok {
+				m.releaseOutboundElement(e)
+				i++
+				continue
 			}
-			if cap(e.raw) == outboundPacketBufferSize {
-				outboundPacketPool.Put(e.raw[:outboundPacketBufferSize])
+
+			peer := e.peer
+			start := i
+			sealed := make([][]byte, 0, len(c.elems)-i)
+			for i < len(c.elems) && c.elems[i].ok && c.elems[i].peer == peer {
+				e = c.elems[i]
+				sealed = append(sealed, e.sealed)
+				i++
 			}
-			*e = outboundElement{}
-			outboundElementPool.Put(e)
+			_ = peer.transmitBatchFn(sealed)
+			for _, e := range c.elems[start:i] {
+				m.releaseOutboundElement(e)
+			}
 		}
 		c.elems = c.elems[:0]
 		outboundContainerPool.Put(c)
 	}
+}
+
+func (m *Mesh) releaseOutboundElement(e *outboundElement) {
+	if cap(e.raw) == outboundPacketBufferSize {
+		outboundPacketPool.Put(e.raw[:outboundPacketBufferSize])
+	}
+	*e = outboundElement{}
+	outboundElementPool.Put(e)
 }
 
 // addrsOf extracts both the source and destination address from a raw IP

@@ -9,13 +9,17 @@ import (
 func TestEncryptionWorkersParallelizeOneContainerAndEmitInOrder(t *testing.T) {
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
-	transmitted := make(chan []byte, 2)
-	peer := NewPeer("peer", func(raw []byte, _ byte) ([]byte, error) {
+	transmitted := make(chan [][]byte, 1)
+	peer := NewPeerBatched("peer", func(raw []byte, _ byte) ([]byte, error) {
 		started <- struct{}{}
 		<-release
 		return raw, nil
-	}, func(sealed []byte) error {
-		transmitted <- append([]byte(nil), sealed...)
+	}, func(sealed [][]byte) error {
+		batch := make([][]byte, len(sealed))
+		for i := range sealed {
+			batch[i] = append([]byte(nil), sealed[i]...)
+		}
+		transmitted <- batch
 		return nil
 	})
 
@@ -53,16 +57,13 @@ func TestEncryptionWorkersParallelizeOneContainerAndEmitInOrder(t *testing.T) {
 	close(release)
 
 	var got [][]byte
-	for i := 0; i < 2; i++ {
-		select {
-		case pkt := <-transmitted:
-			got = append(got, pkt)
-		case <-time.After(time.Second):
-			t.Fatal("timed out waiting for ordered transmission")
-		}
+	select {
+	case got = <-transmitted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ordered transmission")
 	}
 	<-emitterDone
-	if !bytes.Equal(got[0], []byte{1}) || !bytes.Equal(got[1], []byte{2}) {
+	if len(got) != 2 || !bytes.Equal(got[0], []byte{1}) || !bytes.Equal(got[1], []byte{2}) {
 		t.Fatalf("transmission order = %v, want [[1] [2]]", got)
 	}
 }

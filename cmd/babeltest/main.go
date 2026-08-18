@@ -93,7 +93,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	peer := netstack.NewPeer("bird", out.Seal, sess.Mux().SendESP)
+	peer := netstack.NewPeerBatched("bird", out.Seal, sess.Mux().SendESPBatch)
 
 	speaker, err := babel.New(babel.Config{HelloInterval: 4 * time.Second}, mesh)
 	if err != nil {

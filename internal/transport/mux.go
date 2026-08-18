@@ -36,8 +36,9 @@ const readBufferSize = 65536
 // parallel inbound worker pool) -- too small and a burst overflows it,
 // which is real, permanent packet loss, not just added latency.
 const (
-	espSendBatch = 128
-	espChanSize  = 4096
+	espSendBatch    = 128
+	espChanSize     = 4096
+	espOutBatchSize = 64
 )
 
 // Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
@@ -61,7 +62,7 @@ type Mux struct {
 
 	ikeCh  chan []byte
 	espCh  chan []byte
-	espOut chan []byte // queued outbound ESP packets awaiting a batched Send
+	espOut chan [][]byte // queued outbound ESP batches; ownership transfers to sendESPLoop
 
 	// done is closed exactly once, on a fatal read error or Close() —
 	// closing (unlike sending on a channel) wakes every blocked receiver,
@@ -195,7 +196,7 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 		port:     actualPort,
 		ikeCh:    make(chan []byte, 16),
 		espCh:    make(chan []byte, espChanSize),
-		espOut:   make(chan []byte, espChanSize),
+		espOut:   make(chan [][]byte, espOutBatchSize),
 		done:     make(chan struct{}),
 	}
 	for _, fn := range fns {
@@ -225,8 +226,17 @@ func (m *Mux) SendIKE(b []byte) error {
 // netstack.Mesh's per-flow outbound workers all sending through the same
 // peer): it's just a channel send.
 func (m *Mux) SendESP(b []byte) error {
+	return m.SendESPBatch([][]byte{b})
+}
+
+// SendESPBatch transfers ownership of a packet batch to the send loop. The
+// caller must not mutate the slice or its packets after this method returns.
+func (m *Mux) SendESPBatch(bufs [][]byte) error {
+	if len(bufs) == 0 {
+		return nil
+	}
 	select {
-	case m.espOut <- b:
+	case m.espOut <- bufs:
 		return nil
 	case <-m.done:
 		return m.doneError()
@@ -241,21 +251,31 @@ func (m *Mux) SendESP(b []byte) error {
 func (m *Mux) sendESPLoop() {
 	bufs := make([][]byte, 0, espSendBatch)
 	var packed []byte
+	var pending [][]byte
 	for {
-		select {
-		case <-m.done:
-			return
-		case b := <-m.espOut:
-			bufs = append(bufs, b)
-		}
 	drain:
 		for len(bufs) < espSendBatch {
-			select {
-			case b := <-m.espOut:
-				bufs = append(bufs, b)
-			default:
-				break drain
+			if len(pending) == 0 {
+				if len(bufs) == 0 {
+					select {
+					case <-m.done:
+						return
+					case pending = <-m.espOut:
+					}
+				} else {
+					select {
+					case pending = <-m.espOut:
+					default:
+						break drain
+					}
+					if len(pending) == 0 {
+						break drain
+					}
+				}
 			}
+			n := min(espSendBatch-len(bufs), len(pending))
+			bufs = append(bufs, pending[:n]...)
+			pending = pending[n:]
 		}
 		if len(bufs) > 1 {
 			packed = packForGSO(packed, bufs)

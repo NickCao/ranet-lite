@@ -30,15 +30,15 @@ func testSendESPBatch(t *testing.T, network, addr string) {
 	}
 	defer m.Close()
 
-	// Sent back-to-back with no synchronization, so sendESPLoop's
-	// non-blocking drain has a real chance to coalesce more than one of
-	// these into a single WriteBatch call — this is the actual code path
-	// under test, not just "does a single SendESP still work".
+	// A batch larger than Bind's limit exercises sendESPLoop's splitting and
+	// pending-batch handling as well as the ordinary batched send path.
 	const n = 200
+	batch := make([][]byte, n)
 	for i := 0; i < n; i++ {
-		if err := m.SendESP([]byte{byte(i), byte(i >> 8)}); err != nil {
-			t.Fatalf("SendESP %d: %v", i, err)
-		}
+		batch[i] = []byte{byte(i), byte(i >> 8)}
+	}
+	if err := m.SendESPBatch(batch); err != nil {
+		t.Fatalf("SendESPBatch: %v", err)
 	}
 
 	got := map[int]bool{}

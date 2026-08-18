@@ -8,8 +8,8 @@ import (
 )
 
 // Peer is one mesh neighbor: encryptFn encrypts a raw tunnel-mode IP packet
-// (nextHeader is esp.NextHeaderIPv4/IPv6) for this peer, and transmitFn
-// hands the sealed result off to the wire. They're kept separate, rather
+// (nextHeader is esp.NextHeaderIPv4/IPv6), and the transmit functions hand
+// sealed results to the wire. They're kept separate, rather
 // than one combined send step, so Mesh.outboundLoop can run the expensive
 // part -- encryption -- across as many parallel workers as there are
 // cores for any peer's traffic, while still calling transmitFn for one
@@ -20,13 +20,34 @@ import (
 // also makes the stack wiring testable without a real TUN device or
 // ESP/UDP (see mesh_test.go).
 type Peer struct {
-	ID         string
-	encryptFn  func(raw []byte, nextHeader byte) ([]byte, error)
-	transmitFn func(sealed []byte) error
+	ID              string
+	encryptFn       func(raw []byte, nextHeader byte) ([]byte, error)
+	transmitFn      func(sealed []byte) error
+	transmitBatchFn func(sealed [][]byte) error
 }
 
 func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
-	return &Peer{ID: id, encryptFn: encryptFn, transmitFn: transmitFn}
+	return &Peer{
+		ID: id, encryptFn: encryptFn, transmitFn: transmitFn,
+		transmitBatchFn: func(sealed [][]byte) error {
+			for _, packet := range sealed {
+				if err := transmitFn(packet); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// NewPeerBatched preserves completed TUN batches through the transport handoff.
+func NewPeerBatched(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
+	return &Peer{
+		ID: id, encryptFn: encryptFn, transmitBatchFn: transmitBatchFn,
+		transmitFn: func(sealed []byte) error {
+			return transmitBatchFn([][]byte{sealed})
+		},
+	}
 }
 
 // SendRaw transmits a hand-built tunnel-mode IP packet directly through
