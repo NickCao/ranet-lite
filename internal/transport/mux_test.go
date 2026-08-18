@@ -157,10 +157,6 @@ func TestRecvESPBatchIPv6(t *testing.T) {
 // sender used a batched or unbatched write — it's a plain UDP receiver on
 // this end either way, unaffected by how the peer chose to send.
 func TestRecvESPAndIKEDemux(t *testing.T) {
-	// Dual-stack, matching how Mux itself always binds (Dial resolves ""
-	// against network "udp") — a udp4-only socket can't address a peer
-	// whose LocalAddr() comes back in IPv6-wildcard form ("[::]:port"),
-	// even though the underlying socket is perfectly reachable over IPv4.
 	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatal(err)
@@ -168,16 +164,17 @@ func TestRecvESPAndIKEDemux(t *testing.T) {
 	defer server.Close()
 	serverAddr := server.LocalAddr().(*net.UDPAddr)
 
-	// Bind to a real loopback address, not "" (wildcard "any interface"):
-	// LocalAddr() on a wildcard-bound socket reports the unspecified
-	// address itself ("::"), which isn't a valid destination to write to.
-	m, err := Dial("127.0.0.1:0", serverAddr.IP, serverAddr.Port)
+	// Dial always binds all interfaces regardless of what's passed here
+	// (see Dial's doc comment) -- LocalAddr()'s IP is unspecified, only its
+	// port is meaningful, so the destination below is built from the
+	// known loopback address plus that port, not from LocalAddr() directly.
+	m, err := Dial(":0", serverAddr.IP, serverAddr.Port)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
-	clientAddr := m.LocalAddr().(*net.UDPAddr)
+	clientAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: m.LocalAddr().(*net.UDPAddr).Port}
 	espPkt := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0, 0, 0, 1, 'e', 's', 'p'}
 	if _, err := server.WriteToUDP(espPkt, clientAddr); err != nil {
 		t.Fatal(err)

@@ -13,70 +13,56 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/unix"
+	"golang.zx2c4.com/wireguard/conn"
 )
 
 const nonESPMarkerLen = 4
 
-// espSendBatch bounds how many queued ESP packets sendESPLoop coalesces
-// into one sendmmsg(2) call, and readBatchSize how many inbound datagrams
-// readLoop reads with one recvmmsg(2) call. A CPU profile under load
-// showed roughly half of all time spent in the write syscall alone — one
-// syscall per packet — with AEAD encryption barely registering; the read
-// side has the identical problem in the opposite direction: one
-// ReadFromUDP syscall per incoming datagram is slow enough, under a fast
-// enough real sender, to risk overflowing the kernel's UDP receive
-// buffer — real, silent packet loss that happens before our replay
-// window or anything else in this codebase ever sees the packet.
+// readBufferSize is the per-slot buffer size handed to conn.Bind's receive
+// funcs. UDP GRO coalesces several inbound datagrams into one underlying
+// read internally, but the Bind splits that back into one full datagram per
+// slot before we ever see it -- this only needs to hold one datagram.
+const readBufferSize = 65536
+
+// espSendBatch bounds how many queued ESP packets sendESPLoop batches into
+// one Bind.Send call, and espChanSize is deliberately generous: it's the
+// buffer absorbing any gap between how fast the receive loop can receive
+// and how fast the consumer can decrypt+deliver (see cmd/ranet-lite's
+// parallel inbound worker pool) -- too small and a burst overflows it,
+// which is real, permanent packet loss, not just added latency.
 const (
-	espSendBatch   = 128
-	readBatchSize  = 128
-	readBufferSize = 65536
-	// espChanSize is deliberately generous: it's the buffer absorbing any
-	// gap between how fast readLoop can now receive (batched, fast) and
-	// how fast the consumer can decrypt+deliver (see cmd/ranet-lite's
-	// parallel inbound worker pool) — too small and a burst overflows it,
-	// which is real, permanent packet loss, not just added latency.
-	espChanSize = 4096
-	// socketBufSize is set directly on the UDP socket's kernel receive
-	// buffer. The default (net.core.rmem_default, often ~208KB on Linux)
-	// is nowhere near enough to absorb a burst at multi-Gbps: once it
-	// fills, the kernel drops the overflow before recvmmsg ever sees it
-	// -- confirmed live via a huge UdpRcvbufErrors count on a real
-	// high-throughput test, real loss that no amount of batching on our
-	// side of the read syscall can fix, since it happens before that
-	// syscall returns.
-	socketBufSize = 8 * 1024 * 1024
+	espSendBatch = 128
+	espChanSize  = 4096
 )
 
-// batchConn abstracts ipv4.PacketConn and ipv6.PacketConn's
-// WriteBatch/ReadBatch: both Message types are aliases for the same
-// underlying golang.org/x/net/internal/socket.Message, so either
-// concrete type satisfies this identically.
-type batchConn interface {
-	WriteBatch(ms []ipv4.Message, flags int) (int, error)
-	ReadBatch(ms []ipv4.Message, flags int) (int, error)
-}
-
 // Mux is a UDP socket to exactly one peer, demultiplexing inbound packets
-// into IKE and ESP streams and handling the initial-port -> NAT-T-port
-// float ranet's strongSwan deployments always trigger (they set
-// `encap = yes` unconditionally, RFC 7296 §2.23 note in ranet's vici config).
+// into IKE and ESP streams. It's built on wireguard-go's conn.Bind (the
+// same package used for the mesh's tun device) rather than a hand-rolled
+// socket: StdNetBind already does everything a hand-rolled implementation
+// would have to reinvent for this workload -- batched sendmmsg/recvmmsg,
+// forcing the kernel receive buffer past its default via SO_RCVBUFFORCE
+// (the exact fix for a real, confirmed packet-loss bug this package used
+// to carry by hand), and, the actual reason to prefer it, real UDP GSO/GRO:
+// letting the kernel carry many ESP datagrams through its networking stack
+// as one segmented unit instead of iterating the stack once per datagram
+// even inside a batched syscall. See
+// https://tailscale.com/blog/more-throughput for why that distinction
+// matters -- sendmmsg/recvmmsg batching alone tops out well short of what
+// UDP GSO/GRO reaches on the same hardware.
 type Mux struct {
-	conn       *net.UDPConn
-	remoteIP   net.IP
-	remotePort int
-	batch      batchConn
+	bind     conn.Bind
+	endpoint conn.Endpoint
+	port     uint16
 
 	ikeCh  chan []byte
 	espCh  chan []byte
-	espOut chan []byte // queued outbound ESP packets awaiting a batched write
+	espOut chan []byte // queued outbound ESP packets awaiting a batched Send
+
 	// done is closed exactly once, on a fatal read error or Close() —
 	// closing (unlike sending on a channel) wakes every blocked receiver,
 	// not just one. RecvIKE and RecvESP run concurrently in normal use
@@ -162,26 +148,6 @@ func (g *seqGapTracker) observe(spi, seq uint32) {
 	}
 }
 
-// setSocketBufSize raises the UDP socket's kernel receive buffer to
-// socketBufSize. It uses SO_RCVBUFFORCE rather than Go's SetReadBuffer
-// (plain SO_RCVBUF) because the latter is silently clamped to
-// net.core.rmem_max for unprivileged sockets -- often far below
-// socketBufSize -- while SO_RCVBUFFORCE bypasses that cap. This requires
-// CAP_NET_ADMIN, which this binary already has for TUN device creation.
-func setSocketBufSize(conn *net.UDPConn) error {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var sockErr error
-	if err := raw.Control(func(fd uintptr) {
-		sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, socketBufSize)
-	}); err != nil {
-		return err
-	}
-	return sockErr
-}
-
 // closeDone wakes every blocked Recv* call exactly once, regardless of
 // whether it's triggered by a real read error or an explicit Close().
 func (m *Mux) closeDone(err error) {
@@ -191,49 +157,57 @@ func (m *Mux) closeDone(err error) {
 	})
 }
 
-// Dial opens the shared socket. localAddr may be "" to let the OS pick an
-// ephemeral port on all interfaces. remoteAddr:remotePort is the peer's
-// configured IKE endpoint — ranet's registry port, commonly non-standard
-// (e.g. 13000) — and is the only port ever used; there is no separate
-// NAT-T port and no floating.
+// Dial opens the shared socket. localAddr may be "" (or ":0") to let the OS
+// pick an ephemeral port on all interfaces. Only the port portion of
+// localAddr is honored -- conn.Bind (see Mux's doc comment for why this
+// package uses it) always binds every interface, so a specific local IP
+// can't be requested; ranet-lite's production path never asks for one
+// (PeerConfig.LocalAddr is always left unset), only a couple of standalone
+// debug commands under cmd/ do, and they still work, just without pinning
+// to a specific interface. remoteAddr:remotePort is the peer's configured
+// IKE endpoint — ranet's registry port, commonly non-standard (e.g. 13000)
+// — and is the only port ever used; there is no separate NAT-T port and no
+// floating.
 func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: resolve local addr: %w", err)
 	}
-	conn, err := net.ListenUDP("udp", laddr)
+	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
+		log.Printf("transport: binding to a specific local address (%s) isn't supported by this package's underlying conn.Bind; binding all interfaces on port %d instead", laddr.IP, laddr.Port)
+	}
+
+	bind := conn.NewStdNetBind()
+	fns, actualPort, err := bind.Open(uint16(laddr.Port))
 	if err != nil {
-		return nil, fmt.Errorf("transport: listen: %w", err)
+		return nil, fmt.Errorf("transport: open bind: %w", err)
 	}
-	if err := setSocketBufSize(conn); err != nil {
-		log.Printf("transport: raise socket buffer size: %v (leaving kernel default, which risks silent drops under load)", err)
+
+	endpoint, err := bind.ParseEndpoint(net.JoinHostPort(remoteIP.String(), strconv.Itoa(remotePort)))
+	if err != nil {
+		bind.Close()
+		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	var batch batchConn
-	if remoteIP.To4() != nil {
-		batch = ipv4.NewPacketConn(conn)
-	} else {
-		batch = ipv6.NewPacketConn(conn)
-	}
+
 	m := &Mux{
-		conn:       conn,
-		remoteIP:   remoteIP,
-		remotePort: remotePort,
-		batch:      batch,
-		ikeCh:      make(chan []byte, 16),
-		espCh:      make(chan []byte, espChanSize),
-		espOut:     make(chan []byte, espChanSize),
-		done:       make(chan struct{}),
+		bind:     bind,
+		endpoint: endpoint,
+		port:     actualPort,
+		ikeCh:    make(chan []byte, 16),
+		espCh:    make(chan []byte, espChanSize),
+		espOut:   make(chan []byte, espChanSize),
+		done:     make(chan struct{}),
 	}
-	go m.readLoop()
+	for _, fn := range fns {
+		go m.receiveLoop(fn)
+	}
 	go m.sendESPLoop()
 	return m, nil
 }
 
-func (m *Mux) LocalAddr() net.Addr { return m.conn.LocalAddr() }
-
-func (m *Mux) remoteAddr() *net.UDPAddr {
-	return &net.UDPAddr{IP: m.remoteIP, Port: m.remotePort}
-}
+// LocalAddr's IP is always unspecified -- see Dial's doc comment; only the
+// port is meaningful.
+func (m *Mux) LocalAddr() net.Addr { return &net.UDPAddr{Port: int(m.port)} }
 
 // SendIKE writes one IKE message, always prefixed with the non-ESP marker
 // — ranet forces UDP encapsulation unconditionally, so even the very first
@@ -242,13 +216,12 @@ func (m *Mux) remoteAddr() *net.UDPAddr {
 func (m *Mux) SendIKE(b []byte) error {
 	out := make([]byte, nonESPMarkerLen+len(b))
 	copy(out[nonESPMarkerLen:], b)
-	_, err := m.conn.WriteToUDP(out, m.remoteAddr())
-	return err
+	return m.bind.Send([][]byte{out}, m.endpoint)
 }
 
 // SendESP queues one raw ESP packet, always UDP-encapsulated (bare, no
 // marker — its nonzero SPI disambiguates it from the marker on receive),
-// for a batched write by sendESPLoop. Safe for concurrent callers (e.g.
+// for a batched Send by sendESPLoop. Safe for concurrent callers (e.g.
 // netstack.Mesh's per-flow outbound workers all sending through the same
 // peer): it's just a channel send.
 func (m *Mux) SendESP(b []byte) error {
@@ -260,34 +233,33 @@ func (m *Mux) SendESP(b []byte) error {
 	}
 }
 
-// sendESPLoop batches whatever's currently queued into as few sendmmsg(2)
-// calls (via WriteBatch) as possible — the same non-blocking-drain
-// pattern as netstack.Mesh's inboundLoop: a lone packet with nothing
-// queued behind it still goes out immediately, batching only kicks in
-// under real load.
+// sendESPLoop batches whatever's currently queued into as few Bind.Send
+// calls as possible (each of which UDP-GSO-coalesces its buffers into as
+// few underlying datagrams as the kernel supports) — a non-blocking-drain
+// pattern: a lone packet with nothing queued behind it still goes out
+// immediately, batching only kicks in under real load.
 func (m *Mux) sendESPLoop() {
-	addr := m.remoteAddr()
-	msgs := make([]ipv4.Message, 0, espSendBatch)
+	bufs := make([][]byte, 0, espSendBatch)
 	for {
 		select {
 		case <-m.done:
 			return
 		case b := <-m.espOut:
-			msgs = append(msgs, ipv4.Message{Buffers: [][]byte{b}, Addr: addr})
+			bufs = append(bufs, b)
 		}
 	drain:
-		for len(msgs) < espSendBatch {
+		for len(bufs) < espSendBatch {
 			select {
 			case b := <-m.espOut:
-				msgs = append(msgs, ipv4.Message{Buffers: [][]byte{b}, Addr: addr})
+				bufs = append(bufs, b)
 			default:
 				break drain
 			}
 		}
-		if n, err := m.batch.WriteBatch(msgs, 0); err != nil {
-			log.Printf("transport: batch send: %d/%d packets sent: %v", n, len(msgs), err)
+		if err := m.bind.Send(bufs, m.endpoint); err != nil {
+			log.Printf("transport: batch send of %d packets: %v", len(bufs), err)
 		}
-		msgs = msgs[:0]
+		bufs = bufs[:0]
 	}
 }
 
@@ -352,15 +324,21 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 	}
 }
 
-func (m *Mux) readLoop() {
-	bufs := make([][]byte, readBatchSize)
-	msgs := make([]ipv4.Message, readBatchSize)
+// receiveLoop runs one of Bind.Open's ReceiveFuncs (IPv4 and IPv6 each get
+// their own) until it errors, demuxing every datagram it hands back into
+// the IKE or ESP channel. UDP GRO coalescing/splitting is handled entirely
+// inside the Bind -- fn always hands back one full datagram per slot, so
+// this sees exactly what a plain recvmmsg loop would.
+func (m *Mux) receiveLoop(fn conn.ReceiveFunc) {
+	batch := m.bind.BatchSize()
+	bufs := make([][]byte, batch)
+	sizes := make([]int, batch)
+	eps := make([]conn.Endpoint, batch)
 	for i := range bufs {
 		bufs[i] = make([]byte, readBufferSize)
-		msgs[i].Buffers = [][]byte{bufs[i]}
 	}
 	for {
-		n, err := m.batch.ReadBatch(msgs, 0)
+		n, err := fn(bufs, sizes, eps)
 		if err != nil {
 			if m.closed.Load() {
 				m.closeDone(fmt.Errorf("transport: closed"))
@@ -370,8 +348,11 @@ func (m *Mux) readLoop() {
 			return
 		}
 		for i := 0; i < n; i++ {
-			raw := bufs[i][:msgs[i].N]
-			pkt := append([]byte{}, raw...) // bufs[i] is reused by the next ReadBatch call
+			if sizes[i] == 0 {
+				continue
+			}
+			raw := bufs[i][:sizes[i]]
+			pkt := append([]byte{}, raw...) // bufs[i] is reused by the next call
 			if len(pkt) >= nonESPMarkerLen && isZero(pkt[:nonESPMarkerLen]) {
 				select {
 				case m.ikeCh <- pkt[nonESPMarkerLen:]:
@@ -403,5 +384,5 @@ func isZero(b []byte) bool {
 
 func (m *Mux) Close() error {
 	m.closed.Store(true)
-	return m.conn.Close()
+	return m.bind.Close()
 }
