@@ -10,7 +10,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
-	"sync"
+	"sync/atomic"
 
 	"github.com/NickCao/ranet-lite/internal/ike"
 )
@@ -23,21 +23,19 @@ const (
 )
 
 // OutboundSA encrypts packets for the direction this client originates.
-// Seal is called concurrently by design — babel's Hello/IHU timer and its
-// Update timer run as independent goroutines, and both send through the
-// same peer's OutboundSA — so seq/IV assignment and the actual socket
-// write must be serialized under mu, or two packets can race onto the
-// wire out of sequence-number order (observed in practice) or, worse,
-// collide on the same seq/IV, which for AES-GCM breaks confidentiality
-// and authentication outright.
+// Seal is called concurrently by design — every peer's babel timers and
+// the mesh's outbound dispatch (see netstack.Mesh.outboundLoop) all seal
+// packets through the same OutboundSA from separate goroutines — so
+// sequence/IV assignment must be atomic, or two packets can collide on
+// the same seq/IV, which for AES-GCM breaks confidentiality and
+// authentication outright.
 type OutboundSA struct {
 	aead   cipher.AEAD
 	params ike.ESPAEADParams
 	salt   []byte
 	spi    uint32
 
-	mu  sync.Mutex
-	seq uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
+	seq atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 }
 
 // InboundSA decrypts packets sent to this client's SPI.
@@ -113,15 +111,13 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 // nextSeq atomically allocates the next sequence number, the only state
 // Seal needs to serialize.
 func (o *OutboundSA) nextSeq() (uint64, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.seq++
-	if o.seq > 0xffffffff {
+	seq := o.seq.Add(1)
+	if seq > 0xffffffff {
 		// No ESN, no rekey in this minimal client: once the 32-bit sequence
 		// space is exhausted the SA is unusable and must be re-established.
 		return 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
 	}
-	return o.seq, nil
+	return seq, nil
 }
 
 // Open validates and decrypts one ESP packet addressed to this SA's SPI,

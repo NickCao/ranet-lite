@@ -229,7 +229,6 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		if speaker.Receive(peer, plain) {
 			log.Printf("peer %s: received babel packet (%d bytes)", name, len(plain))
 		} else {
-			log.Printf("peer %s: received %d bytes, next header %d, delivering to mesh", name, len(plain), nh)
 			mesh.DeliverInbound(plain, nh)
 		}
 	}
