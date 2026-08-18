@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/NickCao/ranet-lite/internal/esp"
 	"golang.zx2c4.com/wireguard/tun"
@@ -158,10 +159,25 @@ func (m *Mesh) outboundLoop() {
 		close(m.encryption)
 	}()
 
+	// Temporary diagnostic: is Device.Read actually returning ~batch
+	// packets per call, or far fewer despite BatchSize() reporting 128?
+	// Logged periodically (not per call) to avoid flooding.
+	var (
+		reads, packets int64
+		lastLog        = time.Now()
+	)
+
 	for {
 		n, err := m.dev.Read(bufs, sizes, 0)
 		if err != nil {
 			return // device closed
+		}
+		reads++
+		packets += int64(n)
+		if now := time.Now(); now.Sub(lastLog) > 2*time.Second {
+			log.Printf("netstack: outboundLoop Read() batch stats: %d reads, %d packets, avg %.1f packets/call (BatchSize()=%d)", reads, packets, float64(packets)/float64(reads), batch)
+			reads, packets = 0, 0
+			lastLog = now
 		}
 		c := &outboundElementsContainer{elems: make([]*outboundElement, 0, n)}
 		for i := 0; i < n; i++ {
