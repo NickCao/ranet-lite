@@ -66,6 +66,52 @@ func TestReplayRejected(t *testing.T) {
 	}
 }
 
+// TestReplayWindowWideReordering exercises the multi-word bitmap directly
+// (bypassing real ESP/AEAD): sequences arriving thousands of positions out
+// of order, as observed in practice under highly parallel real-world
+// traffic (e.g. iperf3 -P 8 sharing one SA's sequence space across
+// multiple flows/CPU cores), must still be accepted as long as they're
+// within windowSize — and exact duplicates, even far apart across a large
+// window advance, must still be rejected.
+func TestReplayWindowWideReordering(t *testing.T) {
+	var w replayWindow
+
+	// Establish a high watermark.
+	if err := w.check(10000); err != nil {
+		t.Fatalf("first packet should be accepted: %v", err)
+	}
+	w.commit(10000)
+
+	// A packet ~3000 sequence numbers behind is well within a 64-packet
+	// window's rejection range but must be accepted by the wider window.
+	late := uint32(10000 - 3000)
+	if err := w.check(late); err != nil {
+		t.Fatalf("packet %d positions behind should be accepted with a %d window: %v", 3000, windowSize, err)
+	}
+	w.commit(late)
+
+	// The same late packet replayed again must still be rejected.
+	if err := w.check(late); err == nil {
+		t.Fatal("exact duplicate of a far-behind packet was accepted")
+	}
+
+	// A packet beyond windowSize behind must be rejected as too old.
+	tooOld := uint32(10000 - windowSize - 1)
+	if err := w.check(tooOld); err == nil {
+		t.Fatal("packet beyond the window was accepted")
+	}
+
+	// Advancing last by more than windowSize (a large jump forward, e.g.
+	// after a burst) must not retain stale bits from before the jump: a
+	// sequence that was legitimately received just before the jump must
+	// now correctly read as "too old" rather than incorrectly "already
+	// seen" or accepted twice.
+	w.commit(10000 + windowSize + 500)
+	if err := w.check(10000); err == nil {
+		t.Fatal("a sequence far behind after a large jump should be rejected as too old, not silently accepted")
+	}
+}
+
 func TestTamperedPacketRejected(t *testing.T) {
 	child := testChild(t)
 	out, _ := NewOutbound(child)
