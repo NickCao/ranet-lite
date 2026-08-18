@@ -6,7 +6,10 @@
 # below, and private_key must be that organization's shared Ed25519 key.
 organization: example
 common_name: my-laptop
-serial_number: "0"
+port: 13000
+endpoints:
+  - serial_number: "0"
+    address_family: ip4
 
 private_key: /etc/ranet-lite/key.pem      # PKCS8 PEM Ed25519 private key
 registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
@@ -17,7 +20,8 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 originate:
   - "10.66.0.5/32"
 
-# One or more existing mesh nodes to dial as IKEv2/babel peers.
+# One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
+# endpoint only dials remote endpoints with the same address family.
 peers:
   - organization: example       # optional, defaults to the top-level organization
     common_name: gateway

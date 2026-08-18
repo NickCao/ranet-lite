@@ -32,6 +32,7 @@ type PeerConfig struct {
 	LocalPort  int    // 0 => ephemeral
 	RemoteAddr net.IP
 	RemotePort int // ranet registry endpoint port (often non-standard, e.g. 13000); the only port ever used, IKE and ESP alike
+	Hub        *transport.Hub
 }
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
@@ -185,7 +186,13 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 	local = fmt.Sprintf("%s:%d", local, cfg.LocalPort)
 
-	mux, err := transport.Dial(local, cfg.RemoteAddr, cfg.RemotePort)
+	var mux *transport.Mux
+	var err error
+	if cfg.Hub != nil {
+		mux, err = cfg.Hub.NewMux(cfg.RemoteAddr, cfg.RemotePort)
+	} else {
+		mux, err = transport.Dial(local, cfg.RemoteAddr, cfg.RemotePort)
+	}
 	if err != nil {
 		return nil, err
 	}

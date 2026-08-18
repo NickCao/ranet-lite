@@ -36,6 +36,7 @@ import (
 	"github.com/NickCao/ranet-lite/internal/ike"
 	"github.com/NickCao/ranet-lite/internal/netstack"
 	"github.com/NickCao/ranet-lite/internal/registry"
+	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
 const reconnectDelay = 10 * time.Second
@@ -137,8 +138,15 @@ func main() {
 		}
 	}()
 
-	for _, p := range cfg.Peers {
-		go runPeer(ctx, priv, cfg, p, reg, mesh, speaker)
+	hub, err := transport.NewHub(fmt.Sprintf(":%d", cfg.Port))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer hub.Close()
+	for _, local := range cfg.Endpoints {
+		for _, p := range cfg.Peers {
+			go runPeer(ctx, priv, cfg, local, p, reg, mesh, speaker, hub)
+		}
 	}
 	if err := speaker.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Printf("babel: %v", err)
@@ -148,13 +156,13 @@ func main() {
 // runPeer maintains one peer connection for the client's lifetime,
 // reconnecting on any failure (network blip, peer restart, etc.) rather
 // than requiring a manual restart.
-func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker) {
-	name := fmt.Sprintf("%s/%s", p.Organization, p.CommonName)
+func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, local config.Endpoint, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, hub *transport.Hub) {
+	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := connectPeer(ctx, priv, cfg, p, reg, mesh, speaker, name); err != nil {
+		if err := connectPeer(ctx, priv, cfg, local, p, reg, mesh, speaker, name, hub); err != nil {
 			log.Printf("peer %s: %v; reconnecting in %s", name, err, reconnectDelay)
 		}
 		select {
@@ -169,17 +177,22 @@ func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, p
 // config-specified serial if given, otherwise the first one whose address
 // actually resolves (a node commonly has endpoints for address families or
 // links that aren't currently usable, e.g. address: null).
-func resolveEndpoint(node registry.Node, serial string) (registry.Endpoint, error) {
+func resolveEndpoint(node registry.Node, serial, family string) (registry.Endpoint, error) {
 	if serial != "" {
 		ep, ok := node.FindEndpoint(serial)
 		if !ok {
 			return registry.Endpoint{}, fmt.Errorf("no endpoint with serial %q", serial)
 		}
+		if ep.AddressFamily != family {
+			return registry.Endpoint{}, fmt.Errorf("endpoint %q is %s, want %s", serial, ep.AddressFamily, family)
+		}
 		return ep, nil
 	}
 	for _, ep := range node.Endpoints {
-		if _, err := ep.ResolveRemote(); err == nil {
-			return ep, nil
+		if ep.AddressFamily == family {
+			if _, err := ep.ResolveRemote(); err == nil {
+				return ep, nil
+			}
 		}
 	}
 	return registry.Endpoint{}, fmt.Errorf("no endpoint currently resolves to an address")
@@ -189,7 +202,7 @@ func resolveEndpoint(node registry.Node, serial string) (registry.Endpoint, erro
 // ESP setup, mesh/babel registration, and servicing the connection until
 // it dies (network failure, peer restart, DPD timeout). Returning means
 // the connection is gone; runPeer decides whether/when to retry.
-func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, name string) error {
+func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, local config.Endpoint, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, name string, hub *transport.Hub) error {
 	org, ok := reg.FindOrganization(p.Organization)
 	if !ok {
 		return fmt.Errorf("organization %q not found in registry", p.Organization)
@@ -198,7 +211,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	if !ok {
 		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
 	}
-	ep, err := resolveEndpoint(node, p.SerialNumber)
+	ep, err := resolveEndpoint(node, p.SerialNumber, local.AddressFamily)
 	if err != nil {
 		return err
 	}
@@ -215,13 +228,14 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	ikeCfg := ike.PeerConfig{
 		Organization:     cfg.Organization,
 		LocalCommonName:  cfg.CommonName,
-		LocalSerial:      cfg.SerialNumber,
+		LocalSerial:      local.SerialNumber,
 		LocalPrivateKey:  priv,
 		RemoteCommonName: node.CommonName,
 		RemoteSerial:     ep.SerialNumber,
 		RemotePublicKey:  remotePub,
 		RemoteAddr:       remoteIP,
 		RemotePort:       int(ep.Port),
+		Hub:              hub,
 	}
 	sess, err := ike.Initiate(ikeCfg)
 	if err != nil {

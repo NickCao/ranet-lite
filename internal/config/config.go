@@ -17,9 +17,10 @@ import (
 type Config struct {
 	// Identity: must match an entry in Registry's Nodes for Organization,
 	// and PrivateKey must be that organization's shared Ed25519 key.
-	Organization string `yaml:"organization"`
-	CommonName   string `yaml:"common_name"`
-	SerialNumber string `yaml:"serial_number"`
+	Organization string     `yaml:"organization"`
+	CommonName   string     `yaml:"common_name"`
+	Port         uint16     `yaml:"port"`
+	Endpoints    []Endpoint `yaml:"endpoints"`
 
 	PrivateKey string `yaml:"private_key"` // path to a PKCS8 PEM Ed25519 key
 	Registry   string `yaml:"registry"`    // path to a ranet registry.json
@@ -31,6 +32,14 @@ type Config struct {
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
+}
+
+// Endpoint mirrors the identity portion of ranet's endpoint configuration.
+// Socket address selection is global: StdNetBind owns one dual-stack socket
+// on Config.Port and the kernel selects the source address by route.
+type Endpoint struct {
+	SerialNumber  string `yaml:"serial_number"`
+	AddressFamily string `yaml:"address_family"`
 }
 
 type Peer struct {
@@ -77,14 +86,21 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: organization is required")
 	case c.CommonName == "":
 		return fmt.Errorf("config: common_name is required")
-	case c.SerialNumber == "":
-		return fmt.Errorf("config: serial_number is required")
+	case c.Port == 0:
+		return fmt.Errorf("config: port is required")
+	case len(c.Endpoints) == 0:
+		return fmt.Errorf("config: at least one endpoint is required")
 	case c.PrivateKey == "":
 		return fmt.Errorf("config: private_key is required")
 	case c.Registry == "":
 		return fmt.Errorf("config: registry is required")
 	case len(c.Peers) == 0:
 		return fmt.Errorf("config: at least one peer is required")
+	}
+	for _, ep := range c.Endpoints {
+		if ep.SerialNumber == "" || (ep.AddressFamily != "ip4" && ep.AddressFamily != "ip6") {
+			return fmt.Errorf("config: endpoints require serial_number and address_family (ip4 or ip6)")
+		}
 	}
 	return nil
 }

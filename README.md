@@ -95,7 +95,10 @@ ranet-lite needs two files:
 ```yaml
 organization: example
 common_name: my-laptop
-serial_number: "0"
+port: 13000
+endpoints:
+  - serial_number: "0"
+    address_family: ip4
 
 private_key: /etc/ranet-lite/key.pem      # PKCS8 PEM Ed25519 private key
 registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
@@ -119,8 +122,8 @@ babel:
   update_interval: 80s
 ```
 
-Required fields: `organization`, `common_name`, `serial_number`,
-`private_key`, `registry`, and at least one entry in `peers`. Everything
+Required fields: `organization`, `common_name`, `port`, at least one local
+`endpoints` entry, `private_key`, `registry`, and at least one entry in `peers`. Everything
 else has a default (`peers[].organization` defaults to the top-level
 `organization`, and the babel intervals default to 20s/80s).
 
