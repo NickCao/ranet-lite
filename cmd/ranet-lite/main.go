@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,6 +39,11 @@ import (
 )
 
 const reconnectDelay = 10 * time.Second
+
+// inboundWorkers bounds how many goroutines decrypt+deliver a single
+// peer's inbound ESP traffic concurrently — see connectPeer's doc
+// comment for why this needs to be parallel at all.
+var inboundWorkers = min(runtime.NumCPU(), 16)
 
 func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
@@ -234,20 +240,44 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 
 	go sess.Run() // answers the peer's DPD liveness checks
 
+	// Decrypt+deliver is fanned out across a bounded worker pool rather
+	// than done one packet at a time on this goroutine: a fast enough
+	// real sender (a regular kernel IPsec peer, not throttled by
+	// anything on our end now that reads are batched — see
+	// transport.Mux.readLoop) can otherwise decrypt slower than packets
+	// arrive, backing up and overflowing Mux's internal ESP channel —
+	// real, permanent packet loss, confirmed live via the "espCh full,
+	// dropping ESP packet" log. AES-GCM/ChaCha20-Poly1305 Open calls on
+	// one InboundSA are safe concurrently (see esp.InboundSA's doc
+	// comment); mesh.DeliverInbound and speaker.Receive are as well.
+	pkts := make(chan []byte, 256)
+	var wg sync.WaitGroup
+	for i := 0; i < inboundWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pkt := range pkts {
+				plain, nh, err := in.Open(pkt)
+				if err != nil {
+					log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
+					continue
+				}
+				if speaker.Receive(peer, plain) {
+					log.Printf("peer %s: received babel packet (%d bytes)", name, len(plain))
+				} else {
+					mesh.DeliverInbound(plain, nh)
+				}
+			}
+		}()
+	}
+
 	for {
 		pkt, err := sess.Mux().RecvESP()
 		if err != nil {
+			close(pkts)
+			wg.Wait()
 			return err
 		}
-		plain, nh, err := in.Open(pkt)
-		if err != nil {
-			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
-			continue
-		}
-		if speaker.Receive(peer, plain) {
-			log.Printf("peer %s: received babel packet (%d bytes)", name, len(plain))
-		} else {
-			mesh.DeliverInbound(plain, nh)
-		}
+		pkts <- pkt
 	}
 }

@@ -36,6 +36,12 @@ const (
 	espSendBatch   = 128
 	readBatchSize  = 128
 	readBufferSize = 65536
+	// espChanSize is deliberately generous: it's the buffer absorbing any
+	// gap between how fast readLoop can now receive (batched, fast) and
+	// how fast the consumer can decrypt+deliver (see cmd/ranet-lite's
+	// parallel inbound worker pool) — too small and a burst overflows it,
+	// which is real, permanent packet loss, not just added latency.
+	espChanSize = 4096
 )
 
 // batchConn abstracts ipv4.PacketConn and ipv6.PacketConn's
@@ -107,8 +113,8 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 		remotePort: remotePort,
 		batch:      batch,
 		ikeCh:      make(chan []byte, 16),
-		espCh:      make(chan []byte, 256),
-		espOut:     make(chan []byte, 256),
+		espCh:      make(chan []byte, espChanSize),
+		espOut:     make(chan []byte, espChanSize),
 		done:       make(chan struct{}),
 	}
 	go m.readLoop()
