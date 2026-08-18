@@ -19,6 +19,7 @@ import (
 
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
 const nonESPMarkerLen = 4
@@ -43,6 +44,15 @@ const (
 	// parallel inbound worker pool) — too small and a burst overflows it,
 	// which is real, permanent packet loss, not just added latency.
 	espChanSize = 4096
+	// socketBufSize is set directly on the UDP socket's kernel receive
+	// buffer. The default (net.core.rmem_default, often ~208KB on Linux)
+	// is nowhere near enough to absorb a burst at multi-Gbps: once it
+	// fills, the kernel drops the overflow before recvmmsg ever sees it
+	// -- confirmed live via a huge UdpRcvbufErrors count on a real
+	// high-throughput test, real loss that no amount of batching on our
+	// side of the read syscall can fix, since it happens before that
+	// syscall returns.
+	socketBufSize = 8 * 1024 * 1024
 )
 
 // batchConn abstracts ipv4.PacketConn and ipv6.PacketConn's
@@ -152,6 +162,26 @@ func (g *seqGapTracker) observe(spi, seq uint32) {
 	}
 }
 
+// setSocketBufSize raises the UDP socket's kernel receive buffer to
+// socketBufSize. It uses SO_RCVBUFFORCE rather than Go's SetReadBuffer
+// (plain SO_RCVBUF) because the latter is silently clamped to
+// net.core.rmem_max for unprivileged sockets -- often far below
+// socketBufSize -- while SO_RCVBUFFORCE bypasses that cap. This requires
+// CAP_NET_ADMIN, which this binary already has for TUN device creation.
+func setSocketBufSize(conn *net.UDPConn) error {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	if err := raw.Control(func(fd uintptr) {
+		sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, socketBufSize)
+	}); err != nil {
+		return err
+	}
+	return sockErr
+}
+
 // closeDone wakes every blocked Recv* call exactly once, regardless of
 // whether it's triggered by a real read error or an explicit Close().
 func (m *Mux) closeDone(err error) {
@@ -174,6 +204,9 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		return nil, fmt.Errorf("transport: listen: %w", err)
+	}
+	if err := setSocketBufSize(conn); err != nil {
+		log.Printf("transport: raise socket buffer size: %v (leaving kernel default, which risks silent drops under load)", err)
 	}
 	var batch batchConn
 	if remoteIP.To4() != nil {
