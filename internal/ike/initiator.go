@@ -206,7 +206,30 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		m := &Message{Header: hdr, Payloads: payloads}
 		req = m.Encode()
 
-		respRaw, err = sendRecv(mux, req, spiI, 0, false)
+		// A bare notify-only response is only worth stopping for when it's
+		// N_INVALID_KE_PAYLOAD on the first attempt -- the one legitimate
+		// signal that lets us make progress by switching Diffie-Hellman
+		// group. Anything else unauthenticated (see sendRecv's doc comment)
+		// is rejected here, which makes sendRecv keep retransmitting/
+		// waiting for the real response instead of surfacing a possibly
+		// forged error.
+		acceptAttempt := attempt
+		respRaw, err = sendRecv(mux, req, func(raw []byte) bool {
+			m, err := DecodeMessage(raw)
+			if err != nil {
+				return false
+			}
+			if m.find(PayloadSA) != nil {
+				return true
+			}
+			if n := m.find(PayloadN); n != nil && acceptAttempt == 0 {
+				nt, err := DecodeNotify(n.Body)
+				if err == nil && nt.Type == N_INVALID_KE_PAYLOAD && len(nt.Data) >= 2 {
+					return true
+				}
+			}
+			return false
+		})
 		if err != nil {
 			mux.Close()
 			return nil, err
@@ -216,16 +239,13 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 			mux.Close()
 			return nil, fmt.Errorf("ike: decode IKE_SA_INIT response: %w", err)
 		}
-		if n := resp.find(PayloadN); n != nil && resp.find(PayloadSA) == nil {
-			nt, err := DecodeNotify(n.Body)
-			if err == nil && nt.Type == N_INVALID_KE_PAYLOAD && len(nt.Data) >= 2 && attempt == 0 {
-				group = binary.BigEndian.Uint16(nt.Data[:2])
-				continue
-			}
-			if err == nil {
-				mux.Close()
-				return nil, fmt.Errorf("ike: IKE_SA_INIT rejected: notify type %d", nt.Type)
-			}
+		if resp.find(PayloadSA) == nil {
+			// Only reachable for the N_INVALID_KE_PAYLOAD case accept()
+			// just validated -- switch group and retry with a fresh request.
+			n := resp.find(PayloadN)
+			nt, _ := DecodeNotify(n.Body)
+			group = binary.BigEndian.Uint16(nt.Data[:2])
+			continue
 		}
 		break
 	}
@@ -332,17 +352,20 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		return err
 	}
 
-	respRaw, err := sendRecv(s.mux, req, s.spiI, s.spiR, true)
+	// A response with no SK payload is a bare, unauthenticated notify --
+	// RFC 7815 §2.1 says to ignore these rather than abort, since anyone
+	// able to spoof our SPI can forge one; sendRecv keeps retransmitting
+	// until a real (encrypted) response arrives or it times out.
+	respRaw, err := sendRecv(s.mux, req, func(raw []byte) bool {
+		m, err := DecodeMessage(raw)
+		return err == nil && m.find(PayloadSK) != nil
+	})
 	if err != nil {
 		return err
 	}
 	resp, err := DecodeMessage(respRaw)
 	if err != nil {
 		return fmt.Errorf("ike: decode IKE_AUTH response: %w", err)
-	}
-	if n := resp.find(PayloadN); n != nil && resp.find(PayloadSK) == nil {
-		nt, _ := DecodeNotify(n.Body)
-		return fmt.Errorf("ike: IKE_AUTH rejected: notify type %d", nt.Type)
 	}
 	respInner, err := DecryptMessage(s.suite, s.sker, respRaw, resp)
 	if err != nil {
@@ -397,11 +420,17 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	return nil
 }
 
-// sendRecv sends req and waits for a correlated response, retransmitting
-// on timeout. expectSK selects whether the reply is expected to carry an
-// SK payload (anything past IKE_SA_INIT).
-func sendRecv(mux *transport.Mux, req []byte, spiI, spiR uint64, expectSK bool) ([]byte, error) {
-	_ = expectSK
+// sendRecv sends req and waits for a correlated response, retransmitting on
+// timeout. accept is consulted for every response matching req's SPI and
+// Message ID: RFC 7815 §2.1 requires ignoring unauthenticated error
+// notifications and simply continuing to retransmit until timeout, since an
+// IKE_SA_INIT response (and the outer, pre-decryption layer of an IKE_AUTH
+// response) carries no integrity protection of its own -- anyone able to
+// spoof the initiator's SPI, visible in the plaintext request, can inject a
+// forged error notify to abort an in-progress handshake otherwise. accept
+// lets each exchange decide what counts as a real response worth stopping
+// for; a nil accept treats any correlated response as final.
+func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte, error) {
 	reqHdr, err := decodeHeader(req)
 	if err != nil {
 		return nil, err
@@ -421,7 +450,13 @@ func sendRecv(mux *transport.Mux, req []byte, spiI, spiR uint64, expectSK bool) 
 				continue
 			}
 			if h.SPIInitiator == reqHdr.SPIInitiator && h.MessageID == reqHdr.MessageID && h.IsResponse() {
-				return raw, nil
+				if accept == nil || accept(raw) {
+					return raw, nil
+				}
+				// Correlated but rejected by accept (e.g. a bare,
+				// unauthenticated error notify): keep waiting instead of
+				// treating a possibly-forged message as authoritative.
+				continue
 			}
 			// Not our response (e.g. an unrelated request); ignore and keep waiting.
 		}

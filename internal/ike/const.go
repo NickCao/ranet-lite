@@ -105,6 +105,7 @@ const (
 	N_AUTHENTICATION_FAILED        NotifyType = 24
 	N_NO_PROPOSAL_CHOSEN           NotifyType = 14
 	N_INVALID_KE_PAYLOAD           NotifyType = 17
+	N_NO_ADDITIONAL_SAS            NotifyType = 35
 	N_INITIAL_CONTACT              NotifyType = 16384
 	N_SET_WINDOW_SIZE              NotifyType = 16390
 

@@ -44,10 +44,18 @@ func (s *Session) Run() error {
 			if err := s.respondEmpty(hdr.MessageID); err != nil {
 				return err
 			}
+		case CREATE_CHILD_SA:
+			// No CREATE_CHILD_SA (rekey, additional Child SA) support in
+			// this minimal client. RFC 7815 §2.2 MUST: reject with
+			// NO_ADDITIONAL_SAS rather than an empty response, so the peer
+			// knows definitively not to retry.
+			if err := s.respondNotify(hdr.MessageID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS); err != nil {
+				return err
+			}
 		default:
-			// No CREATE_CHILD_SA (rekey) support in this minimal client;
-			// silently ack anything else so the peer doesn't retransmit
-			// forever, rather than leaving it unanswered.
+			// Nothing else is expected from a real strongSwan peer against
+			// this client; silently ack so it doesn't retransmit forever,
+			// rather than leaving it unanswered.
 			if err := s.respondEmpty(hdr.MessageID); err != nil {
 				return err
 			}
@@ -70,6 +78,20 @@ func (s *Session) respondEmpty(msgID uint32) error {
 	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, nil)
 	if err != nil {
 		return fmt.Errorf("ike: build INFORMATIONAL response: %w", err)
+	}
+	return s.mux.SendIKE(raw)
+}
+
+// respondNotify replies to a peer-initiated request with a single Notify
+// payload inside SK{}, e.g. SK{N(NO_ADDITIONAL_SAS)} for a rejected
+// CREATE_CHILD_SA (RFC 7815 §2.2).
+func (s *Session) respondNotify(msgID uint32, exchange ExchangeType, notifyType NotifyType) error {
+	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: exchange,
+		Flags: FlagInitiator | FlagResponse, MessageID: msgID}
+	inner := []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}}
+	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, inner)
+	if err != nil {
+		return fmt.Errorf("ike: build %v response: %w", exchange, err)
 	}
 	return s.mux.SendIKE(raw)
 }
