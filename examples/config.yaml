@@ -20,6 +20,10 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 originate:
   - "10.66.0.5/32"
 
+# Optional anti-replay window. Omit for strongSwan's default of 32 packets;
+# set to 0 to disable replay checking.
+# replay_window: 32
+
 # One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
 # endpoint only dials remote endpoints with the same address family.
 peers:

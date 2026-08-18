@@ -29,9 +29,19 @@ type Config struct {
 	// TUN names an existing TUN device to attach to, or the device to create
 	// when it does not exist. Empty creates an automatically named ranet%d.
 	TUN string `yaml:"tun"`
+	// ReplayWindow matches strongSwan's child replay_window: omitted uses 32,
+	// while an explicit 0 disables replay checking.
+	ReplayWindow *uint32 `yaml:"replay_window"`
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
+}
+
+func (c *Config) ReplayWindowSize() uint32 {
+	if c.ReplayWindow == nil {
+		return 32
+	}
+	return *c.ReplayWindow
 }
 
 // Endpoint mirrors the identity portion of ranet's endpoint configuration.

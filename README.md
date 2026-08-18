@@ -107,6 +107,10 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 originate:
   - "10.66.0.5/32"
 
+# Optional anti-replay window. Omit for strongSwan's default of 32 packets;
+# set to 0 to disable replay checking.
+# replay_window: 32
+
 # Optional fixed TUN name. It attaches to an existing compatible device or
 # creates it when absent. Omit to create an automatically named ranet%d device.
 # tun: ranet0

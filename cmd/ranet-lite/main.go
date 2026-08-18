@@ -275,7 +275,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	if err != nil {
 		return err
 	}
-	in, err := esp.NewInbound(sess.Child)
+	in, err := esp.NewInbound(sess.Child, esp.WithReplayWindow(cfg.ReplayWindowSize()))
 	if err != nil {
 		return err
 	}
@@ -290,7 +290,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		if err != nil {
 			return err
 		}
-		newIn, err := esp.NewInbound(child)
+		newIn, err := esp.NewInbound(child, esp.WithReplayWindow(cfg.ReplayWindowSize()))
 		if err != nil {
 			return err
 		}

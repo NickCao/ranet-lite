@@ -30,7 +30,7 @@ func TestRoundTrip(t *testing.T) {
 	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
-	})
+	}, WithReplayWindow(4096))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,8 @@ func TestReplayRejected(t *testing.T) {
 // within windowSize — and exact duplicates, even far apart across a large
 // window advance, must still be rejected.
 func TestReplayWindowWideReordering(t *testing.T) {
-	var w replayWindow
+	const window = 4096
+	w := newReplayWindow(window)
 
 	// Establish a high watermark.
 	if err := w.check(10000); err != nil {
@@ -139,7 +140,7 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	// window's rejection range but must be accepted by the wider window.
 	late := uint32(10000 - 3000)
 	if err := w.check(late); err != nil {
-		t.Fatalf("packet %d positions behind should be accepted with a %d window: %v", 3000, windowSize, err)
+		t.Fatalf("packet %d positions behind should be accepted with a %d window: %v", 3000, window, err)
 	}
 	w.commit(late)
 
@@ -149,7 +150,7 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	}
 
 	// A packet beyond windowSize behind must be rejected as too old.
-	tooOld := uint32(10000 - windowSize - 1)
+	tooOld := uint32(10000 - window - 1)
 	if err := w.check(tooOld); err == nil {
 		t.Fatal("packet beyond the window was accepted")
 	}
@@ -159,10 +160,18 @@ func TestReplayWindowWideReordering(t *testing.T) {
 	// sequence that was legitimately received just before the jump must
 	// now correctly read as "too old" rather than incorrectly "already
 	// seen" or accepted twice.
-	w.commit(10000 + windowSize + 500)
+	w.commit(10000 + window + 500)
 	if err := w.check(10000); err == nil {
 		t.Fatal("a sequence far behind after a large jump should be rejected as too old, not silently accepted")
 	}
+}
+
+func TestReplayWindowZeroDisablesChecking(t *testing.T) {
+	w := newReplayWindow(0)
+	if err := w.check(0); err != nil {
+		t.Fatalf("disabled replay window rejected sequence zero: %v", err)
+	}
+	w.commit(0)
 }
 
 // TestSealConcurrentUniqueSeq guards the split between atomic sequence
@@ -181,7 +190,7 @@ func TestSealConcurrentUniqueSeq(t *testing.T) {
 	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
-	})
+	}, WithReplayWindow(4096))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +245,7 @@ func TestOpenConcurrent(t *testing.T) {
 	in, err := NewInbound(ChildSA{
 		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
 		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
-	})
+	}, WithReplayWindow(4096))
 	if err != nil {
 		t.Fatal(err)
 	}

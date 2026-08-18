@@ -55,6 +55,15 @@ type InboundSA struct {
 	window replayWindow
 }
 
+// InboundOption configures inbound ESP processing.
+type InboundOption func(*InboundSA)
+
+// WithReplayWindow sets the anti-replay window. A zero value disables replay
+// checking, matching strongSwan's replay_window = 0 behavior.
+func WithReplayWindow(window uint32) InboundOption {
+	return func(in *InboundSA) { in.window = newReplayWindow(window) }
+}
+
 func NewOutbound(child ChildSA) (*OutboundSA, error) {
 	aead, params, err := newESPAEAD(child.EncrID, child.EncrKeyBits, child.OutboundKey)
 	if err != nil {
@@ -67,16 +76,21 @@ func NewOutbound(child ChildSA) (*OutboundSA, error) {
 	}, nil
 }
 
-func NewInbound(child ChildSA) (*InboundSA, error) {
+func NewInbound(child ChildSA, options ...InboundOption) (*InboundSA, error) {
 	aead, params, err := newESPAEAD(child.EncrID, child.EncrKeyBits, child.InboundKey)
 	if err != nil {
 		return nil, err
 	}
-	return &InboundSA{
+	in := &InboundSA{
 		aead: aead, params: params,
-		salt: child.InboundKey[params.keyLen:],
-		spi:  child.LocalSPI,
-	}, nil
+		salt:   child.InboundKey[params.keyLen:],
+		spi:    child.LocalSPI,
+		window: newReplayWindow(DefaultReplayWindow),
+	}
+	for _, option := range options {
+		option(in)
+	}
+	return in, nil
 }
 
 // Seal wraps one tunnel-mode IP packet (nextHeader identifies its version,
