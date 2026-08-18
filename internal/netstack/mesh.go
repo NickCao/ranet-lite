@@ -41,7 +41,9 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	dev tun.Device
+	dev     tun.Device
+	inbound chan []byte
+	done    chan struct{}
 }
 
 func New(mtu int) (*Mesh, error) {
@@ -57,8 +59,15 @@ func New(mtu int) (*Mesh, error) {
 		dev.Close()
 		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
-	m := &Mesh{Routes: NewRouteTable(), Name: name, dev: dev}
+	m := &Mesh{
+		Routes:  NewRouteTable(),
+		Name:    name,
+		dev:     dev,
+		inbound: make(chan []byte, 256),
+		done:    make(chan struct{}),
+	}
 	go m.outboundLoop()
+	go m.inboundLoop()
 	return m, nil
 }
 
@@ -122,15 +131,56 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 // DeliverInbound injects an already-decapsulated tunnel-mode IP packet into
 // the TUN device, as if it had arrived on the wire. nextHeader is unused —
 // the packet's own version nibble is all the kernel needs — but kept for
-// symmetry with how peers hand packets to Peer.sendFn.
+// symmetry with how peers hand packets to Peer.sendFn. It hands off to
+// inboundLoop rather than writing directly so that packets arriving in a
+// tight burst (from one or several peers concurrently) get coalesced into
+// a single Device.Write call.
 func (m *Mesh) DeliverInbound(raw []byte, _ byte) {
 	buf := make([]byte, writeOffset+len(raw))
 	copy(buf[writeOffset:], raw)
-	if _, err := m.dev.Write([][]byte{buf}, writeOffset); err != nil {
-		log.Printf("netstack: write to tun device: %v", err)
+	select {
+	case m.inbound <- buf:
+	case <-m.done:
+	}
+}
+
+// inboundLoop batches decrypted packets into as few Device.Write calls as
+// possible. Writing one packet per syscall, as a naive implementation
+// would, also means the TUN device never sees more than one buffer per
+// call, so it can never exercise its own GSO/GRO coalescing for
+// same-flow packets — batching here is what lets that actually kick in,
+// on top of the more basic win of fewer syscalls under load. It only
+// batches what's *already* waiting (a non-blocking drain), so a lone
+// packet with nothing queued behind it is written immediately with no
+// added latency; batching only happens when arrivals are bursty enough
+// that there's really something to gain from it.
+func (m *Mesh) inboundLoop() {
+	batch := m.dev.BatchSize()
+	bufs := make([][]byte, 0, batch)
+	for {
+		select {
+		case <-m.done:
+			return
+		case buf := <-m.inbound:
+			bufs = append(bufs, buf)
+		}
+	drain:
+		for len(bufs) < batch {
+			select {
+			case buf := <-m.inbound:
+				bufs = append(bufs, buf)
+			default:
+				break drain
+			}
+		}
+		if _, err := m.dev.Write(bufs, writeOffset); err != nil {
+			log.Printf("netstack: write to tun device: %v", err)
+		}
+		bufs = bufs[:0]
 	}
 }
 
 func (m *Mesh) Close() {
+	close(m.done)
 	m.dev.Close()
 }
