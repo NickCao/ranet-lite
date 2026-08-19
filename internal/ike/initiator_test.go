@@ -311,6 +311,148 @@ func TestSessionRekeyIKE(t *testing.T) {
 	}
 }
 
+func TestSessionHandlesPeerIKERekey(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const oldSPIi = 0x0102030405060708
+	const oldSPIr = 0x1112131415161718
+	const newSPIi = 0x2122232425262728
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	old := &ikeContext{suite: suite, spiI: oldSPIi, spiR: oldSPIr,
+		skD: []byte("old IKE rekey SK_d material-------"), skei: make([]byte, 20), sker: make([]byte, 20)}
+	child := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 0x10203040, RemoteSPI: 0x50607080}
+	s := &Session{mux: mux, current: old, Child: child, requests: make(chan *localRequest, 1)}
+	if err := mux.RegisterIKE(oldSPIi); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+
+	dh, err := GenerateDH(DH_CURVE25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ni := []byte("peer nonce for IKE rekey")
+	spi := make([]byte, 8)
+	binary.BigEndian.PutUint64(spi, newSPIi)
+	request, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, MessageID: 0}, nil, []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms}})},
+		{Type: PayloadNonce, Body: EncodeNonce(ni)},
+		{Type: PayloadKE, Body: EncodeKE(DH_CURVE25519, dh.PublicBytes())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 2048)
+	peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw := append([]byte(nil), buf[4:n]...)
+	response, err := DecodeMessage(responseRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.SPIInitiator != oldSPIi || response.Header.SPIResponder != oldSPIr || response.Header.Flags != FlagInitiator|FlagResponse {
+		t.Fatalf("rekey response header = %#v", response.Header)
+	}
+	inner, err := DecryptMessage(suite, old.skei, responseRaw, response)
+	if err != nil {
+		t.Fatalf("decrypt old-context rekey response: %v", err)
+	}
+	sa, nonce, ke := findType(inner, PayloadSA), findType(inner, PayloadNonce), findType(inner, PayloadKE)
+	if sa == nil || nonce == nil || ke == nil || findType(inner, PayloadTSi) != nil || findType(inner, PayloadTSr) != nil {
+		t.Fatalf("invalid peer rekey response payloads: %#v", inner)
+	}
+	props, err := DecodeSA(sa.Body)
+	if err != nil || len(props) != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
+		t.Fatalf("invalid peer rekey response proposal: %#v, %v", props, err)
+	}
+	newSPIr := binary.BigEndian.Uint64(props[0].SPI)
+	newSuite, err := suiteFromProposal(props[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, public, err := DecodeKE(ke.Body)
+	if err != nil || group != DH_CURVE25519 || newSPIr == 0 || len(nonce.Body) == 0 {
+		t.Fatalf("invalid peer rekey response KE: group=%d spi=%016x err=%v", group, newSPIr, err)
+	}
+	shared, err := dh.SharedSecret(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := DeriveRekeyedIKEKeys(old.suite.PRFID, old.skD, newSuite, shared, ni, nonce.Body, newSPIi, newSPIr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.current == old || !s.current.responder || s.old != old || s.current.suite != newSuite || s.current.spiI != newSPIi || s.current.spiR != newSPIr || string(s.current.skD) != string(keys.SKd) || string(s.current.skei) != string(keys.SKei) || string(s.current.sker) != string(keys.SKer) {
+		t.Fatalf("peer rekey contexts = current %#v old %#v", s.current, s.old)
+	}
+	if got := s.currentChild(); got.EncrID != child.EncrID || got.EncrKeyBits != child.EncrKeyBits || got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || len(got.InboundKey) != 0 || len(got.OutboundKey) != 0 {
+		t.Fatalf("Child SA changed during peer IKE rekey: %#v, want %#v", got, child)
+	}
+
+	request, err = EncryptMessage(s.current.suite, keys.SKei, Header{SPIInitiator: newSPIi, SPIResponder: newSPIr, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 0}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err = peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw = append([]byte(nil), buf[4:n]...)
+	response, err = DecodeMessage(responseRaw)
+	if err != nil || response.Header.SPIInitiator != newSPIi || response.Header.SPIResponder != newSPIr || response.Header.Flags != FlagResponse {
+		t.Fatalf("new-context response header = %#v, err=%v", response.Header, err)
+	}
+	if _, err := DecryptMessage(s.current.suite, keys.SKer, responseRaw, response); err != nil {
+		t.Fatalf("decrypt new-context response: %v", err)
+	}
+
+	request, err = EncryptMessage(old.suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: INFORMATIONAL, MessageID: 1}, nil, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err = peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw = append([]byte(nil), buf[4:n]...)
+	response, err = DecodeMessage(responseRaw)
+	if err != nil || response.Header.SPIInitiator != oldSPIi || response.Header.SPIResponder != oldSPIr {
+		t.Fatalf("old delete response header = %#v, err=%v", response.Header, err)
+	}
+	if _, err := DecryptMessage(old.suite, old.skei, responseRaw, response); err != nil {
+		t.Fatalf("decrypt old delete response: %v", err)
+	}
+	if s.old != nil || s.contextForHeader(&Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr}) != nil {
+		t.Fatal("old IKE context was not removed after peer delete")
+	}
+
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
+	}
+}
+
 func encodeTestMessage(t *testing.T, hdr Header, payloads []RawPayload) []byte {
 	t.Helper()
 	m := &Message{Header: hdr, Payloads: payloads}

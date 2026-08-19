@@ -144,8 +144,12 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 	}
 	msgID := context.nextLocalMID
 	context.nextLocalMID++
-	hdr := Header{SPIInitiator: context.spiI, SPIResponder: context.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
-	raw, err := EncryptMessage(context.suite, context.skei, hdr, nil, req.inner)
+	flags := uint8(0)
+	if !context.responder {
+		flags = FlagInitiator
+	}
+	hdr := Header{SPIInitiator: context.spiI, SPIResponder: context.spiR, ExchangeType: req.exchange, Flags: flags, MessageID: msgID}
+	raw, err := EncryptMessage(context.suite, context.localEncryptionKey(), hdr, nil, req.inner)
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +182,11 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	if err != nil {
 		return false
 	}
-	inner, err := DecryptMessage(ctx.suite, ctx.sker, raw, outer)
+	inner, err := DecryptMessage(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
 	if err != nil {
 		return false
 	}
-	if hdr.IsResponse() && !hdr.IsInitiator() {
+	if hdr.IsResponse() && hdr.IsInitiator() == ctx.responder {
 		if current := *pending; current != nil && current.context == ctx && hdr.MessageID == current.msgID && hdr.ExchangeType == current.exchange {
 			current.result <- requestResult{inner: inner}
 			*pending = nil
@@ -190,7 +194,7 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 		}
 		return false
 	}
-	if hdr.IsInitiator() || hdr.IsResponse() {
+	if hdr.IsInitiator() != ctx.responder || hdr.IsResponse() {
 		return false
 	}
 	if hdr.MessageID != ctx.nextPeerMID {
@@ -244,6 +248,11 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
+				if ctx == s.old {
+					s.mux.UnregisterIKE(ctx.spiI)
+					s.old = nil
+					return response, nil
+				}
 				return response, fmt.Errorf("peer deleted IKE SA")
 			}
 			child := s.currentChild()
@@ -275,6 +284,12 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 		return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
 	}
 	if hdr.ExchangeType == CREATE_CHILD_SA {
+		if sa := findType(inner, PayloadSA); sa != nil {
+			props, err := DecodeSA(sa.Body)
+			if err == nil && len(props) == 1 && props[0].Protocol == ProtoIKE {
+				return s.handleIKERekey(ctx, hdr.MessageID, inner)
+			}
+		}
 		return s.handleChildRekey(ctx, hdr.MessageID, inner)
 	}
 	return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
@@ -341,12 +356,30 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 }
 
 func (s *Session) response(ctx *ikeContext, msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {
-	hdr := Header{SPIInitiator: ctx.spiI, SPIResponder: ctx.spiR, ExchangeType: exchange, Flags: FlagInitiator | FlagResponse, MessageID: msgID}
-	raw, err := EncryptMessage(ctx.suite, ctx.skei, hdr, nil, inner)
+	flags := uint8(FlagResponse)
+	if !ctx.responder {
+		flags |= FlagInitiator
+	}
+	hdr := Header{SPIInitiator: ctx.spiI, SPIResponder: ctx.spiR, ExchangeType: exchange, Flags: flags, MessageID: msgID}
+	raw, err := EncryptMessage(ctx.suite, ctx.localEncryptionKey(), hdr, nil, inner)
 	if err != nil {
 		return nil, fmt.Errorf("ike: build response: %w", err)
 	}
 	return raw, nil
+}
+
+func (ctx *ikeContext) localEncryptionKey() []byte {
+	if ctx.responder {
+		return ctx.sker
+	}
+	return ctx.skei
+}
+
+func (ctx *ikeContext) peerEncryptionKey() []byte {
+	if ctx.responder {
+		return ctx.skei
+	}
+	return ctx.sker
 }
 
 func (s *Session) responseNotify(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType) ([]byte, error) {

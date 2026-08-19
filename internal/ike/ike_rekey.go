@@ -112,3 +112,115 @@ func (s *Session) RekeyIKE() error {
 	s.old = nil
 	return nil
 }
+
+// handleIKERekey accepts a peer-initiated IKE SA rekey. Its response remains
+// protected by ctx; the newly-derived context becomes current for subsequent
+// exchanges while ctx stays available until the peer deletes it.
+func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
+	if ctx != s.current || s.old != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	var sa, nonce, ke *RawPayload
+	for i := range inner {
+		switch inner[i].Type {
+		case PayloadSA:
+			if sa != nil {
+				return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+			}
+			sa = &inner[i]
+		case PayloadNonce:
+			if nonce != nil {
+				return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+			}
+			nonce = &inner[i]
+		case PayloadKE:
+			if ke != nil {
+				return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+			}
+			ke = &inner[i]
+		case PayloadTSi, PayloadTSr:
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+	}
+	if sa == nil || nonce == nil || ke == nil || len(nonce.Body) == 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	props, err := DecodeSA(sa.Body)
+	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	spiI := binary.BigEndian.Uint64(props[0].SPI)
+	if spiI == 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	selected, suite, ok := selectIKERekeyProposal(props[0])
+	if !ok {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	group, peerPublic, err := DecodeKE(ke.Body)
+	if err != nil || group != suite.DHGroup || len(peerPublic) == 0 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	dh, err := GenerateDH(group)
+	if err != nil {
+		return nil, fmt.Errorf("ike: generate peer IKE rekey DH key: %w", err)
+	}
+	shared, err := dh.SharedSecret(peerPublic)
+	if err != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	nr := make([]byte, 32)
+	if _, err := rand.Read(nr); err != nil {
+		return nil, fmt.Errorf("ike: generate peer IKE rekey nonce: %w", err)
+	}
+	spiR := randUint64Nonzero()
+	keys, err := DeriveRekeyedIKEKeys(ctx.suite.PRFID, ctx.skD, suite, shared, nonce.Body, nr, spiI, spiR)
+	if err != nil {
+		return nil, fmt.Errorf("ike: derive peer IKE rekey keys: %w", err)
+	}
+	if err := s.mux.RegisterIKE(spiI); err != nil {
+		return nil, fmt.Errorf("ike: register peer rekeyed IKE SA: %w", err)
+	}
+	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
+	s.old = ctx
+	s.current = newContext
+	spi := make([]byte, 8)
+	binary.BigEndian.PutUint64(spi, spiR)
+	response := Proposal{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: selected}
+	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{response})},
+		{Type: PayloadNonce, Body: EncodeNonce(nr)},
+		{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
+	})
+}
+
+func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {
+	offered := ikeProposal().Transforms
+	selected := make([]Transform, 0, 3)
+	for _, typ := range []TransformType{TransEncr, TransPRF, TransDH} {
+		found := false
+		for _, want := range offered {
+			if want.Type != typ {
+				continue
+			}
+			for _, got := range proposal.Transforms {
+				if got == want {
+					selected = append(selected, got)
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return nil, SASuite{}, false
+		}
+	}
+	suite, err := suiteFromProposal(Proposal{Transforms: selected})
+	if err != nil {
+		return nil, SASuite{}, false
+	}
+	return selected, suite, true
+}

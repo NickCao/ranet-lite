@@ -43,15 +43,16 @@ type ChildSA = esp.ChildSA
 // ikeContext contains the state bound to one IKE SA's SPI pair. During an IKE
 // SA rekey, Session keeps the replaced context until its transition completes.
 type ikeContext struct {
-	suite SASuite
-	skD   []byte
-	skai  []byte // unused (AEAD ciphers derive no integrity keys)
-	skei  []byte
-	sker  []byte
-	skpi  []byte
-	skpr  []byte
-	spiI  uint64
-	spiR  uint64
+	suite     SASuite
+	skD       []byte
+	skai      []byte // unused (AEAD ciphers derive no integrity keys)
+	skei      []byte
+	sker      []byte
+	skpi      []byte
+	skpr      []byte
+	spiI      uint64
+	spiR      uint64
+	responder bool // local endpoint is the responder for this IKE SA
 
 	nextLocalMID       uint32 // next Message ID we allocate for a local request
 	nextPeerMID        uint32 // next Message ID expected from a peer request
