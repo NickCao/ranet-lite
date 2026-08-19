@@ -134,6 +134,7 @@ func TestRouteTableRemovePeer(t *testing.T) {
 func TestAddrsOfIPv4(t *testing.T) {
 	raw := make([]byte, 20)
 	raw[0] = 0x45
+	raw[3] = byte(len(raw))
 	copy(raw[12:16], mustAddr("10.1.2.3").AsSlice())
 	copy(raw[16:20], mustAddr("10.4.5.6").AsSlice())
 
@@ -176,6 +177,14 @@ func TestAddrsOfRejectsShortOrUnknownPackets(t *testing.T) {
 	}
 	if _, _, _, ok := addrsOf([]byte{0x00}); ok {
 		t.Fatal("expected reject on unknown IP version")
+	}
+	if _, _, _, ok := addrsOf(make([]byte, 20)); ok {
+		t.Fatal("expected reject on invalid IPv4 length")
+	}
+	invalidIPv6 := make([]byte, 41)
+	invalidIPv6[0] = 0x60
+	if _, _, _, ok := addrsOf(invalidIPv6); ok {
+		t.Fatal("expected reject on invalid IPv6 length")
 	}
 }
 

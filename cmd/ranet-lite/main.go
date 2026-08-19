@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -224,12 +225,20 @@ func validateESPTunnelPayload(plain []byte, nextHeader byte) (bool, error) {
 	}
 	switch nextHeader {
 	case esp.NextHeaderIPv4:
-		if plain[0]>>4 != 4 {
+		if plain[0]>>4 != 4 || len(plain) < 20 {
 			return false, fmt.Errorf("ESP Next Header is IPv4 but inner version is %d", plain[0]>>4)
 		}
+		headerLength := int(plain[0]&0x0f) * 4
+		totalLength := int(binary.BigEndian.Uint16(plain[2:4]))
+		if headerLength < 20 || headerLength > len(plain) || totalLength < headerLength || totalLength != len(plain) {
+			return false, fmt.Errorf("invalid IPv4 tunnel packet length")
+		}
 	case esp.NextHeaderIPv6:
-		if plain[0]>>4 != 6 {
+		if plain[0]>>4 != 6 || len(plain) < 40 {
 			return false, fmt.Errorf("ESP Next Header is IPv6 but inner version is %d", plain[0]>>4)
+		}
+		if 40+int(binary.BigEndian.Uint16(plain[4:6])) != len(plain) {
+			return false, fmt.Errorf("invalid IPv6 tunnel packet length")
 		}
 	default:
 		return false, fmt.Errorf("unsupported ESP Next Header %d", nextHeader)

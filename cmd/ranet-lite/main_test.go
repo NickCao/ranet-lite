@@ -57,6 +57,10 @@ func TestValidateRuntimeConfig(t *testing.T) {
 }
 
 func TestValidateESPTunnelPayload(t *testing.T) {
+	ipv4 := make([]byte, 20)
+	ipv4[0], ipv4[3] = 0x45, 20
+	ipv6 := make([]byte, 40)
+	ipv6[0] = 0x60
 	for _, test := range []struct {
 		name    string
 		plain   []byte
@@ -64,11 +68,12 @@ func TestValidateESPTunnelPayload(t *testing.T) {
 		deliver bool
 		wantErr bool
 	}{
-		{name: "IPv4", plain: []byte{0x45}, nh: esp.NextHeaderIPv4, deliver: true},
-		{name: "IPv6", plain: []byte{0x60}, nh: esp.NextHeaderIPv6, deliver: true},
-		{name: "dummy", plain: []byte{0x60}, nh: esp.NextHeaderNone},
-		{name: "version mismatch", plain: []byte{0x60}, nh: esp.NextHeaderIPv4, wantErr: true},
-		{name: "unsupported", plain: []byte{0x45}, nh: 6, wantErr: true},
+		{name: "IPv4", plain: ipv4, nh: esp.NextHeaderIPv4, deliver: true},
+		{name: "IPv6", plain: ipv6, nh: esp.NextHeaderIPv6, deliver: true},
+		{name: "dummy", plain: ipv6, nh: esp.NextHeaderNone},
+		{name: "version mismatch", plain: ipv6, nh: esp.NextHeaderIPv4, wantErr: true},
+		{name: "unsupported", plain: ipv4, nh: 6, wantErr: true},
+		{name: "IPv4 trailing data", plain: append(append([]byte(nil), ipv4...), 0), nh: esp.NextHeaderIPv4, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			deliver, err := validateESPTunnelPayload(test.plain, test.nh)

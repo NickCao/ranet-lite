@@ -260,11 +260,20 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 		if len(raw) < 20 {
 			return netip.Addr{}, netip.Addr{}, 0, false
 		}
+		headerLength := int(raw[0]&0x0f) * 4
+		totalLength := int(raw[2])<<8 | int(raw[3])
+		if headerLength < 20 || headerLength > len(raw) || totalLength < headerLength || totalLength != len(raw) {
+			return netip.Addr{}, netip.Addr{}, 0, false
+		}
 		s, sok := netip.AddrFromSlice(raw[12:16])
 		d, dok := netip.AddrFromSlice(raw[16:20])
 		return s, d, esp.NextHeaderIPv4, sok && dok
 	case 6:
 		if len(raw) < 40 {
+			return netip.Addr{}, netip.Addr{}, 0, false
+		}
+		payloadLength := int(raw[4])<<8 | int(raw[5])
+		if 40+payloadLength != len(raw) {
 			return netip.Addr{}, netip.Addr{}, 0, false
 		}
 		s, sok := netip.AddrFromSlice(raw[8:24])
