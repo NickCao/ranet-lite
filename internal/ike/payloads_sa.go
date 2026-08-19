@@ -36,6 +36,9 @@ func decodeTransform(b []byte) (Transform, bool, []byte, error) {
 	if len(b) < 8 {
 		return Transform{}, false, nil, fmt.Errorf("ike: short transform")
 	}
+	if b[0] != 0 && b[0] != 3 {
+		return Transform{}, false, nil, fmt.Errorf("ike: invalid transform last/more value %d", b[0])
+	}
 	more := b[0] == 3
 	tlen := binary.BigEndian.Uint16(b[2:4])
 	if int(tlen) < 8 || int(tlen) > len(b) {
@@ -46,13 +49,30 @@ func decodeTransform(b []byte) (Transform, bool, []byte, error) {
 		ID:   binary.BigEndian.Uint16(b[6:8]),
 	}
 	attrs := b[8:tlen]
-	for len(attrs) >= 4 {
-		at := binary.BigEndian.Uint16(attrs[0:2])
-		av := binary.BigEndian.Uint16(attrs[2:4])
-		if at&0x8000 != 0 && (at&0x7fff) == AttrKeyLength {
-			t.KeyLengthBits = av
+	for len(attrs) > 0 {
+		if len(attrs) < 4 {
+			return Transform{}, false, nil, fmt.Errorf("ike: truncated transform attribute")
 		}
-		attrs = attrs[4:] // all attributes we care about are TV-format (4 bytes)
+		at := binary.BigEndian.Uint16(attrs[0:2])
+		if at&0x8000 != 0 {
+			if (at & 0x7fff) == AttrKeyLength {
+				t.KeyLengthBits = binary.BigEndian.Uint16(attrs[2:4])
+			}
+			attrs = attrs[4:]
+			continue
+		}
+		valueLength := int(binary.BigEndian.Uint16(attrs[2:4]))
+		length := 4 + valueLength
+		if length > len(attrs) {
+			return Transform{}, false, nil, fmt.Errorf("ike: invalid transform attribute length %d", valueLength)
+		}
+		if at == AttrKeyLength {
+			if valueLength != 2 {
+				return Transform{}, false, nil, fmt.Errorf("ike: invalid key length attribute")
+			}
+			t.KeyLengthBits = binary.BigEndian.Uint16(attrs[4:6])
+		}
+		attrs = attrs[length:]
 	}
 	return t, more, b[tlen:], nil
 }
@@ -91,6 +111,9 @@ func decodeProposal(b []byte) (Proposal, bool, []byte, error) {
 	if len(b) < 8 {
 		return Proposal{}, false, nil, fmt.Errorf("ike: short proposal")
 	}
+	if b[0] != 0 && b[0] != 2 {
+		return Proposal{}, false, nil, fmt.Errorf("ike: invalid proposal last/more value %d", b[0])
+	}
 	more := b[0] == 2
 	plen := binary.BigEndian.Uint16(b[2:4])
 	if int(plen) < 8 || int(plen) > len(b) {
@@ -115,9 +138,15 @@ func decodeProposal(b []byte) (Proposal, bool, []byte, error) {
 		}
 		p.Transforms = append(p.Transforms, t)
 		rest = next
-		if !more {
-			break
+		if i < numTrans-1 && !more {
+			return Proposal{}, false, nil, fmt.Errorf("ike: proposal ended before transform count")
 		}
+		if i == numTrans-1 && more {
+			return Proposal{}, false, nil, fmt.Errorf("ike: proposal has more transforms than declared")
+		}
+	}
+	if len(rest) != 0 {
+		return Proposal{}, false, nil, fmt.Errorf("ike: trailing bytes in proposal")
 	}
 	return p, more, b[plen:], nil
 }
@@ -142,8 +171,11 @@ func DecodeSA(body []byte) ([]Proposal, error) {
 		}
 		props = append(props, p)
 		rest = next
-		if !more {
-			break
+		if !more && len(rest) != 0 {
+			return nil, fmt.Errorf("ike: trailing bytes after last proposal")
+		}
+		if more && len(rest) == 0 {
+			return nil, fmt.Errorf("ike: proposal chain ends with more flag")
 		}
 	}
 	return props, nil
