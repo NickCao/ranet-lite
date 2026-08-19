@@ -51,19 +51,23 @@ func main() {
 	privPath := flag.String("priv", "/root/ike/testpki/org_priv.pem", "org private key")
 	pubPath := flag.String("pub", "/root/ike/testpki/org_pub.pem", "org public key")
 	runSeconds := flag.Int("run", 0, "seconds to keep servicing DPD/INFORMATIONAL after handshake")
+	childRekey := flag.Duration("child-rekey", 0, "proactively rekey Child SAs at this interval (0 disables)")
+	ikeRekey := flag.Duration("ike-rekey", 0, "proactively rekey IKE SAs at this interval (0 disables)")
 	flag.Parse()
 
 	cfg := ike.PeerConfig{
-		Organization:     "testorg",
-		LocalCommonName:  "client",
-		LocalSerial:      "2",
-		LocalPrivateKey:  loadPriv(*privPath),
-		RemoteCommonName: "server",
-		RemoteSerial:     "1",
-		RemotePublicKey:  loadPub(*pubPath),
-		LocalAddr:        net.ParseIP(*localAddr),
-		RemoteAddr:       net.ParseIP(*remoteAddr),
-		RemotePort:       *remotePort,
+		Organization:       "testorg",
+		LocalCommonName:    "client",
+		LocalSerial:        "2",
+		LocalPrivateKey:    loadPriv(*privPath),
+		RemoteCommonName:   "server",
+		RemoteSerial:       "1",
+		RemotePublicKey:    loadPub(*pubPath),
+		LocalAddr:          net.ParseIP(*localAddr),
+		RemoteAddr:         net.ParseIP(*remoteAddr),
+		RemotePort:         *remotePort,
+		ChildRekeyInterval: *childRekey,
+		IKERekeyInterval:   *ikeRekey,
 	}
 
 	sess, err := ike.Initiate(cfg)
@@ -74,6 +78,9 @@ func main() {
 		sess.Child.LocalSPI, sess.Child.RemoteSPI, sess.Child.EncrID, sess.Child.EncrKeyBits)
 
 	if *runSeconds > 0 {
+		if *childRekey > 0 || *ikeRekey > 0 {
+			fmt.Printf("rekey schedule: child=%s ike=%s\n", *childRekey, *ikeRekey)
+		}
 		go func() {
 			if err := sess.Run(); err != nil {
 				log.Printf("session loop ended: %v", err)

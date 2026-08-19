@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -78,9 +79,10 @@ type Session struct {
 	// collision retains the losing peer-initiated candidate until the local
 	// rekey exchange can delete it. The normal current/old pair retains the
 	// winning candidate and the SA it replaces.
-	collision     *ikeContext
-	localRekey    *ikeRekey
-	ikeRekeyNonce func([]byte) error
+	collision           *ikeContext
+	localRekey          *ikeRekey
+	ikeRekeyNonce       func([]byte) error
+	tieBreakLocalHigher bool
 
 	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
 	requests  chan *localRequest
@@ -495,6 +497,9 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 			spiI: spiI, spiR: spiR, nextLocalMID: 2},
 		requests: make(chan *localRequest, 1),
 	}
+	if localIP, remoteIP := canonicalIP(cfg.LocalAddr), canonicalIP(cfg.RemoteAddr); localIP != nil && remoteIP != nil {
+		sess.tieBreakLocalHigher = bytes.Compare(localIP, remoteIP) > 0
+	}
 
 	if err := sess.doIKEAuth(cfg, req, respRaw, ni, nr); err != nil {
 		mux.Close()
@@ -517,6 +522,13 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		return nil, err
 	}
 	return sess, nil
+}
+
+func canonicalIP(ip net.IP) []byte {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4
+	}
+	return ip.To16()
 }
 
 func suiteFromProposal(p Proposal) (SASuite, error) {

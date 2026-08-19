@@ -228,7 +228,11 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
 	s.stateMu.Lock()
 	local := s.localRekey
-	if local != nil && local.old == ctx && compareIKENonces(nonce.Body, local.nonce) < 0 {
+	comparison := 0
+	if local != nil && local.old == ctx {
+		comparison = compareIKENonces(nonce.Body, local.nonce)
+	}
+	if local != nil && local.old == ctx && localRekeyWins(comparison, s.tieBreakLocalHigher) {
 		// RFC 7296 section 2.8 retains the SA whose initiator nonce is larger.
 		// Keep this lower-nonce peer candidate reachable until RekeyIKE can
 		// delete it after its own candidate is established.
@@ -246,6 +250,10 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		{Type: PayloadNonce, Body: EncodeNonce(nr)},
 		{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
 	})
+}
+
+func localRekeyWins(nonceComparison int, localAddressHigher bool) bool {
+	return nonceComparison < 0 || (nonceComparison == 0 && localAddressHigher)
 }
 
 func (s *Session) fillIKERekeyNonce(nonce []byte) error {

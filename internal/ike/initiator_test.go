@@ -606,6 +606,15 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	}
 }
 
+func TestLocalRekeyWinsTieBreak(t *testing.T) {
+	if !localRekeyWins(-1, false) || localRekeyWins(1, true) {
+		t.Fatal("nonce comparison did not select the higher candidate")
+	}
+	if !localRekeyWins(0, true) || localRekeyWins(0, false) {
+		t.Fatal("equal nonce tie break did not select the higher address")
+	}
+}
+
 func TestSessionRekeyIKECollisionKeepsHigherNonceCandidate(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)

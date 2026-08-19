@@ -123,6 +123,9 @@ originate:
 # rekey_retry_initial: 5s
 # rekey_retry_max: 5m
 
+# The existing strongSwan netns test rig can exercise short rekey lifetimes:
+# go run ./cmd/iketest -child-rekey=5s -ike-rekey=15s -run=45
+
 # Optional fixed TUN name. It attaches to an existing compatible device or
 # creates it when absent. Omit to create an automatically named ranet%d device.
 # tun: ranet0
