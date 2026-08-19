@@ -413,6 +413,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 	}
 	prefixDec := &PrefixDecoder{}
 	var curRouterID [8]byte
+	var haveRouterID bool
 	var freshHelloTxTS uint32
 	var haveFreshHello bool
 
@@ -466,6 +467,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			id, err := DecodeRouterID(t.Body)
 			if err == nil {
 				curRouterID = id
+				haveRouterID = true
 			}
 
 		case TLVUpdate:
@@ -488,11 +490,14 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				s.triggerUpdate()
 				continue
 			}
+			if !haveRouterID && u.Metric != MetricInfinity {
+				continue
+			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
 			if !ok {
 				continue
 			}
-			prefix := netip.PrefixFrom(addr.Unmap(), u.Plen)
+			prefix := netip.PrefixFrom(addr.Unmap(), u.Plen).Masked()
 			if curRouterID == s.cfg.RouterID {
 				// This route is ours. Split horizon (RFC 8966 §3.7.4)
 				// only ever suppresses re-advertising back out the *one*

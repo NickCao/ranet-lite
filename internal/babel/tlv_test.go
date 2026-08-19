@@ -80,6 +80,21 @@ func TestUpdatePrefixCompression(t *testing.T) {
 	}
 }
 
+func TestUpdateCompressionRequiresPrefixFlag(t *testing.T) {
+	decoder := &PrefixDecoder{}
+	first := EncodeUpdate(Update{AE: AEIPv4, Plen: 32, Prefix: net.IPv4(10, 0, 0, 1)})
+	if _, err := decoder.Decode(first.Body); err != nil {
+		t.Fatal(err)
+	}
+	compressed := []byte{AEIPv4, 0, 32, 3, 0, 0, 0, 0, 0, 1, 2}
+	if _, err := decoder.Decode(compressed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&PrefixDecoder{}).Decode(compressed); err == nil {
+		t.Fatal("accepted compressed Update without a P-flag default")
+	}
+}
+
 func TestUpdateRejectsPrefixLengthBeyondAddressFamily(t *testing.T) {
 	for _, body := range [][]byte{
 		{AEIPv4, 0, 40, 5, 0, 0, 0, 0, 0, 0},
@@ -117,7 +132,7 @@ func TestUpdateWithSourcePrefix(t *testing.T) {
 	// AE=IPv4, Plen=32, prefix 10.99.2.5, trailing Source Prefix sub-TLV
 	// (type 128, SourcePlen=16, source prefix 10.1.0.0/16).
 	body := []byte{
-		AEIPv4, 0, 32, 0, // AE, Flags, Plen, Omitted
+		AEIPv4, updateFlagPrefix, 32, 0, // AE, Flags, Plen, Omitted
 		0, 0, // Interval
 		0, 0, // Seqno
 		0, 128, // Metric
