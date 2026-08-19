@@ -478,7 +478,7 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		return nil, err
 	}
 	peerGroup, peerPub, err := DecodeKE(kePl.Body)
-	if err != nil || peerGroup != group {
+	if err != nil || peerGroup != group || peerGroup != suite.DHGroup {
 		mux.Close()
 		return nil, fmt.Errorf("ike: KE group mismatch (got %d, used %d)", peerGroup, group)
 	}
@@ -537,27 +537,39 @@ func canonicalIP(ip net.IP) []byte {
 }
 
 func suiteFromProposal(p Proposal) (SASuite, error) {
-	encr, ok := p.ChosenTransform(TransEncr)
-	if !ok {
-		return SASuite{}, fmt.Errorf("ike: responder chose no encryption transform")
+	if p.Number != 1 || p.Protocol != ProtoIKE || len(p.SPI) != 0 || len(p.Transforms) != 3 {
+		return SASuite{}, fmt.Errorf("ike: invalid selected IKE proposal shape")
 	}
-	prfT, ok := p.ChosenTransform(TransPRF)
-	if !ok {
-		return SASuite{}, fmt.Errorf("ike: responder chose no PRF transform")
+	offered := ikeProposal().Transforms
+	selected := make(map[TransformType]Transform, 3)
+	for _, transform := range p.Transforms {
+		if transform.Type != TransEncr && transform.Type != TransPRF && transform.Type != TransDH {
+			return SASuite{}, fmt.Errorf("ike: unexpected selected transform type %d", transform.Type)
+		}
+		if _, duplicate := selected[transform.Type]; duplicate {
+			return SASuite{}, fmt.Errorf("ike: duplicate selected transform type %d", transform.Type)
+		}
+		matched := false
+		for _, candidate := range offered {
+			if transform == candidate {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return SASuite{}, fmt.Errorf("ike: responder selected unoffered transform %d/%d", transform.Type, transform.ID)
+		}
+		selected[transform.Type] = transform
 	}
-	dhT, ok := p.ChosenTransform(TransDH)
-	if !ok {
-		return SASuite{}, fmt.Errorf("ike: responder chose no DH transform")
+	encr, encrOK := selected[TransEncr]
+	prfT, prfOK := selected[TransPRF]
+	dhT, dhOK := selected[TransDH]
+	if !encrOK || !prfOK || !dhOK {
+		return SASuite{}, fmt.Errorf("ike: incomplete selected IKE proposal")
 	}
 	kb := encr.KeyLengthBits
 	if encr.ID == ENCR_CHACHA20_POLY1305 {
 		kb = 256
-	}
-	if _, err := aeadParams(encr.ID, kb); err != nil {
-		return SASuite{}, fmt.Errorf("ike: responder chose unsupported encryption %d: %w", encr.ID, err)
-	}
-	if _, err := prfHashFunc(prfT.ID); err != nil {
-		return SASuite{}, err
 	}
 	return SASuite{EncrID: encr.ID, EncrKeyBits: kb, PRFID: prfT.ID, DHGroup: dhT.ID}, nil
 }

@@ -75,7 +75,9 @@ func (s *Session) RekeyIKE() error {
 	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
 		return fmt.Errorf("ike: invalid IKE SA rekey proposal")
 	}
-	suite, err := suiteFromProposal(props[0])
+	selectedProposal := props[0]
+	selectedProposal.SPI = nil
+	suite, err := suiteFromProposal(selectedProposal)
 	if err != nil {
 		return fmt.Errorf("ike: invalid IKE SA rekey transforms: %w", err)
 	}
@@ -301,7 +303,7 @@ func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {
 			return nil, SASuite{}, false
 		}
 	}
-	suite, err := suiteFromProposal(Proposal{Transforms: selected})
+	suite, err := suiteFromProposal(Proposal{Number: 1, Protocol: ProtoIKE, Transforms: selected})
 	if err != nil {
 		return nil, SASuite{}, false
 	}

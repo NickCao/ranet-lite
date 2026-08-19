@@ -131,6 +131,21 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		if err != nil || encryption.ID != want.ID || encryption.KeyLengthBits != want.KeyLengthBits {
 			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal changed encryption transform")
 		}
+	} else {
+		matched := false
+		for _, offered := range espProposal(nil).Transforms {
+			if offered.Type != TransEncr {
+				continue
+			}
+			canonical, err := canonicalEncryptionTransform(offered)
+			if err == nil && canonical.ID == encryption.ID && canonical.KeyLengthBits == encryption.KeyLengthBits {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal selected an unoffered transform")
+		}
 	}
 	return p, encryption, remoteSPI, nil
 }

@@ -533,7 +533,9 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 		t.Fatalf("invalid peer rekey response proposal: %#v, %v", props, err)
 	}
 	newSPIr := binary.BigEndian.Uint64(props[0].SPI)
-	newSuite, err := suiteFromProposal(props[0])
+	selectedProposal := props[0]
+	selectedProposal.SPI = nil
+	newSuite, err := suiteFromProposal(selectedProposal)
 	if err != nil {
 		t.Fatal(err)
 	}
