@@ -107,6 +107,7 @@ const (
 	N_NO_PROPOSAL_CHOSEN           NotifyType = 14
 	N_INVALID_KE_PAYLOAD           NotifyType = 17
 	N_NO_ADDITIONAL_SAS            NotifyType = 35
+	N_TEMPORARY_FAILURE            NotifyType = 43
 	N_CHILD_SA_NOT_FOUND           NotifyType = 44
 	N_REKEY_SA                     NotifyType = 16393
 	N_INITIAL_CONTACT              NotifyType = 16384

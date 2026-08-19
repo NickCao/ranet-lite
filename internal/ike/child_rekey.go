@@ -12,6 +12,10 @@ import (
 // The old Child SA is intentionally retained: retiring it requires a correct
 // INFORMATIONAL Delete exchange and an ESP overlap policy.
 func (s *Session) RekeyChild() error {
+	if !s.childRekeying.CompareAndSwap(false, true) {
+		return fmt.Errorf("ike: Child SA rekey already in progress")
+	}
+	defer s.childRekeying.Store(false)
 	old := s.currentChild()
 	if old.LocalSPI == 0 || old.RemoteSPI == 0 {
 		return fmt.Errorf("ike: no Child SA to rekey")

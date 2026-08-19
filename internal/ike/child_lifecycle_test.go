@@ -73,3 +73,13 @@ func TestReplaceChildRejectsOverlappingRetirement(t *testing.T) {
 		t.Fatal("replaceChild replaced an SA while an earlier one was still retiring")
 	}
 }
+
+func TestChildRekeyGuardSerializesAttempts(t *testing.T) {
+	s := &Session{}
+	if !s.childRekeying.CompareAndSwap(false, true) {
+		t.Fatal("failed to reserve Child rekey")
+	}
+	if s.childRekeying.CompareAndSwap(false, true) {
+		t.Fatal("reserved a second simultaneous Child rekey")
+	}
+}

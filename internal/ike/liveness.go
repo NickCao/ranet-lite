@@ -494,6 +494,9 @@ func supportedPayloadType(payloadType PayloadType) bool {
 }
 
 func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
+	if s.childRekeying.Load() {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+	}
 	var rekey Notify
 	payloads, err := decodeChildExchangePayloads(inner)
 	if err != nil {

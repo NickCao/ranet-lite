@@ -90,10 +90,11 @@ type Session struct {
 	Child    ChildSA
 	retiring ChildSA
 
-	handlerMu   sync.RWMutex
-	onChild     func(ChildSA) error
-	onRetire    func(uint32) error
-	lastTraffic atomic.Int64
+	handlerMu     sync.RWMutex
+	onChild       func(ChildSA) error
+	onRetire      func(uint32) error
+	lastTraffic   atomic.Int64
+	childRekeying atomic.Bool
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
