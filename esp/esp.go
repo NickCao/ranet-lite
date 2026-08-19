@@ -182,20 +182,8 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("esp: authentication failed: %w", err)
 	}
-	if len(plain) < 2 {
-		return nil, 0, fmt.Errorf("esp: plaintext too short")
-	}
-	padLen := int(plain[len(plain)-2])
-	nextHeader := plain[len(plain)-1]
-	if padLen+2 > len(plain) {
-		return nil, 0, fmt.Errorf("esp: invalid padding")
-	}
-
-	// Re-check under the same lock as commit: another goroutine may have
-	// committed this exact sequence, or advanced the window far enough
-	// to make it stale, while this decrypt was in flight. Without this,
-	// two concurrent decrypts of the same replayed packet could both
-	// pass the first check and both get delivered.
+	// Authentication, rather than successful trailer interpretation, consumes
+	// the sequence number (RFC 4303 section 3.4.3).
 	in.mu.Lock()
 	err = in.window.check(seq)
 	if err == nil {
@@ -205,5 +193,14 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	if len(plain) < 2 {
+		return nil, 0, fmt.Errorf("esp: plaintext too short")
+	}
+	padLen := int(plain[len(plain)-2])
+	nextHeader := plain[len(plain)-1]
+	if padLen+2 > len(plain) {
+		return nil, 0, fmt.Errorf("esp: invalid padding")
+	}
+
 	return plain[:len(plain)-2-padLen], nextHeader, nil
 }

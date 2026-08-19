@@ -52,6 +52,33 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedMalformedPacketConsumesSequence(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ChildSA{EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits, LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := make([]byte, headerLen+out.params.IVLen)
+	binary.BigEndian.PutUint32(packet[0:4], out.spi)
+	binary.BigEndian.PutUint32(packet[4:8], 1)
+	binary.BigEndian.PutUint64(packet[8:16], 1)
+	nonce := append(append([]byte(nil), out.salt...), packet[8:16]...)
+	packet = out.aead.Seal(packet, nonce, []byte{0, 3, NextHeaderIPv4}, packet[:headerLen])
+	if _, _, err := in.Open(packet); err == nil {
+		t.Fatal("accepted malformed authenticated trailer")
+	}
+	in.mu.Lock()
+	err = in.window.check(1)
+	in.mu.Unlock()
+	if err == nil {
+		t.Fatal("malformed authenticated packet did not consume its sequence number")
+	}
+}
+
 func TestRoundTripChaCha20Poly1305(t *testing.T) {
 	key := make([]byte, 36) // 32-byte key + 4-byte salt
 	if _, err := rand.Read(key); err != nil {
