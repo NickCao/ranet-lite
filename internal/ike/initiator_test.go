@@ -2,6 +2,8 @@ package ike
 
 import (
 	"net"
+	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,5 +149,84 @@ func TestSendRecvAcceptsNilAsAlwaysTrue(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("sendRecv with nil accept did not return")
+	}
+}
+
+func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	s := &Session{
+		mux: mux, suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+		skei: make([]byte, 20), sker: make([]byte, 20),
+		requests: make(chan *localRequest, 1),
+	}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+
+	var ids []uint32
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		buf := make([]byte, 2048)
+		for range 2 {
+			n, addr, err := peer.ReadFromUDP(buf)
+			if err != nil {
+				t.Errorf("read request: %v", err)
+				return
+			}
+			raw := append([]byte(nil), buf[4:n]...)
+			m, err := DecodeMessage(raw)
+			if err != nil {
+				t.Errorf("decode request: %v", err)
+				return
+			}
+			if _, err := DecryptMessage(suite, s.skei, raw, m); err != nil {
+				t.Errorf("decrypt request: %v", err)
+				return
+			}
+			ids = append(ids, m.Header.MessageID)
+			response, err := EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: m.Header.ExchangeType, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, nil)
+			if err != nil {
+				t.Errorf("encrypt response: %v", err)
+				return
+			}
+			if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+				t.Errorf("write response: %v", err)
+				return
+			}
+		}
+	}()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.request(INFORMATIONAL, nil); err != nil {
+				t.Errorf("request: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	<-peerDone
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if len(ids) != 2 || ids[0] != 2 || ids[1] != 3 {
+		t.Fatalf("local message IDs = %v, want [2 3]", ids)
+	}
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
 	}
 }

@@ -44,18 +44,23 @@ type ChildSA = esp.ChildSA
 // still service the peer's INFORMATIONAL exchanges (DPD liveness checks,
 // deletes) for as long as the ESP Child SA is in use.
 type Session struct {
-	mux     *transport.Mux
-	suite   SASuite
-	skD     []byte
-	skai    []byte // unused (AEAD ciphers derive no integrity keys)
-	skei    []byte
-	sker    []byte
-	skpi    []byte
-	skpr    []byte
-	spiI    uint64
-	spiR    uint64
-	selfMID uint32 // next Message ID *we* allocate for a self-initiated request
-	peerMID uint32 // next Message ID expected from a peer-initiated request
+	mux                *transport.Mux
+	suite              SASuite
+	skD                []byte
+	skai               []byte // unused (AEAD ciphers derive no integrity keys)
+	skei               []byte
+	sker               []byte
+	skpi               []byte
+	skpr               []byte
+	spiI               uint64
+	spiR               uint64
+	nextLocalMID       uint32 // next Message ID *we* allocate for a self-initiated request
+	nextPeerMID        uint32 // next Message ID expected from a peer-initiated request
+	lastPeerResponseID uint32
+	lastPeerResponse   []byte
+
+	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
+	requests  chan *localRequest
 
 	childMu sync.RWMutex
 	Child   ChildSA
@@ -333,7 +338,8 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	sess := &Session{
 		mux: mux, suite: suite,
 		skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr,
-		spiI: spiI, spiR: spiR, selfMID: 2, peerMID: 0,
+		spiI: spiI, spiR: spiR, nextLocalMID: 2, nextPeerMID: 0,
+		requests: make(chan *localRequest, 1),
 	}
 
 	if err := sess.doIKEAuth(cfg, req, respRaw, ni, nr); err != nil {

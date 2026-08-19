@@ -9,7 +9,30 @@ import (
 	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
-const dpdInterval = 10 * time.Second
+const (
+	dpdInterval         = 10 * time.Second
+	requestPollInterval = 100 * time.Millisecond
+)
+
+type localRequest struct {
+	exchange ExchangeType
+	inner    []RawPayload
+	result   chan requestResult
+	dpd      bool
+}
+
+type requestResult struct {
+	inner []RawPayload
+	err   error
+}
+
+type pendingRequest struct {
+	localRequest
+	msgID    uint32
+	raw      []byte
+	attempts int
+	deadline time.Time
+}
 
 func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 	for i := range payloads {
@@ -20,37 +43,116 @@ func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 	return nil
 }
 
-// Run is the sole post-handshake IKE receiver. It handles peer requests and
-// probes with an encrypted empty INFORMATIONAL exchange after an idle period.
+// Run is the sole post-handshake IKE receiver. It dispatches authenticated
+// peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run() error {
 	lastAuthenticated := time.Now()
+	var pending *pendingRequest
 	for {
 		if nanos := s.lastTraffic.Load(); nanos != 0 {
 			if traffic := time.Unix(0, nanos); traffic.After(lastAuthenticated) {
 				lastAuthenticated = traffic
 			}
 		}
-		raw, err := s.mux.RecvIKEUntil(lastAuthenticated.Add(dpdInterval))
+		if pending == nil {
+			select {
+			case req := <-s.requests:
+				var err error
+				pending, err = s.startRequest(req)
+				if err != nil {
+					req.result <- requestResult{err: err}
+				}
+			default:
+			}
+		}
+
+		deadline := lastAuthenticated.Add(dpdInterval)
+		if pending != nil && pending.deadline.Before(deadline) {
+			deadline = pending.deadline
+		}
+		// Mux has no selectable receive channel. Polling avoids another receiver.
+		if poll := time.Now().Add(requestPollInterval); poll.Before(deadline) {
+			deadline = poll
+		}
+		raw, err := s.mux.RecvIKEUntil(deadline)
 		if err != nil {
 			if !transport.IsTimeout(err) {
+				if pending != nil {
+					pending.result <- requestResult{err: err}
+				}
 				return err
 			}
-			if err := s.probe(); err != nil {
-				s.mux.Close()
-				return fmt.Errorf("ike: DPD failed: %w", err)
+			if pending != nil && !time.Now().Before(pending.deadline) {
+				if pending.attempts == maxRetransmits {
+					if pending.dpd {
+						s.mux.Close()
+						return fmt.Errorf("ike: DPD failed: no response after %d attempts", maxRetransmits)
+					}
+					pending.result <- requestResult{err: fmt.Errorf("no response after %d attempts", maxRetransmits)}
+					pending = nil
+				} else if err := s.sendPending(pending); err != nil {
+					if pending.dpd {
+						s.mux.Close()
+						return fmt.Errorf("ike: DPD failed: %w", err)
+					}
+					pending.result <- requestResult{err: err}
+					pending = nil
+				}
+				continue
 			}
-			lastAuthenticated = time.Now()
+			if pending == nil && !time.Now().Before(lastAuthenticated.Add(dpdInterval)) {
+				pending, err = s.startRequest(&localRequest{exchange: INFORMATIONAL, result: make(chan requestResult, 1), dpd: true})
+				if err != nil {
+					s.mux.Close()
+					return fmt.Errorf("ike: DPD failed: %w", err)
+				}
+			}
 			continue
 		}
-		if s.handle(raw) {
+		if s.dispatch(raw, &pending) {
 			lastAuthenticated = time.Now()
 		}
 	}
 }
 
-func (s *Session) handle(raw []byte) bool {
+// request starts a serialized local exchange through Run. Future Child SA
+// rekey support uses this path rather than receiving directly from the mux.
+func (s *Session) request(exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+	req := &localRequest{exchange: exchange, inner: inner, result: make(chan requestResult, 1)}
+	s.requests <- req
+	result := <-req.result
+	return result.inner, result.err
+}
+
+func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
+	msgID := s.nextLocalMID
+	s.nextLocalMID++
+	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
+	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, req.inner)
+	if err != nil {
+		return nil, err
+	}
+	pending := &pendingRequest{localRequest: *req, msgID: msgID, raw: raw}
+	if err := s.sendPending(pending); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+func (s *Session) sendPending(pending *pendingRequest) error {
+	if err := s.mux.SendIKE(pending.raw); err != nil {
+		return err
+	}
+	pending.attempts++
+	pending.deadline = time.Now().Add(requestTimeout)
+	return nil
+}
+
+func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	hdr, err := decodeHeader(raw)
-	if err != nil || hdr.SPIInitiator != s.spiI || hdr.SPIResponder != s.spiR || hdr.IsInitiator() || hdr.IsResponse() {
+	if err != nil || hdr.SPIInitiator != s.spiI || hdr.SPIResponder != s.spiR {
 		return false
 	}
 	outer, err := DecodeMessage(raw)
@@ -61,13 +163,44 @@ func (s *Session) handle(raw []byte) bool {
 	if err != nil {
 		return false
 	}
-	if err := s.handleRequest(hdr, inner); err != nil {
-		s.mux.Close()
+	if hdr.IsResponse() && !hdr.IsInitiator() {
+		if current := *pending; current != nil && hdr.MessageID == current.msgID && hdr.ExchangeType == current.exchange {
+			current.result <- requestResult{inner: inner}
+			*pending = nil
+			return true
+		}
+		return false
 	}
+	if hdr.IsInitiator() || hdr.IsResponse() {
+		return false
+	}
+	if hdr.MessageID != s.nextPeerMID {
+		if s.nextPeerMID > 0 && hdr.MessageID == s.nextPeerMID-1 && s.lastPeerResponseID == hdr.MessageID {
+			if err := s.mux.SendIKE(s.lastPeerResponse); err != nil {
+				s.mux.Close()
+			}
+		}
+		return true
+	}
+	response, err := s.handleRequest(hdr, inner)
+	if err != nil {
+		if response != nil {
+			_ = s.mux.SendIKE(response)
+		}
+		s.mux.Close()
+		return true
+	}
+	if err := s.mux.SendIKE(response); err != nil {
+		s.mux.Close()
+		return true
+	}
+	s.lastPeerResponseID = hdr.MessageID
+	s.lastPeerResponse = response
+	s.nextPeerMID++
 	return true
 }
 
-func (s *Session) handleRequest(hdr *Header, inner []RawPayload) error {
+func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error) {
 	if hdr.ExchangeType == INFORMATIONAL {
 		for _, p := range inner {
 			if p.Type != PayloadD {
@@ -75,36 +208,37 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) error {
 			}
 			d, err := DecodeDelete(p.Body)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if d.Protocol == ProtoIKE {
-				if err := s.respondEmpty(hdr.MessageID); err != nil {
-					return err
+				response, err := s.response(hdr.MessageID, INFORMATIONAL, nil)
+				if err != nil {
+					return nil, err
 				}
-				return fmt.Errorf("peer deleted IKE SA")
+				return response, fmt.Errorf("peer deleted IKE SA")
 			}
 			child := s.currentChild()
 			for _, spi := range d.SPIs {
 				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == child.RemoteSPI {
-					// RFC 7296 section 1.4.1: return the paired inbound SPI.
 					local := make([]byte, 4)
 					binary.BigEndian.PutUint32(local, child.LocalSPI)
-					if err := s.respond(hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}}); err != nil {
-						return err
+					response, err := s.response(hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
+					if err != nil {
+						return nil, err
 					}
-					return fmt.Errorf("peer deleted Child SA")
+					return response, fmt.Errorf("peer deleted Child SA")
 				}
 			}
 		}
-		return s.respondEmpty(hdr.MessageID)
+		return s.response(hdr.MessageID, INFORMATIONAL, nil)
 	}
 	if hdr.ExchangeType == CREATE_CHILD_SA {
 		return s.handleChildRekey(hdr.MessageID, inner)
 	}
-	return s.respondEmpty(hdr.MessageID)
+	return s.response(hdr.MessageID, INFORMATIONAL, nil)
 }
 
-func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) error {
+func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) ([]byte, error) {
 	var rekey Notify
 	var sa, nonce, tsi, tsr *RawPayload
 	for i := range inner {
@@ -112,7 +246,7 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) error {
 		case PayloadN:
 			n, err := DecodeNotify(inner[i].Body)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if n.Type == N_REKEY_SA {
 				rekey = n
@@ -129,100 +263,50 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) error {
 	}
 	child := s.currentChild()
 	if rekey.Type != N_REKEY_SA || rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
-		return s.respondNotify(msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
+		return s.responseNotify(msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
 	}
-	// This minimal profile negotiates no Child-SA PFS, matching IKE_AUTH.
 	if sa == nil || nonce == nil || tsi == nil || tsr == nil || len(nonce.Body) == 0 || findType(inner, PayloadKE) != nil {
-		return s.respondNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	props, err := DecodeSA(sa.Body)
 	if err != nil || len(props) != 1 || len(props[0].SPI) != 4 {
-		return s.respondNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	encr, ok := props[0].ChosenTransform(TransEncr)
 	if !ok || encr.ID != child.EncrID || encr.KeyLengthBits != child.EncrKeyBits {
-		return s.respondNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	var spi [4]byte
 	for binary.BigEndian.Uint32(spi[:]) == 0 {
 		if _, err := rand.Read(spi[:]); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	nr := make([]byte, 32)
 	if _, err := rand.Read(nr); err != nil {
-		return err
+		return nil, err
 	}
 	initKey, respKey, err := ChildSAKeymat(s.suite.PRFID, s.skD, nonce.Body, nr, encr.ID, encr.KeyLengthBits)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// The peer initiated this exchange, so initiator->responder keying is inbound.
 	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: binary.BigEndian.Uint32(props[0].SPI), InboundKey: initKey, OutboundKey: respKey}
 	if err := s.replaceChild(replacement); err != nil {
-		return err
+		return nil, err
 	}
 	response := Proposal{Number: props[0].Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{{Type: TransEncr, ID: encr.ID, KeyLengthBits: encr.KeyLengthBits}, {Type: TransESN, ID: ESN_NO}}}
-	return s.respond(msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: tsi.Body}, {Type: PayloadTSr, Body: tsr.Body}})
+	return s.response(msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: tsi.Body}, {Type: PayloadTSr, Body: tsr.Body}})
 }
 
-func (s *Session) probe() error {
-	msgID := s.selfMID
-	s.selfMID++
-	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: msgID}
-	req, err := EncryptMessage(s.suite, s.skei, hdr, nil, nil)
-	if err != nil {
-		return err
-	}
-	for attempt := 0; attempt < maxRetransmits; attempt++ {
-		if err := s.mux.SendIKE(req); err != nil {
-			return err
-		}
-		deadline := time.Now().Add(requestTimeout)
-		for {
-			raw, err := s.mux.RecvIKEUntil(deadline)
-			if err != nil {
-				break
-			}
-			h, err := decodeHeader(raw)
-			if err != nil || h.SPIInitiator != s.spiI || h.SPIResponder != s.spiR {
-				continue
-			}
-			if h.IsResponse() && h.MessageID == msgID && h.ExchangeType == INFORMATIONAL {
-				m, err := DecodeMessage(raw)
-				if err == nil {
-					_, err = DecryptMessage(s.suite, s.sker, raw, m)
-				}
-				if err == nil {
-					return nil
-				}
-				continue
-			}
-			if !h.IsInitiator() && !h.IsResponse() {
-				if m, err := DecodeMessage(raw); err == nil {
-					if inner, err := DecryptMessage(s.suite, s.sker, raw, m); err == nil {
-						if err := s.handleRequest(h, inner); err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
-	}
-	return fmt.Errorf("no response after %d attempts", maxRetransmits)
-}
-
-func (s *Session) respond(msgID uint32, exchange ExchangeType, inner []RawPayload) error {
+func (s *Session) response(msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {
 	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: exchange, Flags: FlagInitiator | FlagResponse, MessageID: msgID}
 	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, inner)
 	if err != nil {
-		return fmt.Errorf("ike: build response: %w", err)
+		return nil, fmt.Errorf("ike: build response: %w", err)
 	}
-	return s.mux.SendIKE(raw)
+	return raw, nil
 }
 
-func (s *Session) respondEmpty(msgID uint32) error { return s.respond(msgID, INFORMATIONAL, nil) }
-
-func (s *Session) respondNotify(msgID uint32, exchange ExchangeType, notifyType NotifyType) error {
-	return s.respond(msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}})
+func (s *Session) responseNotify(msgID uint32, exchange ExchangeType, notifyType NotifyType) ([]byte, error) {
+	return s.response(msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}})
 }
