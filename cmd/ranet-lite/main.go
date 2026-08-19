@@ -215,6 +215,28 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 	return nil
 }
 
+func validateESPTunnelPayload(plain []byte, nextHeader byte) (bool, error) {
+	if nextHeader == esp.NextHeaderNone {
+		return false, nil
+	}
+	if len(plain) == 0 {
+		return false, fmt.Errorf("empty tunnel payload")
+	}
+	switch nextHeader {
+	case esp.NextHeaderIPv4:
+		if plain[0]>>4 != 4 {
+			return false, fmt.Errorf("ESP Next Header is IPv4 but inner version is %d", plain[0]>>4)
+		}
+	case esp.NextHeaderIPv6:
+		if plain[0]>>4 != 6 {
+			return false, fmt.Errorf("ESP Next Header is IPv6 but inner version is %d", plain[0]>>4)
+		}
+	default:
+		return false, fmt.Errorf("unsupported ESP Next Header %d", nextHeader)
+	}
+	return true, nil
+}
+
 // runPeer maintains one peer connection for the client's lifetime,
 // reconnecting on any failure (network blip, peer restart, etc.) rather
 // than requiring a manual restart.
@@ -387,6 +409,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	// emitter delivers packets in their original arrival order.
 	type decrypted struct {
 		plain []byte
+		nh    byte
 		err   error
 	}
 	order := make(chan chan decrypted, orderBufferSize)
@@ -398,6 +421,14 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 			r := <-slot
 			if r.err != nil {
 				log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
+				continue
+			}
+			deliver, err := validateESPTunnelPayload(r.plain, r.nh)
+			if err != nil {
+				log.Printf("peer %s: dropping invalid ESP tunnel payload: %v", name, err)
+				continue
+			}
+			if !deliver {
 				continue
 			}
 			if !speaker.Receive(peer, r.plain) {
@@ -423,9 +454,10 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 				candidates := append([]inboundSA(nil), inbound...)
 				saMu.RUnlock()
 				var plain []byte
+				var nextHeader byte
 				var err error
 				for _, candidate := range candidates {
-					plain, _, err = candidate.sa.Open(pkt)
+					plain, nextHeader, err = candidate.sa.Open(pkt)
 					if err == nil {
 						break
 					}
@@ -433,7 +465,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 				if err == nil {
 					sess.NoteTraffic()
 				}
-				slot <- decrypted{plain: plain, err: err}
+				slot <- decrypted{plain: plain, nh: nextHeader, err: err}
 			}(pkt, slot)
 		}
 	}

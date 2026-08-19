@@ -18,6 +18,7 @@ import (
 const (
 	NextHeaderIPv4 = 4
 	NextHeaderIPv6 = 41
+	NextHeaderNone = 59
 
 	headerLen = 8 // SPI + 32-bit Sequence Number
 )

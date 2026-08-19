@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"testing"
 
+	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
@@ -52,5 +53,28 @@ func TestValidateRuntimeConfig(t *testing.T) {
 	cfg.Peers[0].SerialNumber = "missing"
 	if err := validateRuntimeConfig(cfg, privateKey, reg); err == nil {
 		t.Fatal("accepted a peer endpoint missing from the registry")
+	}
+}
+
+func TestValidateESPTunnelPayload(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		plain   []byte
+		nh      byte
+		deliver bool
+		wantErr bool
+	}{
+		{name: "IPv4", plain: []byte{0x45}, nh: esp.NextHeaderIPv4, deliver: true},
+		{name: "IPv6", plain: []byte{0x60}, nh: esp.NextHeaderIPv6, deliver: true},
+		{name: "dummy", plain: []byte{0x60}, nh: esp.NextHeaderNone},
+		{name: "version mismatch", plain: []byte{0x60}, nh: esp.NextHeaderIPv4, wantErr: true},
+		{name: "unsupported", plain: []byte{0x45}, nh: 6, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deliver, err := validateESPTunnelPayload(test.plain, test.nh)
+			if (err != nil) != test.wantErr || deliver != test.deliver {
+				t.Fatalf("got deliver=%v err=%v; want deliver=%v err=%v", deliver, err, test.deliver, test.wantErr)
+			}
+		})
 	}
 }
