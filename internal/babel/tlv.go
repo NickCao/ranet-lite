@@ -73,10 +73,9 @@ func DecodePacket(b []byte) ([]RawTLV, error) {
 	if b[0] != Magic {
 		return nil, fmt.Errorf("babel: bad magic %d", b[0])
 	}
-	// Version is not checked strictly: RFC 8966 §4.2 says implementations
-	// MUST ignore packets with an unknown version in the *TLV* sense only
-	// if they can't parse it; since our TLV framing is version-independent
-	// so far, we just proceed.
+	if b[1] != Version {
+		return nil, fmt.Errorf("babel: unsupported version %d", b[1])
+	}
 	bodyLen := binary.BigEndian.Uint16(b[2:4])
 	if int(headerLen)+int(bodyLen) > len(b) {
 		return nil, fmt.Errorf("babel: body length %d exceeds packet size", bodyLen)

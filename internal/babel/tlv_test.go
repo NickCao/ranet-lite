@@ -201,3 +201,11 @@ func TestDecodePacketSkipsPadding(t *testing.T) {
 		t.Fatalf("expected only the Ack TLV to survive, got %+v", got)
 	}
 }
+
+func TestDecodePacketRejectsUnsupportedVersion(t *testing.T) {
+	packet := EncodePacket(nil)
+	packet[1] = Version + 1
+	if _, err := DecodePacket(packet); err == nil {
+		t.Fatal("DecodePacket accepted an unsupported version")
+	}
+}

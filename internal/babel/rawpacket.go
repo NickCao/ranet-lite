@@ -15,10 +15,10 @@ import (
 // the *routes it learns* go into the shared netstack.RouteTable.
 
 const (
-	nextHeaderUDP  = 17
-	ipv6HeaderLen  = 40
-	udpHeaderLen   = 8
-	babelHopLimit  = 1 // link-local multicast must not be forwarded, RFC 8966 §4.1
+	nextHeaderUDP = 17
+	ipv6HeaderLen = 40
+	udpHeaderLen  = 8
+	babelHopLimit = 1 // link-local multicast must not be forwarded, RFC 8966 §4.1
 )
 
 // buildPacket wraps a Babel payload in a minimal IPv6+UDP packet.
@@ -54,18 +54,41 @@ func parsePacket(raw []byte) (src netip.Addr, payload []byte, err error) {
 	if raw[6] != nextHeaderUDP {
 		return netip.Addr{}, nil, fmt.Errorf("babel: not UDP")
 	}
+	payloadLen := int(binary.BigEndian.Uint16(raw[4:6]))
+	if payloadLen < udpHeaderLen || ipv6HeaderLen+payloadLen != len(raw) {
+		return netip.Addr{}, nil, fmt.Errorf("babel: invalid IPv6 payload length")
+	}
 	srcAddr, ok := netip.AddrFromSlice(raw[8:24])
 	if !ok {
 		return netip.Addr{}, nil, fmt.Errorf("babel: bad source address")
 	}
+	if !srcAddr.Is6() || !srcAddr.IsLinkLocalUnicast() {
+		return netip.Addr{}, nil, fmt.Errorf("babel: source is not IPv6 link-local")
+	}
+	dstAddr, ok := netip.AddrFromSlice(raw[24:40])
+	if !ok || dstAddr != multicastGroup {
+		return netip.Addr{}, nil, fmt.Errorf("babel: wrong multicast destination")
+	}
 	udp := raw[ipv6HeaderLen:]
+	if binary.BigEndian.Uint16(udp[0:2]) != Port {
+		return netip.Addr{}, nil, fmt.Errorf("babel: wrong UDP source port")
+	}
 	dport := binary.BigEndian.Uint16(udp[2:4])
 	if dport != Port {
 		return netip.Addr{}, nil, fmt.Errorf("babel: not addressed to the babel port")
 	}
 	udpLen := int(binary.BigEndian.Uint16(udp[4:6]))
-	if udpLen < udpHeaderLen || ipv6HeaderLen+udpLen > len(raw) {
+	if udpLen != payloadLen {
 		return netip.Addr{}, nil, fmt.Errorf("babel: invalid UDP length")
+	}
+	receivedChecksum := binary.BigEndian.Uint16(udp[6:8])
+	if receivedChecksum == 0 {
+		return netip.Addr{}, nil, fmt.Errorf("babel: missing IPv6 UDP checksum")
+	}
+	checksumInput := append([]byte(nil), udp...)
+	checksumInput[6], checksumInput[7] = 0, 0
+	if udpChecksum(srcAddr, dstAddr, checksumInput) != receivedChecksum {
+		return netip.Addr{}, nil, fmt.Errorf("babel: invalid UDP checksum")
 	}
 	return srcAddr, udp[udpHeaderLen:udpLen], nil
 }
