@@ -40,24 +40,32 @@ type PeerConfig struct {
 // the esp package after a successful handshake.
 type ChildSA = esp.ChildSA
 
+// ikeContext contains the state bound to one IKE SA's SPI pair. During an IKE
+// SA rekey, Session keeps the replaced context until its transition completes.
+type ikeContext struct {
+	suite SASuite
+	skD   []byte
+	skai  []byte // unused (AEAD ciphers derive no integrity keys)
+	skei  []byte
+	sker  []byte
+	skpi  []byte
+	skpr  []byte
+	spiI  uint64
+	spiR  uint64
+
+	nextLocalMID       uint32 // next Message ID we allocate for a local request
+	nextPeerMID        uint32 // next Message ID expected from a peer request
+	lastPeerResponseID uint32
+	lastPeerResponse   []byte
+}
+
 // Session is an established IKE SA: it owns the shared UDP mux and can
 // still service the peer's INFORMATIONAL exchanges (DPD liveness checks,
 // deletes) for as long as the ESP Child SA is in use.
 type Session struct {
-	mux                *transport.Mux
-	suite              SASuite
-	skD                []byte
-	skai               []byte // unused (AEAD ciphers derive no integrity keys)
-	skei               []byte
-	sker               []byte
-	skpi               []byte
-	skpr               []byte
-	spiI               uint64
-	spiR               uint64
-	nextLocalMID       uint32 // next Message ID *we* allocate for a self-initiated request
-	nextPeerMID        uint32 // next Message ID expected from a peer-initiated request
-	lastPeerResponseID uint32
-	lastPeerResponse   []byte
+	mux     *transport.Mux
+	current *ikeContext
+	old     *ikeContext
 
 	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
 	requests  chan *localRequest
@@ -375,9 +383,10 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 
 	sess := &Session{
-		mux: mux, suite: suite,
-		skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr,
-		spiI: spiI, spiR: spiR, nextLocalMID: 2, nextPeerMID: 0,
+		mux: mux,
+		current: &ikeContext{suite: suite,
+			skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr,
+			spiI: spiI, spiR: spiR, nextLocalMID: 2},
 		requests: make(chan *localRequest, 1),
 	}
 
@@ -422,7 +431,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	idiBody := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.LocalCommonName, cfg.LocalSerial))
 	idrBody := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.RemoteCommonName, cfg.RemoteSerial))
 
-	macedIDForI := prf(s.suite.PRFID, s.skpi, idiBody)
+	macedIDForI := prf(s.current.suite.PRFID, s.current.skpi, idiBody)
 	signedOctets := concat(realMessage1, nr, macedIDForI)
 	authBody := BuildAuth(cfg.LocalPrivateKey, signedOctets)
 
@@ -435,8 +444,8 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		{Type: PayloadTSi, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
 		{Type: PayloadTSr, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
 	}
-	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: IKE_AUTH, Flags: FlagInitiator, MessageID: 1}
-	req, err := EncryptMessage(s.suite, s.skei, hdr, nil, inner)
+	hdr := Header{SPIInitiator: s.current.spiI, SPIResponder: s.current.spiR, ExchangeType: IKE_AUTH, Flags: FlagInitiator, MessageID: 1}
+	req, err := EncryptMessage(s.current.suite, s.current.skei, hdr, nil, inner)
 	if err != nil {
 		return err
 	}
@@ -456,7 +465,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	if err != nil {
 		return fmt.Errorf("ike: decode IKE_AUTH response: %w", err)
 	}
-	respInner, err := DecryptMessage(s.suite, s.sker, respRaw, resp)
+	respInner, err := DecryptMessage(s.current.suite, s.current.sker, respRaw, resp)
 	if err != nil {
 		return err
 	}
@@ -480,7 +489,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	if idrRecv == nil || authRecv == nil || saRecv == nil {
 		return fmt.Errorf("ike: incomplete IKE_AUTH response")
 	}
-	macedIDForR := prf(s.suite.PRFID, s.skpr, idrRecv.Body)
+	macedIDForR := prf(s.current.suite.PRFID, s.current.skpr, idrRecv.Body)
 	responderSigned := concat(realMessage2, ni, macedIDForR)
 	if err := VerifyAuth(cfg.RemotePublicKey, responderSigned, authRecv.Body); err != nil {
 		return err
@@ -504,7 +513,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	}
 	remoteSPI := binary.BigEndian.Uint32(cp.SPI)
 
-	initKey, respKey, err := ChildSAKeymat(s.suite.PRFID, s.skD, ni, nr, encr.ID, kb)
+	initKey, respKey, err := ChildSAKeymat(s.current.suite.PRFID, s.current.skD, ni, nr, encr.ID, kb)
 	if err != nil {
 		return err
 	}

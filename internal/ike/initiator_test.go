@@ -39,8 +39,9 @@ func TestSessionRekeyChild(t *testing.T) {
 	const newRemoteSPI = 0x90a0b0c0
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	s := &Session{
-		mux: mux, suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
-		skei: make([]byte, 20), sker: make([]byte, 20), skD: []byte("test child rekey SK_d material"),
+		mux: mux,
+		current: &ikeContext{suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+			skei: make([]byte, 20), sker: make([]byte, 20), skD: []byte("test child rekey SK_d material")},
 		Child:    ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: oldLocalSPI, RemoteSPI: oldRemoteSPI},
 		requests: make(chan *localRequest, 1),
 	}
@@ -68,7 +69,7 @@ func TestSessionRekeyChild(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 			return
 		}
-		inner, err := DecryptMessage(suite, s.skei, raw, m)
+		inner, err := DecryptMessage(suite, s.current.skei, raw, m)
 		if err != nil {
 			t.Errorf("decrypt request: %v", err)
 			return
@@ -103,7 +104,7 @@ func TestSessionRekeyChild(t *testing.T) {
 		remoteSPI := make([]byte, 4)
 		binary.BigEndian.PutUint32(remoteSPI, newRemoteSPI)
 		nr := []byte("responder nonce for child rekey")
-		response, err := EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
+		response, err := EncryptMessage(suite, s.current.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
 			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: remoteSPI, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}}}})},
 			{Type: PayloadNonce, Body: EncodeNonce(nr)},
 			{Type: PayloadTSi, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
@@ -128,7 +129,7 @@ func TestSessionRekeyChild(t *testing.T) {
 			t.Errorf("decode delete request: %v", err)
 			return
 		}
-		inner, err = DecryptMessage(suite, s.skei, raw, m)
+		inner, err = DecryptMessage(suite, s.current.skei, raw, m)
 		if err != nil {
 			t.Errorf("decrypt delete request: %v", err)
 			return
@@ -145,7 +146,7 @@ func TestSessionRekeyChild(t *testing.T) {
 		}
 		remote := make([]byte, 4)
 		binary.BigEndian.PutUint32(remote, oldRemoteSPI)
-		response, err = EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{remote}})}})
+		response, err = EncryptMessage(suite, s.current.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{remote}})}})
 		if err != nil {
 			t.Errorf("encrypt delete response: %v", err)
 			return
@@ -317,8 +318,9 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 	const spiR = 0x1112131415161718
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
 	s := &Session{
-		mux: mux, suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
-		skei: make([]byte, 20), sker: make([]byte, 20),
+		mux: mux,
+		current: &ikeContext{suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+			skei: make([]byte, 20), sker: make([]byte, 20)},
 		requests: make(chan *localRequest, 1),
 	}
 	if err := mux.RegisterIKE(spiI); err != nil {
@@ -342,12 +344,12 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 				t.Errorf("decode request: %v", err)
 				return
 			}
-			if _, err := DecryptMessage(suite, s.skei, raw, m); err != nil {
+			if _, err := DecryptMessage(suite, s.current.skei, raw, m); err != nil {
 				t.Errorf("decrypt request: %v", err)
 				return
 			}
 			ids = append(ids, m.Header.MessageID)
-			response, err := EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: m.Header.ExchangeType, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, nil)
+			response, err := EncryptMessage(suite, s.current.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: m.Header.ExchangeType, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, nil)
 			if err != nil {
 				t.Errorf("encrypt response: %v", err)
 				return
@@ -376,6 +378,62 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	if len(ids) != 2 || ids[0] != 2 || ids[1] != 3 {
 		t.Fatalf("local message IDs = %v, want [2 3]", ids)
+	}
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
+	}
+}
+
+func TestSessionRunUsesOldIKEContext(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	current := &ikeContext{suite: suite, spiI: 0x0102030405060708, spiR: 0x1112131415161718, skei: make([]byte, 20), sker: make([]byte, 20)}
+	old := &ikeContext{suite: suite, spiI: 0x2122232425262728, spiR: 0x3132333435363738, skei: []byte("old initiator key---"), sker: []byte("old responder key---")}
+	s := &Session{mux: mux, current: current, old: old, requests: make(chan *localRequest, 1)}
+	if err := mux.RegisterIKE(current.spiI); err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.RegisterIKE(old.spiI); err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+	request, err := EncryptMessage(old.suite, old.sker, Header{SPIInitiator: old.spiI, SPIResponder: old.spiR, ExchangeType: INFORMATIONAL, MessageID: 0}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), mux.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 2048)
+	peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw := append([]byte(nil), buf[4:n]...)
+	response, err := DecodeMessage(responseRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Header.SPIInitiator != old.spiI || response.Header.SPIResponder != old.spiR {
+		t.Fatalf("response SPI pair = %016x/%016x, want old %016x/%016x", response.Header.SPIInitiator, response.Header.SPIResponder, old.spiI, old.spiR)
+	}
+	if _, err := DecryptMessage(old.suite, old.skei, responseRaw, response); err != nil {
+		t.Fatalf("decrypt old-context response: %v", err)
+	}
+	if old.nextPeerMID != 1 || current.nextPeerMID != 0 {
+		t.Fatalf("peer message IDs old/current = %d/%d, want 1/0", old.nextPeerMID, current.nextPeerMID)
 	}
 	_ = mux.Close()
 	if err := <-runDone; err == nil {

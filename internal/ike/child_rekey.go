@@ -98,7 +98,7 @@ func (s *Session) RekeyChild() error {
 	if remoteSPI == 0 {
 		return fmt.Errorf("ike: Child SA rekey returned zero SPI")
 	}
-	initKey, respKey, err := ChildSAKeymat(s.suite.PRFID, s.skD, nonce, nr.Body, encr.ID, encr.KeyLengthBits)
+	initKey, respKey, err := ChildSAKeymat(s.current.suite.PRFID, s.current.skD, nonce, nr.Body, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return err
 	}

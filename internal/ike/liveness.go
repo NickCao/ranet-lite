@@ -28,6 +28,7 @@ type requestResult struct {
 
 type pendingRequest struct {
 	localRequest
+	context  *ikeContext
 	msgID    uint32
 	raw      []byte
 	attempts int
@@ -127,14 +128,14 @@ func (s *Session) request(exchange ExchangeType, inner []RawPayload) ([]RawPaylo
 }
 
 func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
-	msgID := s.nextLocalMID
-	s.nextLocalMID++
-	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
-	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, req.inner)
+	msgID := s.current.nextLocalMID
+	s.current.nextLocalMID++
+	hdr := Header{SPIInitiator: s.current.spiI, SPIResponder: s.current.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
+	raw, err := EncryptMessage(s.current.suite, s.current.skei, hdr, nil, req.inner)
 	if err != nil {
 		return nil, err
 	}
-	pending := &pendingRequest{localRequest: *req, msgID: msgID, raw: raw}
+	pending := &pendingRequest{localRequest: *req, context: s.current, msgID: msgID, raw: raw}
 	if err := s.sendPending(pending); err != nil {
 		return nil, err
 	}
@@ -152,19 +153,23 @@ func (s *Session) sendPending(pending *pendingRequest) error {
 
 func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	hdr, err := decodeHeader(raw)
-	if err != nil || hdr.SPIInitiator != s.spiI || hdr.SPIResponder != s.spiR {
+	if err != nil {
+		return false
+	}
+	ctx := s.contextForHeader(hdr)
+	if ctx == nil {
 		return false
 	}
 	outer, err := DecodeMessage(raw)
 	if err != nil {
 		return false
 	}
-	inner, err := DecryptMessage(s.suite, s.sker, raw, outer)
+	inner, err := DecryptMessage(ctx.suite, ctx.sker, raw, outer)
 	if err != nil {
 		return false
 	}
 	if hdr.IsResponse() && !hdr.IsInitiator() {
-		if current := *pending; current != nil && hdr.MessageID == current.msgID && hdr.ExchangeType == current.exchange {
+		if current := *pending; current != nil && current.context == ctx && hdr.MessageID == current.msgID && hdr.ExchangeType == current.exchange {
 			current.result <- requestResult{inner: inner}
 			*pending = nil
 			return true
@@ -174,15 +179,15 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	if hdr.IsInitiator() || hdr.IsResponse() {
 		return false
 	}
-	if hdr.MessageID != s.nextPeerMID {
-		if s.nextPeerMID > 0 && hdr.MessageID == s.nextPeerMID-1 && s.lastPeerResponseID == hdr.MessageID {
-			if err := s.mux.SendIKE(s.lastPeerResponse); err != nil {
+	if hdr.MessageID != ctx.nextPeerMID {
+		if ctx.nextPeerMID > 0 && hdr.MessageID == ctx.nextPeerMID-1 && ctx.lastPeerResponseID == hdr.MessageID {
+			if err := s.mux.SendIKE(ctx.lastPeerResponse); err != nil {
 				s.mux.Close()
 			}
 		}
 		return true
 	}
-	response, err := s.handleRequest(hdr, inner)
+	response, err := s.handleRequest(ctx, hdr, inner)
 	if err != nil {
 		if response != nil {
 			_ = s.mux.SendIKE(response)
@@ -194,13 +199,23 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 		s.mux.Close()
 		return true
 	}
-	s.lastPeerResponseID = hdr.MessageID
-	s.lastPeerResponse = response
-	s.nextPeerMID++
+	ctx.lastPeerResponseID = hdr.MessageID
+	ctx.lastPeerResponse = response
+	ctx.nextPeerMID++
 	return true
 }
 
-func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error) {
+func (s *Session) contextForHeader(hdr *Header) *ikeContext {
+	if hdr.SPIInitiator == s.current.spiI && hdr.SPIResponder == s.current.spiR {
+		return s.current
+	}
+	if s.old != nil && hdr.SPIInitiator == s.old.spiI && hdr.SPIResponder == s.old.spiR {
+		return s.old
+	}
+	return nil
+}
+
+func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload) ([]byte, error) {
 	if hdr.ExchangeType == INFORMATIONAL {
 		for _, p := range inner {
 			if p.Type != PayloadD {
@@ -211,7 +226,7 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 				return nil, err
 			}
 			if d.Protocol == ProtoIKE {
-				response, err := s.response(hdr.MessageID, INFORMATIONAL, nil)
+				response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -223,7 +238,7 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == child.RemoteSPI {
 					local := make([]byte, 4)
 					binary.BigEndian.PutUint32(local, child.LocalSPI)
-					response, err := s.response(hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
+					response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
 					if err != nil {
 						return nil, err
 					}
@@ -232,7 +247,7 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == retiring.RemoteSPI {
 					local := make([]byte, 4)
 					binary.BigEndian.PutUint32(local, retiring.LocalSPI)
-					response, err := s.response(hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
+					response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
 					if err != nil {
 						return nil, err
 					}
@@ -243,15 +258,15 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 				}
 			}
 		}
-		return s.response(hdr.MessageID, INFORMATIONAL, nil)
+		return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
 	}
 	if hdr.ExchangeType == CREATE_CHILD_SA {
-		return s.handleChildRekey(hdr.MessageID, inner)
+		return s.handleChildRekey(ctx, hdr.MessageID, inner)
 	}
-	return s.response(hdr.MessageID, INFORMATIONAL, nil)
+	return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
 }
 
-func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) ([]byte, error) {
+func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
 	var rekey Notify
 	var sa, nonce, tsi, tsr *RawPayload
 	for i := range inner {
@@ -276,18 +291,18 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) ([]byte, er
 	}
 	child := s.currentChild()
 	if rekey.Type != N_REKEY_SA || rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
-		return s.responseNotify(msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
 	}
 	if sa == nil || nonce == nil || tsi == nil || tsr == nil || len(nonce.Body) == 0 || findType(inner, PayloadKE) != nil {
-		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	props, err := DecodeSA(sa.Body)
 	if err != nil || len(props) != 1 || len(props[0].SPI) != 4 {
-		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	encr, ok := props[0].ChosenTransform(TransEncr)
 	if !ok || encr.ID != child.EncrID || encr.KeyLengthBits != child.EncrKeyBits {
-		return s.responseNotify(msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	var spi [4]byte
 	for binary.BigEndian.Uint32(spi[:]) == 0 {
@@ -299,7 +314,7 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) ([]byte, er
 	if _, err := rand.Read(nr); err != nil {
 		return nil, err
 	}
-	initKey, respKey, err := ChildSAKeymat(s.suite.PRFID, s.skD, nonce.Body, nr, encr.ID, encr.KeyLengthBits)
+	initKey, respKey, err := ChildSAKeymat(ctx.suite.PRFID, ctx.skD, nonce.Body, nr, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return nil, err
 	}
@@ -308,18 +323,18 @@ func (s *Session) handleChildRekey(msgID uint32, inner []RawPayload) ([]byte, er
 		return nil, err
 	}
 	response := Proposal{Number: props[0].Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{{Type: TransEncr, ID: encr.ID, KeyLengthBits: encr.KeyLengthBits}, {Type: TransESN, ID: ESN_NO}}}
-	return s.response(msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: tsi.Body}, {Type: PayloadTSr, Body: tsr.Body}})
+	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: tsi.Body}, {Type: PayloadTSr, Body: tsr.Body}})
 }
 
-func (s *Session) response(msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {
-	hdr := Header{SPIInitiator: s.spiI, SPIResponder: s.spiR, ExchangeType: exchange, Flags: FlagInitiator | FlagResponse, MessageID: msgID}
-	raw, err := EncryptMessage(s.suite, s.skei, hdr, nil, inner)
+func (s *Session) response(ctx *ikeContext, msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {
+	hdr := Header{SPIInitiator: ctx.spiI, SPIResponder: ctx.spiR, ExchangeType: exchange, Flags: FlagInitiator | FlagResponse, MessageID: msgID}
+	raw, err := EncryptMessage(ctx.suite, ctx.skei, hdr, nil, inner)
 	if err != nil {
 		return nil, fmt.Errorf("ike: build response: %w", err)
 	}
 	return raw, nil
 }
 
-func (s *Session) responseNotify(msgID uint32, exchange ExchangeType, notifyType NotifyType) ([]byte, error) {
-	return s.response(msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}})
+func (s *Session) responseNotify(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType) ([]byte, error) {
+	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}})
 }
