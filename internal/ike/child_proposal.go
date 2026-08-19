@@ -1,9 +1,28 @@
 package ike
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 )
+
+func fullRangeSelectors() []byte {
+	return EncodeTS([]TrafficSelector{FullRangeV4(), FullRangeV6()})
+}
+
+func validateFullRangeSelectors(tsi, tsr *RawPayload) error {
+	if tsi == nil || tsr == nil {
+		return fmt.Errorf("ike: Child SA exchange is missing traffic selectors")
+	}
+	want := fullRangeSelectors()
+	if _, err := DecodeTS(tsi.Body); err != nil || !bytes.Equal(tsi.Body, want) {
+		return fmt.Errorf("ike: unsupported initiator traffic selectors")
+	}
+	if _, err := DecodeTS(tsr.Body); err != nil || !bytes.Equal(tsr.Body, want) {
+		return fmt.Errorf("ike: unsupported responder traffic selectors")
+	}
+	return nil
+}
 
 type childExchangePayloads struct {
 	sa, nonce, tsi, tsr *RawPayload

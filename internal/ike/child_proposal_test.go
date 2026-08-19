@@ -53,3 +53,14 @@ func TestDecodeChildExchangePayloadsRejectsDuplicatesAndCriticalUnknowns(t *test
 		}
 	}
 }
+
+func TestValidateFullRangeSelectors(t *testing.T) {
+	want := fullRangeSelectors()
+	if err := validateFullRangeSelectors(&RawPayload{Body: want}, &RawPayload{Body: want}); err != nil {
+		t.Fatal(err)
+	}
+	narrow := EncodeTS([]TrafficSelector{FullRangeV4()})
+	if err := validateFullRangeSelectors(&RawPayload{Body: narrow}, &RawPayload{Body: want}); err == nil {
+		t.Fatal("accepted narrowed traffic selectors")
+	}
+}

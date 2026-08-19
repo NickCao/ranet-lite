@@ -618,6 +618,8 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	idrRecv := respMsg.find(PayloadIDr)
 	authRecv := respMsg.find(PayloadAUTH)
 	saRecv := respMsg.find(PayloadSA)
+	tsiRecv := respMsg.find(PayloadTSi)
+	tsrRecv := respMsg.find(PayloadTSr)
 	if saRecv == nil {
 		if n := respMsg.find(PayloadN); n != nil {
 			if nt, err := DecodeNotify(n.Body); err == nil {
@@ -625,12 +627,15 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 			}
 		}
 	}
-	if idrRecv == nil || authRecv == nil || saRecv == nil {
+	if idrRecv == nil || authRecv == nil || saRecv == nil || tsiRecv == nil || tsrRecv == nil {
 		return fmt.Errorf("ike: incomplete IKE_AUTH response")
 	}
 	macedIDForR := prf(s.current.suite.PRFID, s.current.skpr, idrRecv.Body)
 	responderSigned := concat(realMessage2, ni, macedIDForR)
 	if err := VerifyAuth(cfg.RemotePublicKey, responderSigned, authRecv.Body); err != nil {
+		return err
+	}
+	if err := validateFullRangeSelectors(tsiRecv, tsrRecv); err != nil {
 		return err
 	}
 

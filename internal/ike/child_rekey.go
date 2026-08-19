@@ -52,14 +52,8 @@ func (s *Session) RekeyChild() error {
 			return fmt.Errorf("ike: Child SA rekey rejected: notify type %d", notify.Type)
 		}
 	}
-	if _, err := DecodeTS(payloads.tsi.Body); err != nil {
-		return fmt.Errorf("ike: invalid Child SA rekey initiator selectors: %w", err)
-	}
-	if _, err := DecodeTS(payloads.tsr.Body); err != nil {
-		return fmt.Errorf("ike: invalid Child SA rekey responder selectors: %w", err)
-	}
-	if string(payloads.tsi.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) || string(payloads.tsr.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) {
-		return fmt.Errorf("ike: Child SA rekey response changed traffic selectors")
+	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
+		return err
 	}
 	_, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, &old)
 	if err != nil {

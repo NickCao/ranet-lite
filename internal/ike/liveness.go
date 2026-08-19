@@ -486,11 +486,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	if rekey.Type != N_REKEY_SA || rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
 	}
-	wantSelectors := EncodeTS([]TrafficSelector{FullRangeV4(), FullRangeV6()})
-	if _, err := DecodeTS(payloads.tsi.Body); err != nil || string(payloads.tsi.Body) != string(wantSelectors) {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	if _, err := DecodeTS(payloads.tsr.Body); err != nil || string(payloads.tsr.Body) != string(wantSelectors) {
+	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	p, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, &child)
