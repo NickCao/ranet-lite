@@ -111,3 +111,14 @@ func TestLoadRegistry(t *testing.T) {
 		t.Fatalf("got %v, want 192.0.2.1", ip)
 	}
 }
+
+func TestRegistryValidationRejectsDuplicateIdentities(t *testing.T) {
+	reg, err := Load("testdata/registry.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg = append(reg, reg[0])
+	if err := reg.Validate(); err == nil {
+		t.Fatal("Validate accepted duplicate organizations")
+	}
+}

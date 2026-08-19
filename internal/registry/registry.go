@@ -6,6 +6,7 @@
 package registry
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/json"
@@ -24,8 +25,9 @@ type Organization struct {
 }
 
 type Node struct {
-	CommonName string     `json:"common_name"`
-	Endpoints  []Endpoint `json:"endpoints"`
+	CommonName string          `json:"common_name"`
+	Endpoints  []Endpoint      `json:"endpoints"`
+	Remarks    json.RawMessage `json:"remarks"`
 }
 
 type Endpoint struct {
@@ -41,10 +43,49 @@ func Load(path string) (Registry, error) {
 		return nil, fmt.Errorf("registry: read %s: %w", path, err)
 	}
 	var r Registry
-	if err := json.Unmarshal(b, &r); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&r); err != nil {
 		return nil, fmt.Errorf("registry: parse %s: %w", path, err)
 	}
-	return r, nil
+	return r, r.Validate()
+}
+
+func (r Registry) Validate() error {
+	organizations := make(map[string]struct{}, len(r))
+	for _, organization := range r {
+		if organization.Organization == "" {
+			return fmt.Errorf("registry: organization name is required")
+		}
+		if _, exists := organizations[organization.Organization]; exists {
+			return fmt.Errorf("registry: duplicate organization %q", organization.Organization)
+		}
+		organizations[organization.Organization] = struct{}{}
+		if _, err := organization.ParsePublicKey(); err != nil {
+			return err
+		}
+		nodes := make(map[string]struct{}, len(organization.Nodes))
+		for _, node := range organization.Nodes {
+			if node.CommonName == "" {
+				return fmt.Errorf("registry: organization %q has a node without common_name", organization.Organization)
+			}
+			if _, exists := nodes[node.CommonName]; exists {
+				return fmt.Errorf("registry: duplicate node %q in organization %q", node.CommonName, organization.Organization)
+			}
+			nodes[node.CommonName] = struct{}{}
+			endpoints := make(map[string]struct{}, len(node.Endpoints))
+			for _, endpoint := range node.Endpoints {
+				if endpoint.SerialNumber == "" || endpoint.Port == 0 || (endpoint.AddressFamily != "ip4" && endpoint.AddressFamily != "ip6") {
+					return fmt.Errorf("registry: node %q has an invalid endpoint", node.CommonName)
+				}
+				if _, exists := endpoints[endpoint.SerialNumber]; exists {
+					return fmt.Errorf("registry: duplicate endpoint %q on node %q", endpoint.SerialNumber, node.CommonName)
+				}
+				endpoints[endpoint.SerialNumber] = struct{}{}
+			}
+		}
+	}
+	return nil
 }
 
 // ParsePublicKey parses the organization's shared Ed25519 SubjectPublicKeyInfo PEM.

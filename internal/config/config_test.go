@@ -69,3 +69,26 @@ func TestRekeyIntervals(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
+	for name, addition := range map[string]string{
+		"unknown field":         "unknown: true\n",
+		"negative babel":        "babel:\n  hello_interval: -1s\n",
+		"oversized replay":      "replay_window: 1048577\n",
+		"invalid originate":     "originate: [not-a-prefix]\n",
+		"missing peer name":     "peers:\n  - organization: example\n",
+		"duplicate endpoint":    "endpoints:\n  - serial_number: \"0\"\n    address_family: ip4\n  - serial_number: \"0\"\n    address_family: ip4\n",
+		"duplicate peer":        "peers:\n  - common_name: gateway\n  - common_name: gateway\n",
+		"unrepresentable babel": "babel:\n  update_interval: 11m\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(testConfig+addition), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("Load succeeded, want error")
+			}
+		})
+	}
+}

@@ -8,7 +8,9 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -145,7 +147,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	decoder := yaml.NewDecoder(strings.NewReader(string(b)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	c.setDefaults()
@@ -176,6 +180,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: registry is required")
 	case len(c.Peers) == 0:
 		return fmt.Errorf("config: at least one peer is required")
+	case c.ReplayWindow != nil && *c.ReplayWindow > 1<<20:
+		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
+	case c.Babel.HelloInterval < 0 || c.Babel.UpdateInterval < 0:
+		return fmt.Errorf("config: babel intervals must be nonnegative")
+	case c.Babel.HelloInterval > 655350*time.Millisecond || c.Babel.UpdateInterval > 655350*time.Millisecond:
+		return fmt.Errorf("config: babel intervals must fit the protocol's 16-bit centisecond field")
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
 		return fmt.Errorf("config: child_rekey_interval must be nonnegative when set")
 	case c.IKERekeyInterval != nil && time.Duration(*c.IKERekeyInterval) < 0:
@@ -195,9 +205,30 @@ func (c *Config) validate() error {
 	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
 	}
+	endpointSerials := make(map[string]struct{}, len(c.Endpoints))
 	for _, ep := range c.Endpoints {
 		if ep.SerialNumber == "" || (ep.AddressFamily != "ip4" && ep.AddressFamily != "ip6") {
 			return fmt.Errorf("config: endpoints require serial_number and address_family (ip4 or ip6)")
+		}
+		if _, exists := endpointSerials[ep.SerialNumber]; exists {
+			return fmt.Errorf("config: duplicate endpoint serial_number %q", ep.SerialNumber)
+		}
+		endpointSerials[ep.SerialNumber] = struct{}{}
+	}
+	peers := make(map[string]struct{}, len(c.Peers))
+	for _, peer := range c.Peers {
+		if peer.Organization == "" || peer.CommonName == "" {
+			return fmt.Errorf("config: peers require organization and common_name")
+		}
+		key := peer.Organization + "\x00" + peer.CommonName + "\x00" + peer.SerialNumber
+		if _, exists := peers[key]; exists {
+			return fmt.Errorf("config: duplicate peer %s/%s endpoint %q", peer.Organization, peer.CommonName, peer.SerialNumber)
+		}
+		peers[key] = struct{}{}
+	}
+	for _, raw := range c.Originate {
+		if _, err := netip.ParsePrefix(raw); err != nil {
+			return fmt.Errorf("config: originate %q: %w", raw, err)
 		}
 	}
 	return nil
