@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"encoding/binary"
 	"net"
 	"sort"
 	"sync"
@@ -20,6 +21,120 @@ func listenPeer(t *testing.T) *net.UDPConn {
 	}
 	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+func TestSessionRekeyChild(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	const oldLocalSPI = 0x10203040
+	const oldRemoteSPI = 0x50607080
+	const newRemoteSPI = 0x90a0b0c0
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	s := &Session{
+		mux: mux, suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+		skei: make([]byte, 20), sker: make([]byte, 20), skD: []byte("test child rekey SK_d material"),
+		Child:    ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: oldLocalSPI, RemoteSPI: oldRemoteSPI},
+		requests: make(chan *localRequest, 1),
+	}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	installed := make(chan ChildSA, 1)
+	s.SetChildHandler(func(child ChildSA) error {
+		installed <- child
+		return nil
+	})
+
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		buf := make([]byte, 2048)
+		n, addr, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read request: %v", err)
+			return
+		}
+		raw := append([]byte(nil), buf[4:n]...)
+		m, err := DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		inner, err := DecryptMessage(suite, s.skei, raw, m)
+		if err != nil {
+			t.Errorf("decrypt request: %v", err)
+			return
+		}
+		if m.Header.ExchangeType != CREATE_CHILD_SA || findType(inner, PayloadKE) != nil {
+			t.Errorf("unexpected rekey exchange")
+			return
+		}
+		notifyPayload, saPayload := findType(inner, PayloadN), findType(inner, PayloadSA)
+		noncePayload, tsiPayload, tsrPayload := findType(inner, PayloadNonce), findType(inner, PayloadTSi), findType(inner, PayloadTSr)
+		if notifyPayload == nil || saPayload == nil || noncePayload == nil || tsiPayload == nil || tsrPayload == nil {
+			t.Errorf("incomplete rekey request")
+			return
+		}
+		notify, err := DecodeNotify(notifyPayload.Body)
+		if err != nil || notify.Type != N_REKEY_SA || notify.Protocol != ProtoESP || len(notify.SPI) != 4 || binary.BigEndian.Uint32(notify.SPI) != oldRemoteSPI {
+			t.Errorf("bad REKEY_SA notify: %#v, %v", notify, err)
+			return
+		}
+		proposal, err := DecodeSA(saPayload.Body)
+		if err != nil || len(proposal) != 1 || len(proposal[0].SPI) != 4 || binary.BigEndian.Uint32(proposal[0].SPI) == 0 {
+			t.Errorf("bad proposal: %#v, %v", proposal, err)
+			return
+		}
+		nonce := noncePayload.Body
+		tsv4, tsv6 := FullRangeV4(), FullRangeV6()
+		selectors := EncodeTS([]TrafficSelector{tsv4, tsv6})
+		if len(nonce) == 0 || string(tsiPayload.Body) != string(selectors) || string(tsrPayload.Body) != string(selectors) {
+			t.Errorf("bad rekey nonce or traffic selectors")
+			return
+		}
+		remoteSPI := make([]byte, 4)
+		binary.BigEndian.PutUint32(remoteSPI, newRemoteSPI)
+		nr := []byte("responder nonce for child rekey")
+		response, err := EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoESP, SPI: remoteSPI, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}}}})},
+			{Type: PayloadNonce, Body: EncodeNonce(nr)},
+			{Type: PayloadTSi, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
+			{Type: PayloadTSr, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
+		})
+		if err != nil {
+			t.Errorf("encrypt response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+	if err := s.RekeyChild(); err != nil {
+		t.Fatalf("RekeyChild: %v", err)
+	}
+	<-peerDone
+	child := <-installed
+	if child.LocalSPI == oldLocalSPI || child.RemoteSPI != newRemoteSPI || len(child.InboundKey) == 0 || len(child.OutboundKey) == 0 {
+		t.Fatalf("installed child = %#v", child)
+	}
+	if got := s.currentChild(); got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || string(got.InboundKey) != string(child.InboundKey) || string(got.OutboundKey) != string(child.OutboundKey) {
+		t.Fatalf("current child = %#v, want %#v", got, child)
+	}
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
+	}
 }
 
 func encodeTestMessage(t *testing.T, hdr Header, payloads []RawPayload) []byte {
