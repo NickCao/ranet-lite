@@ -634,30 +634,17 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		return err
 	}
 
-	childProps, err := DecodeSA(saRecv.Body)
-	if err != nil || len(childProps) != 1 {
-		return fmt.Errorf("ike: bad child SA in IKE_AUTH response")
+	_, encr, remoteSPI, err := decodeChildProposal(saRecv.Body, nil)
+	if err != nil {
+		return fmt.Errorf("ike: bad child SA in IKE_AUTH response: %w", err)
 	}
-	cp := childProps[0]
-	encr, ok := cp.ChosenTransform(TransEncr)
-	if !ok {
-		return fmt.Errorf("ike: no child encryption transform chosen")
-	}
-	kb := encr.KeyLengthBits
-	if encr.ID == ENCR_CHACHA20_POLY1305 {
-		kb = 256
-	}
-	if len(cp.SPI) != 4 {
-		return fmt.Errorf("ike: unexpected child SPI size %d", len(cp.SPI))
-	}
-	remoteSPI := binary.BigEndian.Uint32(cp.SPI)
 
-	initKey, respKey, err := ChildSAKeymat(s.current.suite.PRFID, s.current.skD, ni, nr, encr.ID, kb)
+	initKey, respKey, err := ChildSAKeymat(s.current.suite.PRFID, s.current.skD, ni, nr, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return err
 	}
 	if err := s.replaceChild(ChildSA{
-		EncrID: encr.ID, EncrKeyBits: kb,
+		EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits,
 		LocalSPI: mySPI, RemoteSPI: remoteSPI,
 		InboundKey: respKey, OutboundKey: initKey,
 	}); err != nil {

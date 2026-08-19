@@ -491,40 +491,28 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 
 func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
 	var rekey Notify
-	var sa, nonce, tsi, tsr *RawPayload
-	for i := range inner {
-		switch inner[i].Type {
-		case PayloadN:
-			n, err := DecodeNotify(inner[i].Body)
-			if err != nil {
-				return nil, err
-			}
-			if n.Type == N_REKEY_SA {
-				rekey = n
-			}
-		case PayloadSA:
-			sa = &inner[i]
-		case PayloadNonce:
-			nonce = &inner[i]
-		case PayloadTSi:
-			tsi = &inner[i]
-		case PayloadTSr:
-			tsr = &inner[i]
+	payloads, err := decodeChildExchangePayloads(inner)
+	if err != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	for _, notify := range payloads.notifies {
+		if notify.Type == N_REKEY_SA {
+			rekey = notify
 		}
 	}
 	child := s.currentChild()
 	if rekey.Type != N_REKEY_SA || rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
 	}
-	if sa == nil || nonce == nil || tsi == nil || tsr == nil || len(nonce.Body) == 0 || findType(inner, PayloadKE) != nil {
+	wantSelectors := EncodeTS([]TrafficSelector{FullRangeV4(), FullRangeV6()})
+	if _, err := DecodeTS(payloads.tsi.Body); err != nil || string(payloads.tsi.Body) != string(wantSelectors) {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
-	props, err := DecodeSA(sa.Body)
-	if err != nil || len(props) != 1 || len(props[0].SPI) != 4 {
+	if _, err := DecodeTS(payloads.tsr.Body); err != nil || string(payloads.tsr.Body) != string(wantSelectors) {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
-	encr, ok := props[0].ChosenTransform(TransEncr)
-	if !ok || encr.ID != child.EncrID || encr.KeyLengthBits != child.EncrKeyBits {
+	p, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, &child)
+	if err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	var spi [4]byte
@@ -537,16 +525,16 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	if _, err := rand.Read(nr); err != nil {
 		return nil, err
 	}
-	initKey, respKey, err := ChildSAKeymat(ctx.suite.PRFID, ctx.skD, nonce.Body, nr, encr.ID, encr.KeyLengthBits)
+	initKey, respKey, err := ChildSAKeymat(ctx.suite.PRFID, ctx.skD, payloads.nonce.Body, nr, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return nil, err
 	}
-	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: binary.BigEndian.Uint32(props[0].SPI), InboundKey: initKey, OutboundKey: respKey}
+	replacement := ChildSA{EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits, LocalSPI: binary.BigEndian.Uint32(spi[:]), RemoteSPI: remoteSPI, InboundKey: initKey, OutboundKey: respKey}
 	if err := s.replaceChild(replacement); err != nil {
 		return nil, err
 	}
-	response := Proposal{Number: props[0].Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{{Type: TransEncr, ID: encr.ID, KeyLengthBits: encr.KeyLengthBits}, {Type: TransESN, ID: ESN_NO}}}
-	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: tsi.Body}, {Type: PayloadTSr, Body: tsr.Body}})
+	response := Proposal{Number: p.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{{Type: TransEncr, ID: encr.ID, KeyLengthBits: encr.KeyLengthBits}, {Type: TransESN, ID: ESN_NO}}}
+	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: payloads.tsi.Body}, {Type: PayloadTSr, Body: payloads.tsr.Body}})
 }
 
 func (s *Session) response(ctx *ikeContext, msgID uint32, exchange ExchangeType, inner []RawPayload) ([]byte, error) {

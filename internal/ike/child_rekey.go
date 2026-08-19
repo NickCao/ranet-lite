@@ -43,63 +43,30 @@ func (s *Session) RekeyChild() error {
 		return fmt.Errorf("ike: Child SA rekey request: %w", err)
 	}
 
-	var sa, nr, tsi, tsr *RawPayload
-	for i := range response {
-		switch response[i].Type {
-		case PayloadN:
-			n, err := DecodeNotify(response[i].Body)
-			if err != nil {
-				return fmt.Errorf("ike: invalid Child SA rekey notify: %w", err)
-			}
-			if n.Type < 16384 {
-				return fmt.Errorf("ike: Child SA rekey rejected: notify type %d", n.Type)
-			}
-		case PayloadSA:
-			sa = &response[i]
-		case PayloadNonce:
-			nr = &response[i]
-		case PayloadTSi:
-			tsi = &response[i]
-		case PayloadTSr:
-			tsr = &response[i]
-		case PayloadKE:
-			return fmt.Errorf("ike: Child SA rekey response unexpectedly includes KE")
+	payloads, err := decodeChildExchangePayloads(response)
+	if err != nil {
+		return fmt.Errorf("ike: invalid Child SA rekey response: %w", err)
+	}
+	for _, notify := range payloads.notifies {
+		if notify.Type < 16384 {
+			return fmt.Errorf("ike: Child SA rekey rejected: notify type %d", notify.Type)
 		}
 	}
-	if sa == nil || nr == nil || tsi == nil || tsr == nil || len(nr.Body) == 0 {
-		return fmt.Errorf("ike: incomplete Child SA rekey response")
-	}
-	if _, err := DecodeTS(tsi.Body); err != nil {
+	if _, err := DecodeTS(payloads.tsi.Body); err != nil {
 		return fmt.Errorf("ike: invalid Child SA rekey initiator selectors: %w", err)
 	}
-	if _, err := DecodeTS(tsr.Body); err != nil {
+	if _, err := DecodeTS(payloads.tsr.Body); err != nil {
 		return fmt.Errorf("ike: invalid Child SA rekey responder selectors: %w", err)
 	}
-	if string(tsi.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) || string(tsr.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) {
+	if string(payloads.tsi.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) || string(payloads.tsr.Body) != string(EncodeTS([]TrafficSelector{tsv4, tsv6})) {
 		return fmt.Errorf("ike: Child SA rekey response changed traffic selectors")
 	}
-	props, err := DecodeSA(sa.Body)
-	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoESP || len(props[0].SPI) != 4 {
-		return fmt.Errorf("ike: invalid Child SA rekey proposal")
-	}
-	p := props[0]
-	if len(p.Transforms) != 2 {
-		return fmt.Errorf("ike: Child SA rekey chose unsupported transforms")
-	}
-	encr, ok := p.ChosenTransform(TransEncr)
-	if !ok || encr.ID != old.EncrID || encr.KeyLengthBits != old.EncrKeyBits {
-		return fmt.Errorf("ike: Child SA rekey chose an unsupported encryption transform")
-	}
-	esn, ok := p.ChosenTransform(TransESN)
-	if !ok || esn.ID != ESN_NO {
-		return fmt.Errorf("ike: Child SA rekey chose an unsupported ESN transform")
-	}
-	remoteSPI := binary.BigEndian.Uint32(p.SPI)
-	if remoteSPI == 0 {
-		return fmt.Errorf("ike: Child SA rekey returned zero SPI")
+	_, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, &old)
+	if err != nil {
+		return fmt.Errorf("ike: invalid Child SA rekey proposal: %w", err)
 	}
 	context := s.currentContext()
-	initKey, respKey, err := ChildSAKeymat(context.suite.PRFID, context.skD, nonce, nr.Body, encr.ID, encr.KeyLengthBits)
+	initKey, respKey, err := ChildSAKeymat(context.suite.PRFID, context.skD, nonce, payloads.nonce.Body, encr.ID, encr.KeyLengthBits)
 	if err != nil {
 		return err
 	}

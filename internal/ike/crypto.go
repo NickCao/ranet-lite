@@ -141,6 +141,9 @@ func aeadParams(encrID uint16, keyLenBits uint16) (AEADParams, error) {
 		}
 		return AEADParams{KeyLen: kl, SaltLen: 4, IVLen: 8, ICVLen: 16}, nil
 	case ENCR_CHACHA20_POLY1305:
+		if keyLenBits != 0 && keyLenBits != 256 {
+			return AEADParams{}, fmt.Errorf("ike: invalid ChaCha20-Poly1305 key length %d bits", keyLenBits)
+		}
 		return AEADParams{KeyLen: 32, SaltLen: 4, IVLen: 8, ICVLen: 16}, nil
 	default:
 		return AEADParams{}, fmt.Errorf("ike: unsupported encryption transform %d", encrID)
