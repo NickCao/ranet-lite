@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/binary"
@@ -124,7 +125,7 @@ func main() {
 	fmt.Printf("handshake OK: child SA local_spi=%08x remote_spi=%08x encr=%d keybits=%d\n",
 		sess.Child.LocalSPI, sess.Child.RemoteSPI, sess.Child.EncrID, sess.Child.EncrKeyBits)
 
-	go sess.Run()
+	go sess.Run(context.Background())
 
 	out, err := esp.NewOutbound(sess.Child)
 	if err != nil {

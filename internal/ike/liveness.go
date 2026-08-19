@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -100,7 +101,9 @@ func (s *Session) rekeyRetryDelay(failures uint) time.Duration {
 
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
-func (s *Session) Run() error {
+func (s *Session) Run(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, func() { _ = s.mux.Close() })
+	defer stop()
 	lastAuthenticated := time.Now()
 	if s.rekeyRetryInitial == 0 && s.rekeyRetryMax == 0 {
 		s.rekeyRetryInitial = 5 * time.Second

@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/x509"
 	"encoding/pem"
@@ -82,7 +83,7 @@ func main() {
 			fmt.Printf("rekey schedule: child=%s ike=%s\n", *childRekey, *ikeRekey)
 		}
 		go func() {
-			if err := sess.Run(); err != nil {
+			if err := sess.Run(context.Background()); err != nil {
 				log.Printf("session loop ended: %v", err)
 			}
 		}()

@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"sort"
@@ -83,7 +84,7 @@ func TestSessionScheduledRekeyFailureRetries(t *testing.T) {
 	}()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	select {
 	case <-retried:
 	case <-time.After(5 * time.Second):
@@ -302,7 +303,7 @@ func TestSessionScheduledRekeyChild(t *testing.T) {
 	}()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	select {
 	case <-rekeyed:
 	case <-time.After(5 * time.Second):
@@ -441,7 +442,7 @@ func TestSessionRekeyIKE(t *testing.T) {
 	}()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	if err := s.RekeyIKE(); err != nil {
 		t.Fatalf("RekeyIKE: %v", err)
 	}
@@ -484,7 +485,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	}
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 
 	dh, err := GenerateDH(DH_CURVE25519)
 	if err != nil {
@@ -835,7 +836,7 @@ func TestSessionRekeyIKECollisionKeepsHigherNonceCandidate(t *testing.T) {
 	}()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	if err := s.RekeyIKE(); err != nil {
 		t.Fatalf("RekeyIKE: %v", err)
 	}
@@ -1064,7 +1065,7 @@ func TestSessionRequestSerializesLocalMessageIDs(t *testing.T) {
 	}()
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	var wg sync.WaitGroup
 	for range 2 {
 		wg.Add(1)
@@ -1108,7 +1109,7 @@ func TestSessionRunUsesOldIKEContext(t *testing.T) {
 	}
 
 	runDone := make(chan error, 1)
-	go func() { runDone <- s.Run() }()
+	go func() { runDone <- s.Run(context.Background()) }()
 	request, err := EncryptMessage(old.suite, old.sker, Header{SPIInitiator: old.spiI, SPIResponder: old.spiR, ExchangeType: INFORMATIONAL, MessageID: 0}, nil, nil)
 	if err != nil {
 		t.Fatal(err)

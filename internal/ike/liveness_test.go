@@ -1,9 +1,24 @@
 package ike
 
 import (
+	"context"
 	"testing"
 	"time"
 )
+
+func TestSessionRunStopsOnContextCancellation(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	s := &Session{mux: mux}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Session.Run did not stop after context cancellation")
+	}
+}
 
 func TestRekeyRetryDelay(t *testing.T) {
 	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}

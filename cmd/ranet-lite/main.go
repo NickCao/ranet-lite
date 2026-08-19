@@ -337,12 +337,6 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	peerHandle := speaker.AddPeer(peer)
 	defer peerHandle.Close()
 
-	go func() {
-		if err := sess.Run(); err != nil && ctx.Err() == nil {
-			log.Printf("peer %s: IKE control session ended: %v", name, err)
-		}
-	}()
-
 	// Decrypt in parallel, but reserve result slots before dispatch so the
 	// emitter delivers packets in their original arrival order.
 	type decrypted struct {
@@ -366,33 +360,49 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 	}()
 
-	for {
-		pkt, err := sess.Mux().RecvESP()
-		if err != nil {
-			close(order)
-			<-emitterDone
-			return err
-		}
-		slot := make(chan decrypted, 1)
-		order <- slot
-		sem <- struct{}{}
-		go func(pkt []byte, slot chan decrypted) {
-			defer func() { <-sem }()
-			saMu.RLock()
-			candidates := append([]inboundSA(nil), inbound...)
-			saMu.RUnlock()
-			var plain []byte
-			var err error
-			for _, candidate := range candidates {
-				plain, _, err = candidate.sa.Open(pkt)
-				if err == nil {
-					break
+	runESP := func() error {
+		for {
+			pkt, err := sess.Mux().RecvESP()
+			if err != nil {
+				close(order)
+				<-emitterDone
+				return err
+			}
+			slot := make(chan decrypted, 1)
+			order <- slot
+			sem <- struct{}{}
+			go func(pkt []byte, slot chan decrypted) {
+				defer func() { <-sem }()
+				saMu.RLock()
+				candidates := append([]inboundSA(nil), inbound...)
+				saMu.RUnlock()
+				var plain []byte
+				var err error
+				for _, candidate := range candidates {
+					plain, _, err = candidate.sa.Open(pkt)
+					if err == nil {
+						break
+					}
 				}
-			}
-			if err == nil {
-				sess.NoteTraffic()
-			}
-			slot <- decrypted{plain: plain, err: err}
-		}(pkt, slot)
+				if err == nil {
+					sess.NoteTraffic()
+				}
+				slot <- decrypted{plain: plain, err: err}
+			}(pkt, slot)
+		}
 	}
+	type sessionResult struct {
+		component string
+		err       error
+	}
+	results := make(chan sessionResult, 2)
+	go func() { results <- sessionResult{"IKE control", sess.Run(ctx)} }()
+	go func() { results <- sessionResult{"ESP receive", runESP()} }()
+	first := <-results
+	_ = sess.Mux().Close()
+	<-results
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("%s session ended: %w", first.component, first.err)
 }

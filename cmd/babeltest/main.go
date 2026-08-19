@@ -77,7 +77,7 @@ func main() {
 		log.Fatalf("handshake failed: %v", err)
 	}
 	fmt.Printf("handshake OK: child SA local_spi=%08x remote_spi=%08x\n", sess.Child.LocalSPI, sess.Child.RemoteSPI)
-	go sess.Run()
+	go sess.Run(context.Background())
 
 	out, err := esp.NewOutbound(sess.Child)
 	if err != nil {
