@@ -123,6 +123,14 @@ func TestSpeakerIgnoresEchoedOwnPrefix(t *testing.T) {
 	if n == nil {
 		t.Fatal("peer \"b\" not registered")
 	}
+	n.mu.Lock()
+	n.alive = true
+	n.lastHelloTime = time.Now()
+	n.helloInterval = time.Minute
+	n.haveReportedCost = true
+	n.reportedCost = 32
+	n.ihuExpiry = time.Now().Add(time.Minute)
+	n.mu.Unlock()
 	pkt := buildPacket(netip.MustParseAddr("fe80::b"), multicastGroup, EncodePacket([]RawTLV{
 		EncodeRouterID(speakerA.cfg.RouterID), // as if reflected back via another mesh node
 		EncodeUpdate(Update{AE: AEIPv6, Plen: mine.Bits(), Seqno: 1, Metric: 32, Prefix: net.IP(mine.Addr().AsSlice())}),
@@ -164,6 +172,17 @@ func sourceSpecificUpdateTLV(dest netip.Prefix, source netip.Prefix, metric uint
 	return RawTLV{Type: TLVUpdate, Body: body}
 }
 
+func makeNeighborReachable(n *neighborState) {
+	n.mu.Lock()
+	n.alive = true
+	n.lastHelloTime = time.Now()
+	n.helloInterval = time.Minute
+	n.haveReportedCost = true
+	n.reportedCost = 32
+	n.ihuExpiry = time.Now().Add(time.Minute)
+	n.mu.Unlock()
+}
+
 // TestSpeakerSADR covers genuine source-specific (SADR) route handling:
 // a Source Prefix sub-TLV is installed as a real (source, destination)
 // entry in the mesh's route table, not approximated by checking whether
@@ -178,6 +197,7 @@ func TestSpeakerSADR(t *testing.T) {
 	if n == nil {
 		t.Fatal("peer \"b\" not registered")
 	}
+	makeNeighborReachable(n)
 
 	dest := netip.MustParsePrefix("10.77.0.0/24")
 	covering := netip.MustParsePrefix("10.66.0.0/16")

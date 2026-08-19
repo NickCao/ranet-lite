@@ -28,7 +28,36 @@ type routeInfo struct {
 }
 
 func (r *routeInfo) reachable() bool {
-	return r.rxMetric < MetricInfinity && time.Now().Before(r.expiresAt)
+	return r.cost < MetricInfinity && time.Now().Before(r.expiresAt)
+}
+
+func sameSelection(a, b *routeInfo) bool {
+	return a == b || (a != nil && b != nil && a.neighbor == b.neighbor && a.cost == b.cost)
+}
+
+// recomputeNeighbor applies changed Hello/IHU/RTT state to every candidate
+// learned through n and immediately updates installed selections.
+func (rt *routeTable) recomputeNeighbor(n *neighborState, install func(routeKey, *routeInfo)) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	linkCost := n.linkCost()
+	for key, entry := range rt.entries {
+		route := entry.routes[n]
+		if route == nil {
+			continue
+		}
+		previous := entry.selected
+		if route.rxMetric < MetricInfinity {
+			route.cost = saturatingAdd(linkCost, route.rxMetric)
+		}
+		best := entry.bestReachable()
+		if entry.selected == nil || !entry.selected.reachable() || (best != nil && best.cost < entry.selected.cost) {
+			entry.selected = best
+		}
+		if !sameSelection(previous, entry.selected) {
+			install(key, entry.selected)
+		}
+	}
 }
 
 // feasible implements the RFC 8966 §3.5.1 feasibility condition against

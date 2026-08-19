@@ -11,6 +11,7 @@ import (
 func TestRouteTableSweepGarbageCollectsExpiredState(t *testing.T) {
 	rt := newRouteTable()
 	neighbor := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	makeNeighborReachable(neighbor)
 	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
 	rt.update(neighbor, key, [8]byte{1}, 1, 1, time.Minute)
 	rt.entries[key].selected.expiresAt = time.Now().Add(-time.Second)
@@ -37,5 +38,18 @@ func TestRouteTableNeighborExpiryDeletesEmptyEntry(t *testing.T) {
 	rt.expireNeighbor(neighbor)
 	if len(rt.entries) != 0 {
 		t.Fatalf("neighbor expiry retained %d empty entries", len(rt.entries))
+	}
+}
+
+func TestInfiniteLinkCostNeverBecomesReachable(t *testing.T) {
+	if got := saturatingAdd(MetricInfinity, 1); got != MetricInfinity {
+		t.Fatalf("infinity + 1 = %d, want infinity", got)
+	}
+	rt := newRouteTable()
+	neighbor := &neighborState{peer: netstack.NewPeer("peer", nil, nil)}
+	key := routeKey{dest: netip.MustParsePrefix("10.0.0.0/24")}
+	_, selected := rt.update(neighbor, key, [8]byte{1}, 1, 1, time.Minute)
+	if selected != nil {
+		t.Fatalf("selected route without live Hello/IHU: %+v", selected)
 	}
 }

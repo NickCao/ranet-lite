@@ -69,7 +69,7 @@ func deadTimeout(interval time.Duration) time.Duration {
 func (n *neighborState) linkCost() uint16 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if !n.haveReportedCost || time.Now().After(n.ihuExpiry) {
+	if !n.isAliveLocked() || !n.haveReportedCost || time.Now().After(n.ihuExpiry) {
 		return MetricInfinity
 	}
 	return n.reportedCost
@@ -436,6 +436,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				freshHelloTxTS, haveFreshHello = h.TxTS, true
 			}
 			n.mu.Unlock()
+			s.routes.recomputeNeighbor(n, s.installRoute)
 
 		case TLVIHU:
 			ihu, _, err := DecodeIHU(t.Body)
@@ -459,6 +460,7 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				}
 			}
 			n.mu.Unlock()
+			s.routes.recomputeNeighbor(n, s.installRoute)
 
 		case TLVRouterID:
 			id, err := DecodeRouterID(t.Body)

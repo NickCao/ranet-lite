@@ -59,9 +59,12 @@ func (p CostParams) Cost(rtt time.Duration, haveRTT bool) uint16 {
 }
 
 func saturatingAdd(a, b uint16) uint16 {
+	if a == MetricInfinity || b == MetricInfinity {
+		return MetricInfinity
+	}
 	sum := uint32(a) + uint32(b)
 	if sum >= uint32(MetricInfinity) {
-		return MetricInfinity - 1
+		return MetricInfinity
 	}
 	return uint16(sum)
 }
