@@ -152,6 +152,21 @@ type Speaker struct {
 	changed chan struct{}
 }
 
+// PeerHandle owns one exact Speaker registration. Closing a stale handle does
+// not disturb a newer session that reused the same peer ID.
+type PeerHandle struct {
+	speaker *Speaker
+	state   *neighborState
+	once    sync.Once
+}
+
+func (h *PeerHandle) Close() {
+	if h == nil {
+		return
+	}
+	h.once.Do(func() { h.speaker.removePeer(h.state) })
+}
+
 func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 	cfg.setDefaults()
 	return &Speaker{
@@ -166,11 +181,29 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 // AddPeer registers a Babel neighbor over the given netstack.Peer (its
 // ESP-backed tunnel). Its address is learned automatically from the first
 // packet it sends — nothing needs to be configured up front.
-func (s *Speaker) AddPeer(peer *netstack.Peer) {
+func (s *Speaker) AddPeer(peer *netstack.Peer) *PeerHandle {
 	n := &neighborState{peer: peer}
 	s.mu.Lock()
+	old := s.neighbors[peer.ID]
 	s.neighbors[peer.ID] = n
 	s.mu.Unlock()
+	if old != nil {
+		s.removePeer(old)
+	}
+	return &PeerHandle{speaker: s, state: n}
+}
+
+func (s *Speaker) removePeer(n *neighborState) {
+	s.mu.Lock()
+	if s.neighbors[n.peer.ID] == n {
+		delete(s.neighbors, n.peer.ID)
+	}
+	s.mu.Unlock()
+	for _, key := range s.routes.expireNeighbor(n) {
+		s.installRoute(key, s.routes.selectedFor(key))
+	}
+	s.mesh.Routes.RemovePeer(n.peer)
+	s.triggerUpdate()
 }
 
 // Receive processes a decrypted packet that arrived via peer's ESP tunnel.

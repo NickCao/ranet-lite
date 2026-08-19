@@ -252,3 +252,35 @@ func TestSpeakerRetractsRouteOnNeighborDown(t *testing.T) {
 	}
 	t.Fatal("A never retracted the route after B went silent")
 }
+
+func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := New(Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := netstack.NewPeer("peer", nil, nil)
+	handle := speaker.AddPeer(peer)
+	n := speaker.neighbors[peer.ID]
+	dest := netip.MustParsePrefix("10.88.0.0/16")
+	key := routeKey{dest: dest}
+	_, selected := speaker.routes.update(n, key, [8]byte{1}, 1, 1, time.Minute)
+	speaker.installRoute(key, selected)
+
+	handle.Close()
+	handle.Close()
+	if speaker.neighbors[peer.ID] != nil {
+		t.Fatal("closed peer remains registered")
+	}
+	if _, ok := mesh.Routes.Lookup(netip.MustParseAddr("192.0.2.1"), dest.Addr()); ok {
+		t.Fatal("closed peer route remains installed")
+	}
+
+	newPeer := netstack.NewPeer("peer", nil, nil)
+	newHandle := speaker.AddPeer(newPeer)
+	defer newHandle.Close()
+	handle.Close()
+	if speaker.neighbors[peer.ID] == nil {
+		t.Fatal("stale handle removed replacement peer")
+	}
+}

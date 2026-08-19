@@ -250,7 +250,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	if err != nil {
 		return err
 	}
-	log.Printf("peer %s: dialing %s:%d (serial %s)", name, remoteIP, ep.Port, ep.SerialNumber)
+	sessionName := fmt.Sprintf("%s/%s/%s@%s", p.Organization, p.CommonName, ep.SerialNumber, local.SerialNumber)
+	log.Printf("peer %s: dialing %s:%d", sessionName, remoteIP, ep.Port)
 
 	ikeCfg := ike.PeerConfig{
 		Organization:       cfg.Organization,
@@ -324,7 +325,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		return fmt.Errorf("retiring inbound ESP SPI %08x was not installed", localSPI)
 	})
-	peer := netstack.NewPeerBatched(name, func(raw []byte, nextHeader byte) ([]byte, error) {
+	peer := netstack.NewPeerBatched(sessionName, func(raw []byte, nextHeader byte) ([]byte, error) {
 		saMu.RLock()
 		sa := out
 		saMu.RUnlock()
@@ -336,7 +337,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		return sealed, err
 	}, sess.Mux().SendESPBatch)
-	speaker.AddPeer(peer)
+	peerHandle := speaker.AddPeer(peer)
+	defer peerHandle.Close()
 
 	go func() {
 		if err := sess.Run(); err != nil && ctx.Err() == nil {
