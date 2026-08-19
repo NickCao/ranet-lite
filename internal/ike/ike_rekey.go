@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 )
 
 // RekeyIKE replaces the IKE SA while retaining the current Child SAs. Run
@@ -117,9 +118,11 @@ func (s *Session) RekeyIKE() error {
 	current, collision := s.current, s.collision
 	s.stateMu.RUnlock()
 	if current != old {
+		slog.Info("ike simultaneous rekey selected peer candidate")
 		return nil
 	}
 	if collision != nil {
+		slog.Info("ike simultaneous rekey selected local candidate")
 		loser := collision
 		if _, err := s.requestOnLocked(loser, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
 			return fmt.Errorf("ike: retire lower-nonce IKE SA: %w", err)

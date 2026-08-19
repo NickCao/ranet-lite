@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"time"
 
@@ -115,6 +116,11 @@ func (s *Session) Run() error {
 	var childDue, ikeDue bool
 	startRekey := func(kind scheduledRekey) {
 		running = kind
+		kindName := "IKE SA"
+		if kind == childScheduledRekey {
+			kindName = "Child SA"
+		}
+		slog.Info("ike scheduled rekey starting", "sa", kindName)
 		go func() {
 			if kind == childScheduledRekey {
 				rekeyResult <- s.RekeyChild()
@@ -139,8 +145,14 @@ func (s *Session) Run() error {
 		select {
 		case err := <-rekeyResult:
 			if err != nil {
+				slog.Error("ike scheduled rekey failed", "err", err)
 				s.mux.Close()
 				return fmt.Errorf("ike: scheduled rekey: %w", err)
+			}
+			if running == childScheduledRekey {
+				slog.Info("ike scheduled rekey completed", "sa", "Child SA")
+			} else {
+				slog.Info("ike scheduled rekey completed", "sa", "IKE SA")
 			}
 			if running == childScheduledRekey {
 				delay, err := s.rekeyDelay(s.childRekeyInterval)
@@ -352,15 +364,15 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 		s.mux.Close()
 		return true
 	}
-	if err := s.mux.SendIKE(response); err != nil {
-		s.mux.Close()
-		return true
-	}
 	s.stateMu.Lock()
 	ctx.lastPeerResponseID = hdr.MessageID
 	ctx.lastPeerResponse = response
 	ctx.nextPeerMID++
 	s.stateMu.Unlock()
+	if err := s.mux.SendIKE(response); err != nil {
+		s.mux.Close()
+		return true
+	}
 	return true
 }
 
