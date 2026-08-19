@@ -24,7 +24,7 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: generate IKE SA rekey DH key: %w", err)
 	}
 	ni := make([]byte, 32)
-	if _, err := rand.Read(ni); err != nil {
+	if err := s.fillIKERekeyNonce(ni); err != nil {
 		return fmt.Errorf("ike: generate IKE SA rekey nonce: %w", err)
 	}
 	s.stateMu.Lock()
@@ -211,7 +211,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	nr := make([]byte, 32)
-	if _, err := rand.Read(nr); err != nil {
+	if err := s.fillIKERekeyNonce(nr); err != nil {
 		return nil, fmt.Errorf("ike: generate peer IKE rekey nonce: %w", err)
 	}
 	spiR := randUint64Nonzero()
@@ -243,6 +243,14 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		{Type: PayloadNonce, Body: EncodeNonce(nr)},
 		{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
 	})
+}
+
+func (s *Session) fillIKERekeyNonce(nonce []byte) error {
+	if s.ikeRekeyNonce != nil {
+		return s.ikeRekeyNonce(nonce)
+	}
+	_, err := rand.Read(nonce)
+	return err
 }
 
 // compareIKENonces compares IKE initiator nonces as unsigned integers.

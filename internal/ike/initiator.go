@@ -76,8 +76,9 @@ type Session struct {
 	// collision retains the losing peer-initiated candidate until the local
 	// rekey exchange can delete it. The normal current/old pair retains the
 	// winning candidate and the SA it replaces.
-	collision  *ikeContext
-	localRekey *ikeRekey
+	collision     *ikeContext
+	localRekey    *ikeRekey
+	ikeRekeyNonce func([]byte) error
 
 	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
 	requests  chan *localRequest
