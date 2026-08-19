@@ -218,6 +218,7 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 				return response, fmt.Errorf("peer deleted IKE SA")
 			}
 			child := s.currentChild()
+			retiring := s.retiringChild()
 			for _, spi := range d.SPIs {
 				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == child.RemoteSPI {
 					local := make([]byte, 4)
@@ -227,6 +228,18 @@ func (s *Session) handleRequest(hdr *Header, inner []RawPayload) ([]byte, error)
 						return nil, err
 					}
 					return response, fmt.Errorf("peer deleted Child SA")
+				}
+				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == retiring.RemoteSPI {
+					local := make([]byte, 4)
+					binary.BigEndian.PutUint32(local, retiring.LocalSPI)
+					response, err := s.response(hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
+					if err != nil {
+						return nil, err
+					}
+					if err := s.retireChild(retiring.RemoteSPI); err != nil {
+						return nil, err
+					}
+					return response, nil
 				}
 			}
 		}

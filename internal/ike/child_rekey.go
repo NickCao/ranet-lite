@@ -26,6 +26,8 @@ func (s *Session) RekeyChild() error {
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("ike: generate Child SA rekey nonce: %w", err)
 	}
+	oldLocalSPI := make([]byte, 4)
+	binary.BigEndian.PutUint32(oldLocalSPI, old.LocalSPI)
 	oldRemoteSPI := make([]byte, 4)
 	binary.BigEndian.PutUint32(oldRemoteSPI, old.RemoteSPI)
 	tsv4, tsv6 := FullRangeV4(), FullRangeV6()
@@ -100,9 +102,30 @@ func (s *Session) RekeyChild() error {
 	if err != nil {
 		return err
 	}
-	return s.replaceChild(ChildSA{
+	if err := s.replaceChild(ChildSA{
 		EncrID: encr.ID, EncrKeyBits: encr.KeyLengthBits,
 		LocalSPI: localSPI, RemoteSPI: remoteSPI,
 		InboundKey: respKey, OutboundKey: initKey,
-	})
+	}); err != nil {
+		return err
+	}
+	deleted, err := s.request(INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{oldLocalSPI}})}})
+	if err != nil {
+		return fmt.Errorf("ike: retire replaced Child SA: %w", err)
+	}
+	for _, p := range deleted {
+		if p.Type != PayloadD {
+			continue
+		}
+		d, err := DecodeDelete(p.Body)
+		if err != nil {
+			return fmt.Errorf("ike: invalid Child SA retire response: %w", err)
+		}
+		for _, spi := range d.SPIs {
+			if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == old.RemoteSPI {
+				return s.retireChild(old.RemoteSPI)
+			}
+		}
+	}
+	return fmt.Errorf("ike: Child SA retire response did not delete peer inbound SPI")
 }

@@ -284,7 +284,11 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	// sent. Retain the immediately preceding inbound SA for packets already
 	// in flight on the replaced SPI (RFC 7296 section 2.8 overlap).
 	var saMu sync.RWMutex
-	inbound := []*esp.InboundSA{in}
+	type inboundSA struct {
+		spi uint32
+		sa  *esp.InboundSA
+	}
+	inbound := []inboundSA{{spi: sess.Child.LocalSPI, sa: in}}
 	sess.SetChildHandler(func(child ike.ChildSA) error {
 		newOut, err := esp.NewOutbound(child)
 		if err != nil {
@@ -296,12 +300,23 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		saMu.Lock()
 		out, in = newOut, newIn
-		inbound = append([]*esp.InboundSA{in}, inbound...)
+		inbound = append([]inboundSA{{spi: child.LocalSPI, sa: in}}, inbound...)
 		if len(inbound) > 2 {
 			inbound = inbound[:2]
 		}
 		saMu.Unlock()
 		return nil
+	})
+	sess.SetChildRetireHandler(func(localSPI uint32) error {
+		saMu.Lock()
+		defer saMu.Unlock()
+		for i := range inbound {
+			if inbound[i].spi == localSPI {
+				inbound = append(inbound[:i], inbound[i+1:]...)
+				return nil
+			}
+		}
+		return fmt.Errorf("retiring inbound ESP SPI %08x was not installed", localSPI)
 	})
 	peer := netstack.NewPeerBatched(name, func(raw []byte, nextHeader byte) ([]byte, error) {
 		saMu.RLock()
@@ -359,12 +374,12 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		go func(pkt []byte, slot chan decrypted) {
 			defer func() { <-sem }()
 			saMu.RLock()
-			candidates := append([]*esp.InboundSA(nil), inbound...)
+			candidates := append([]inboundSA(nil), inbound...)
 			saMu.RUnlock()
 			var plain []byte
 			var err error
-			for _, sa := range candidates {
-				plain, _, err = sa.Open(pkt)
+			for _, candidate := range candidates {
+				plain, _, err = candidate.sa.Open(pkt)
 				if err == nil {
 					break
 				}

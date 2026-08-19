@@ -62,11 +62,13 @@ type Session struct {
 	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
 	requests  chan *localRequest
 
-	childMu sync.RWMutex
-	Child   ChildSA
+	childMu  sync.RWMutex
+	Child    ChildSA
+	retiring ChildSA
 
 	handlerMu   sync.RWMutex
 	onChild     func(ChildSA) error
+	onRetire    func(uint32) error
 	lastTraffic atomic.Int64
 }
 
@@ -77,6 +79,14 @@ func (s *Session) Mux() *transport.Mux { return s.mux }
 func (s *Session) SetChildHandler(fn func(ChildSA) error) {
 	s.handlerMu.Lock()
 	s.onChild = fn
+	s.handlerMu.Unlock()
+}
+
+// SetChildRetireHandler removes an old inbound ESP SA after its paired Delete
+// exchange completes.
+func (s *Session) SetChildRetireHandler(fn func(uint32) error) {
+	s.handlerMu.Lock()
+	s.onRetire = fn
 	s.handlerMu.Unlock()
 }
 
@@ -93,7 +103,11 @@ func (s *Session) replaceChild(child ChildSA) error {
 		}
 	}
 	s.childMu.Lock()
+	old := s.Child
 	s.Child = child
+	if old.LocalSPI != 0 {
+		s.retiring = old
+	}
 	s.childMu.Unlock()
 	return nil
 }
@@ -102,6 +116,31 @@ func (s *Session) currentChild() ChildSA {
 	s.childMu.RLock()
 	defer s.childMu.RUnlock()
 	return s.Child
+}
+
+func (s *Session) retiringChild() ChildSA {
+	s.childMu.RLock()
+	defer s.childMu.RUnlock()
+	return s.retiring
+}
+
+func (s *Session) retireChild(remoteSPI uint32) error {
+	s.childMu.Lock()
+	retiring := s.retiring
+	if retiring.RemoteSPI != remoteSPI {
+		s.childMu.Unlock()
+		return fmt.Errorf("ike: no retiring Child SA with remote SPI %08x", remoteSPI)
+	}
+	s.retiring = ChildSA{}
+	s.childMu.Unlock()
+	s.mux.UnregisterESP(retiring.LocalSPI)
+	s.handlerMu.RLock()
+	fn := s.onRetire
+	s.handlerMu.RUnlock()
+	if fn != nil {
+		return fn(retiring.LocalSPI)
+	}
+	return nil
 }
 
 // NoteTraffic records successfully authenticated ESP traffic for the DPD

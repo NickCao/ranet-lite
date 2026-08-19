@@ -115,6 +115,43 @@ func TestSessionRekeyChild(t *testing.T) {
 		}
 		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
 			t.Errorf("write response: %v", err)
+			return
+		}
+		n, addr, err = peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read delete request: %v", err)
+			return
+		}
+		raw = append([]byte(nil), buf[4:n]...)
+		m, err = DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode delete request: %v", err)
+			return
+		}
+		inner, err = DecryptMessage(suite, s.skei, raw, m)
+		if err != nil {
+			t.Errorf("decrypt delete request: %v", err)
+			return
+		}
+		dp := findType(inner, PayloadD)
+		if m.Header.ExchangeType != INFORMATIONAL || dp == nil {
+			t.Errorf("unexpected retire exchange")
+			return
+		}
+		d, err := DecodeDelete(dp.Body)
+		if err != nil || d.Protocol != ProtoESP || len(d.SPIs) != 1 || len(d.SPIs[0]) != 4 || binary.BigEndian.Uint32(d.SPIs[0]) != oldLocalSPI {
+			t.Errorf("bad retire delete: %#v, %v", d, err)
+			return
+		}
+		remote := make([]byte, 4)
+		binary.BigEndian.PutUint32(remote, oldRemoteSPI)
+		response, err = EncryptMessage(suite, s.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{remote}})}})
+		if err != nil {
+			t.Errorf("encrypt delete response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write delete response: %v", err)
 		}
 	}()
 
