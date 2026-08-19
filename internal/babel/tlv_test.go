@@ -91,6 +91,17 @@ func TestUpdateRejectsPrefixLengthBeyondAddressFamily(t *testing.T) {
 	}
 }
 
+func TestWildcardUpdateRequiresInfiniteMetric(t *testing.T) {
+	finite := []byte{AEWildcard, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	got, err := (&PrefixDecoder{}).Decode(finite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Ignore {
+		t.Fatal("accepted finite wildcard Update")
+	}
+}
+
 // TestUpdateWithSourcePrefix guards real-world SADR interop (e.g. BIRD's
 // "ipv6 sadr" tables, draft-ietf-babel-source-specific): a well-formed
 // Source Prefix sub-TLV (type 128, mandatory bit set per RFC 8966 §4.4)

@@ -304,3 +304,26 @@ func TestPeerHandleRemovesExactNeighborAndRoutes(t *testing.T) {
 		t.Fatal("stale handle removed replacement peer")
 	}
 }
+
+func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := New(Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := netstack.NewPeer("peer", nil, nil)
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	neighbor := speaker.neighbors[peer.ID]
+	makeNeighborReachable(neighbor)
+	for _, dest := range []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("10.2.0.0/16")} {
+		key := routeKey{dest: dest}
+		_, selected := speaker.routes.update(neighbor, key, [8]byte{1}, 1, 1, time.Minute)
+		speaker.installRoute(key, selected)
+	}
+	body := []byte{AEWildcard, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{{Type: TLVUpdate, Body: body}}))
+	if debug := mesh.Routes.Debug(); len(debug) != 0 {
+		t.Fatalf("wildcard retraction left routes installed: %v", debug)
+	}
+}

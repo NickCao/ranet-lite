@@ -140,6 +140,9 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	}
 
 	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}
+	if ae == AEWildcard && metric != MetricInfinity {
+		u.Ignore = true
+	}
 	subs, err := decodeSubTLVs(sent[sentLen:])
 	if err != nil {
 		u.Ignore = true

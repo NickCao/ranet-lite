@@ -481,6 +481,13 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				// state above was still updated.
 				continue
 			}
+			if u.AE == AEWildcard {
+				for _, key := range s.routes.expireNeighbor(n) {
+					s.installRoute(key, s.routes.selectedFor(key))
+				}
+				s.triggerUpdate()
+				continue
+			}
 			addr, ok := netip.AddrFromSlice(u.Prefix)
 			if !ok {
 				continue
