@@ -182,6 +182,21 @@ type IKEKeys struct {
 
 // DeriveIKEKeys computes SKEYSEED and the SK_* keys for the IKE SA.
 func DeriveIKEKeys(suite SASuite, sharedSecret, ni, nr []byte, spiI, spiR uint64) (*IKEKeys, error) {
+	skeyseed := prf(suite.PRFID, append(append([]byte{}, ni...), nr...), sharedSecret)
+	return deriveIKEKeys(suite, skeyseed, ni, nr, spiI, spiR)
+}
+
+// DeriveRekeyedIKEKeys derives keys for an IKE-SA rekey. RFC 7296 section
+// 2.18 uses the previous SA's PRF and SK_d to produce SKEYSEED.
+func DeriveRekeyedIKEKeys(oldPRFID uint16, oldSKd []byte, suite SASuite, sharedSecret, ni, nr []byte, spiI, spiR uint64) (*IKEKeys, error) {
+	if PRFOutputLen(oldPRFID) == 0 {
+		return nil, fmt.Errorf("ike: unsupported previous PRF %d", oldPRFID)
+	}
+	skeyseed := prf(oldPRFID, oldSKd, concat(sharedSecret, ni, nr))
+	return deriveIKEKeys(suite, skeyseed, ni, nr, spiI, spiR)
+}
+
+func deriveIKEKeys(suite SASuite, skeyseed, ni, nr []byte, spiI, spiR uint64) (*IKEKeys, error) {
 	ap, err := aeadParams(suite.EncrID, suite.EncrKeyBits)
 	if err != nil {
 		return nil, err
@@ -190,8 +205,6 @@ func DeriveIKEKeys(suite SASuite, sharedSecret, ni, nr []byte, spiI, spiR uint64
 	if prfLen == 0 {
 		return nil, fmt.Errorf("ike: unsupported PRF %d", suite.PRFID)
 	}
-	skeyseed := prf(suite.PRFID, append(append([]byte{}, ni...), nr...), sharedSecret)
-
 	var spiBuf [16]byte
 	putUint64(spiBuf[0:8], spiI)
 	putUint64(spiBuf[8:16], spiR)
