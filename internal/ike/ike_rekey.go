@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -26,6 +27,12 @@ func (s *Session) RekeyIKE() error {
 	if _, err := rand.Read(ni); err != nil {
 		return fmt.Errorf("ike: generate IKE SA rekey nonce: %w", err)
 	}
+	s.localRekey = &ikeRekey{old: old, nonce: ni}
+	defer func() {
+		if s.localRekey != nil && s.localRekey.old == old {
+			s.localRekey = nil
+		}
+	}()
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiI)
 	response, err := s.requestLocked(CREATE_CHILD_SA, []RawPayload{
@@ -99,6 +106,20 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: derive IKE SA rekey keys: %w", err)
 	}
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR}
+	// A peer candidate with the larger initiator nonce already replaced old.
+	// The peer will retire this lower-nonce candidate; do not displace its
+	// winner or send a Delete on the old SA.
+	if s.current != old {
+		return nil
+	}
+	if s.collision != nil {
+		loser := s.collision
+		if _, err := s.requestOnLocked(loser, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
+			return fmt.Errorf("ike: retire lower-nonce IKE SA: %w", err)
+		}
+		s.mux.UnregisterIKE(loser.spiI)
+		s.collision = nil
+	}
 	if err := s.mux.RegisterIKE(spiI); err != nil {
 		return fmt.Errorf("ike: register rekeyed IKE SA: %w", err)
 	}
@@ -117,7 +138,7 @@ func (s *Session) RekeyIKE() error {
 // protected by ctx; the newly-derived context becomes current for subsequent
 // exchanges while ctx stays available until the peer deletes it.
 func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
-	if ctx != s.current || s.old != nil {
+	if ctx != s.current || (s.old != nil && s.localRekey == nil) || s.collision != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	var sa, nonce, ke *RawPayload
@@ -182,8 +203,15 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return nil, fmt.Errorf("ike: register peer rekeyed IKE SA: %w", err)
 	}
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
-	s.old = ctx
-	s.current = newContext
+	if local := s.localRekey; local != nil && local.old == ctx && compareIKENonces(nonce.Body, local.nonce) < 0 {
+		// RFC 7296 section 2.8 retains the SA whose initiator nonce is larger.
+		// Keep this lower-nonce peer candidate reachable until RekeyIKE can
+		// delete it after its own candidate is established.
+		s.collision = newContext
+	} else {
+		s.old = ctx
+		s.current = newContext
+	}
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiR)
 	response := Proposal{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: selected}
@@ -192,6 +220,19 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		{Type: PayloadNonce, Body: EncodeNonce(nr)},
 		{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
 	})
+}
+
+// compareIKENonces compares IKE initiator nonces as unsigned integers.
+func compareIKENonces(a, b []byte) int {
+	a = bytes.TrimLeft(a, "\x00")
+	b = bytes.TrimLeft(b, "\x00")
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return bytes.Compare(a, b)
 }
 
 func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {

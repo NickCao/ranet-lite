@@ -67,6 +67,11 @@ type Session struct {
 	mux     *transport.Mux
 	current *ikeContext
 	old     *ikeContext
+	// collision retains the losing peer-initiated candidate until the local
+	// rekey exchange can delete it. The normal current/old pair retains the
+	// winning candidate and the SA it replaces.
+	collision  *ikeContext
+	localRekey *ikeRekey
 
 	requestMu sync.Mutex // IKEv2 permits only one outstanding local request.
 	requests  chan *localRequest
@@ -79,6 +84,11 @@ type Session struct {
 	onChild     func(ChildSA) error
 	onRetire    func(uint32) error
 	lastTraffic atomic.Int64
+}
+
+type ikeRekey struct {
+	old   *ikeContext
+	nonce []byte
 }
 
 func (s *Session) Mux() *transport.Mux { return s.mux }

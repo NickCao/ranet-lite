@@ -230,6 +230,9 @@ func (s *Session) contextForHeader(hdr *Header) *ikeContext {
 	if s.old != nil && hdr.SPIInitiator == s.old.spiI && hdr.SPIResponder == s.old.spiR {
 		return s.old
 	}
+	if s.collision != nil && hdr.SPIInitiator == s.collision.spiI && hdr.SPIResponder == s.collision.spiR {
+		return s.collision
+	}
 	return nil
 }
 
@@ -248,9 +251,13 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
-				if ctx == s.old {
+				if ctx == s.old || ctx == s.collision {
 					s.mux.UnregisterIKE(ctx.spiI)
-					s.old = nil
+					if ctx == s.old {
+						s.old = nil
+					} else {
+						s.collision = nil
+					}
 					return response, nil
 				}
 				return response, fmt.Errorf("peer deleted IKE SA")

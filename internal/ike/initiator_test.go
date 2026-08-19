@@ -453,6 +453,26 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	}
 }
 
+func TestCompareIKENonces(t *testing.T) {
+	tests := []struct {
+		a, b []byte
+		want int
+	}{
+		{[]byte{0x00, 0xff}, []byte{0x01, 0x00}, -1},
+		{[]byte{0x80}, []byte{0x7f}, 1},
+		{[]byte{0x42}, []byte{0x42}, 0},
+		{[]byte{0x00, 0x01}, []byte{0x01}, 0},
+		{[]byte{0xff}, []byte{0x01, 0x00}, -1},
+	}
+	for _, test := range tests {
+		got := compareIKENonces(test.a, test.b)
+		if (got < 0 && test.want < 0) || (got == 0 && test.want == 0) || (got > 0 && test.want > 0) {
+			continue
+		}
+		t.Errorf("compareIKENonces(%x, %x) = %d, want sign %d", test.a, test.b, got, test.want)
+	}
+}
+
 func encodeTestMessage(t *testing.T, hdr Header, payloads []RawPayload) []byte {
 	t.Helper()
 	m := &Message{Header: hdr, Payloads: payloads}
