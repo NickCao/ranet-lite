@@ -149,13 +149,23 @@ func removeNode[V comparable](root **trieNode[V], n *trieNode[V]) {
 	removeNode(root, n.parent)
 }
 
-func lookupDest[V comparable](root *trieNode[V], ip []byte) *trieNode[V] {
-	var found *trieNode[V]
-	for n := root; n != nil && commonBits(n.bits, ip) >= n.cidr; n = n.child[n.choose(ip)] {
-		if len(n.srcs) > 0 {
-			found = n
+func lookupApplicable[V comparable](root *trieNode[V], dst []byte, src netip.Addr) *srcEntry[V] {
+	var found *srcEntry[V]
+	for n := root; n != nil && commonBits(n.bits, dst) >= n.cidr; n = n.child[n.choose(dst)] {
+		var best *srcEntry[V]
+		for i := range n.srcs {
+			entry := &n.srcs[i]
+			if entry.src.IsValid() && !entry.src.Contains(src) {
+				continue
+			}
+			if best == nil || sourceBits(entry.src) > sourceBits(best.src) {
+				best = entry
+			}
 		}
-		if n.bitAtByte == uint8(len(ip)) {
+		if best != nil {
+			found = best
+		}
+		if n.bitAtByte == uint8(len(dst)) {
 			break
 		}
 	}
@@ -240,20 +250,7 @@ func (t *Table[V]) Lookup(src, dst netip.Addr) (V, bool) {
 	if dst.Is4() {
 		root = t.ipv4
 	}
-	node := lookupDest(root, dst.AsSlice())
-	if node == nil {
-		return zero, false
-	}
-	var best *srcEntry[V]
-	for i := range node.srcs {
-		entry := &node.srcs[i]
-		if entry.src.IsValid() && !entry.src.Contains(src) {
-			continue
-		}
-		if best == nil || sourceBits(entry.src) > sourceBits(best.src) {
-			best = entry
-		}
-	}
+	best := lookupApplicable(root, dst.AsSlice(), src)
 	if best == nil {
 		return zero, false
 	}

@@ -55,3 +55,16 @@ func TestTableIPv4AndIPv6(t *testing.T) {
 		t.Fatal("unexpected cross-family route")
 	}
 }
+
+func TestTableFallsBackPastInapplicableDestination(t *testing.T) {
+	var table Table[string]
+	table.Set(netip.Prefix{}, prefix("2001:db8::/32"), "fallback")
+	table.Set(prefix("fd00:1::/64"), prefix("2001:db8:1::/64"), "specific")
+
+	if got, ok := table.Lookup(addr("fd00:2::1"), addr("2001:db8:1::1")); !ok || got != "fallback" {
+		t.Fatalf("got %q, %v; want fallback, true", got, ok)
+	}
+	if got, ok := table.Lookup(addr("fd00:1::1"), addr("2001:db8:1::1")); !ok || got != "specific" {
+		t.Fatalf("got %q, %v; want specific, true", got, ok)
+	}
+}
