@@ -34,6 +34,9 @@ type PeerConfig struct {
 	RemoteAddr net.IP
 	RemotePort int // ranet registry endpoint port (often non-standard, e.g. 13000); the only port ever used, IKE and ESP alike
 	Hub        *transport.Hub
+
+	ChildRekeyInterval time.Duration
+	IKERekeyInterval   time.Duration
 }
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
@@ -65,6 +68,7 @@ type ikeContext struct {
 // deletes) for as long as the ESP Child SA is in use.
 type Session struct {
 	mux     *transport.Mux
+	stateMu sync.RWMutex
 	current *ikeContext
 	old     *ikeContext
 	// collision retains the losing peer-initiated candidate until the local
@@ -84,6 +88,9 @@ type Session struct {
 	onChild     func(ChildSA) error
 	onRetire    func(uint32) error
 	lastTraffic atomic.Int64
+
+	childRekeyInterval time.Duration
+	ikeRekeyInterval   time.Duration
 }
 
 type ikeRekey struct {
@@ -92,6 +99,49 @@ type ikeRekey struct {
 }
 
 func (s *Session) Mux() *transport.Mux { return s.mux }
+
+func (s *Session) contexts() (current, old *ikeContext) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.current, s.old
+}
+
+func (s *Session) currentContext() *ikeContext {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.current
+}
+
+func (s *Session) nextPeerMessageID(ctx *ikeContext) uint32 {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return ctx.nextPeerMID
+}
+
+func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.old == ctx {
+		s.old = nil
+		return true
+	}
+	if s.collision == ctx {
+		s.collision = nil
+		return true
+	}
+	return false
+}
+
+// SetRekeyIntervals configures optional periodic Child and IKE SA rekeys.
+// Zero disables an interval. It must be called before Run.
+func (s *Session) SetRekeyIntervals(child, ike time.Duration) error {
+	if child < 0 || ike < 0 {
+		return fmt.Errorf("ike: rekey intervals must be positive when set")
+	}
+	s.childRekeyInterval = child
+	s.ikeRekeyInterval = ike
+	return nil
+}
 
 // SetChildHandler installs replacement ESP SAs before Run acknowledges a
 // peer-initiated rekey, as required by RFC 7296 section 2.8.
@@ -402,6 +452,10 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 
 	if err := sess.doIKEAuth(cfg, req, respRaw, ni, nr); err != nil {
+		mux.Close()
+		return nil, err
+	}
+	if err := sess.SetRekeyIntervals(cfg.ChildRekeyInterval, cfg.IKERekeyInterval); err != nil {
 		mux.Close()
 		return nil, err
 	}

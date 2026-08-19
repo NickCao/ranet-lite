@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,61 @@ func listenPeer(t *testing.T) *net.UDPConn {
 	}
 	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+func TestSessionScheduledRekeyFailureEndsRun(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	s := &Session{
+		mux: mux,
+		current: &ikeContext{suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+			skei: make([]byte, 20), sker: make([]byte, 20), skD: []byte("test child rekey SK_d material")},
+		Child:    ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 0x10203040, RemoteSPI: 0x50607080},
+		requests: make(chan *localRequest, 1),
+	}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRekeyIntervals(time.Millisecond, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		buf := make([]byte, 2048)
+		n, addr, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read scheduled rekey request: %v", err)
+			return
+		}
+		raw := append([]byte(nil), buf[4:n]...)
+		m, err := DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode scheduled rekey request: %v", err)
+			return
+		}
+		response, err := EncryptMessage(suite, s.current.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: m.Header.ExchangeType, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NO_PROPOSAL_CHOSEN})}})
+		if err != nil {
+			t.Errorf("encrypt scheduled rekey response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write scheduled rekey response: %v", err)
+		}
+	}()
+
+	err = s.Run()
+	if err == nil || !strings.Contains(err.Error(), "scheduled rekey") {
+		t.Fatalf("Run error = %v, want scheduled rekey failure", err)
+	}
 }
 
 func TestSessionRekeyChild(t *testing.T) {
@@ -296,8 +352,9 @@ func TestSessionRekeyIKE(t *testing.T) {
 		t.Fatalf("RekeyIKE: %v", err)
 	}
 	<-peerDone
-	if s.current == old || s.current.spiR != newSPIr || s.old != nil {
-		t.Fatalf("IKE contexts not promoted and retired: current=%#v old=%#v", s.current, s.old)
+	current, retained := s.contexts()
+	if current == old || current.spiR != newSPIr || retained != nil {
+		t.Fatalf("IKE contexts not promoted and retired: current=%#v old=%#v", current, retained)
 	}
 	if got := s.currentChild(); got.EncrID != child.EncrID || got.EncrKeyBits != child.EncrKeyBits || got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || len(got.InboundKey) != 0 || len(got.OutboundKey) != 0 {
 		t.Fatalf("Child SA changed during IKE rekey: %#v, want %#v", got, child)
@@ -397,14 +454,15 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.current == old || !s.current.responder || s.old != old || s.current.suite != newSuite || s.current.spiI != newSPIi || s.current.spiR != newSPIr || string(s.current.skD) != string(keys.SKd) || string(s.current.skei) != string(keys.SKei) || string(s.current.sker) != string(keys.SKer) {
-		t.Fatalf("peer rekey contexts = current %#v old %#v", s.current, s.old)
+	current, retained := s.contexts()
+	if current == old || !current.responder || retained != old || current.suite != newSuite || current.spiI != newSPIi || current.spiR != newSPIr || string(current.skD) != string(keys.SKd) || string(current.skei) != string(keys.SKei) || string(current.sker) != string(keys.SKer) {
+		t.Fatalf("peer rekey contexts = current %#v old %#v", current, retained)
 	}
 	if got := s.currentChild(); got.EncrID != child.EncrID || got.EncrKeyBits != child.EncrKeyBits || got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || len(got.InboundKey) != 0 || len(got.OutboundKey) != 0 {
 		t.Fatalf("Child SA changed during peer IKE rekey: %#v, want %#v", got, child)
 	}
 
-	request, err = EncryptMessage(s.current.suite, keys.SKei, Header{SPIInitiator: newSPIi, SPIResponder: newSPIr, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 0}, nil, nil)
+	request, err = EncryptMessage(current.suite, keys.SKei, Header{SPIInitiator: newSPIi, SPIResponder: newSPIr, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 0}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +478,7 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if err != nil || response.Header.SPIInitiator != newSPIi || response.Header.SPIResponder != newSPIr || response.Header.Flags != FlagResponse {
 		t.Fatalf("new-context response header = %#v, err=%v", response.Header, err)
 	}
-	if _, err := DecryptMessage(s.current.suite, keys.SKer, responseRaw, response); err != nil {
+	if _, err := DecryptMessage(current.suite, keys.SKer, responseRaw, response); err != nil {
 		t.Fatalf("decrypt new-context response: %v", err)
 	}
 
@@ -443,7 +501,8 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	if _, err := DecryptMessage(old.suite, old.skei, responseRaw, response); err != nil {
 		t.Fatalf("decrypt old delete response: %v", err)
 	}
-	if s.old != nil || s.contextForHeader(&Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr}) != nil {
+	_, retained = s.contexts()
+	if retained != nil || s.contextForHeader(&Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr}) != nil {
 		t.Fatal("old IKE context was not removed after peer delete")
 	}
 
@@ -730,8 +789,9 @@ func TestSessionRunUsesOldIKEContext(t *testing.T) {
 	if _, err := DecryptMessage(old.suite, old.skei, responseRaw, response); err != nil {
 		t.Fatalf("decrypt old-context response: %v", err)
 	}
-	if old.nextPeerMID != 1 || current.nextPeerMID != 0 {
-		t.Fatalf("peer message IDs old/current = %d/%d, want 1/0", old.nextPeerMID, current.nextPeerMID)
+	oldMID, currentMID := s.nextPeerMessageID(old), s.nextPeerMessageID(current)
+	if oldMID != 1 || currentMID != 0 {
+		t.Fatalf("peer message IDs old/current = %d/%d, want 1/0", oldMID, currentMID)
 	}
 	_ = mux.Close()
 	if err := <-runDone; err == nil {

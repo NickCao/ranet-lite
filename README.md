@@ -111,6 +111,11 @@ originate:
 # set to 0 to disable replay checking.
 # replay_window: 32
 
+# Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
+# Set either to 0 to disable it, or override the default with another duration.
+# child_rekey_interval: 1h
+# ike_rekey_interval: 3h
+
 # Optional fixed TUN name. It attaches to an existing compatible device or
 # creates it when absent. Omit to create an automatically named ranet%d device.
 # tun: ranet0

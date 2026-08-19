@@ -253,16 +253,18 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	log.Printf("peer %s: dialing %s:%d (serial %s)", name, remoteIP, ep.Port, ep.SerialNumber)
 
 	ikeCfg := ike.PeerConfig{
-		Organization:     cfg.Organization,
-		LocalCommonName:  cfg.CommonName,
-		LocalSerial:      local.SerialNumber,
-		LocalPrivateKey:  priv,
-		RemoteCommonName: node.CommonName,
-		RemoteSerial:     ep.SerialNumber,
-		RemotePublicKey:  remotePub,
-		RemoteAddr:       remoteIP,
-		RemotePort:       int(ep.Port),
-		Hub:              hub,
+		Organization:       cfg.Organization,
+		LocalCommonName:    cfg.CommonName,
+		LocalSerial:        local.SerialNumber,
+		LocalPrivateKey:    priv,
+		RemoteCommonName:   node.CommonName,
+		RemoteSerial:       ep.SerialNumber,
+		RemotePublicKey:    remotePub,
+		RemoteAddr:         remoteIP,
+		RemotePort:         int(ep.Port),
+		Hub:                hub,
+		ChildRekeyInterval: cfg.ChildRekeyIntervalValue(),
+		IKERekeyInterval:   cfg.IKERekeyIntervalValue(),
 	}
 	sess, err := ike.Initiate(ikeCfg)
 	if err != nil {

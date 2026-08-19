@@ -32,9 +32,30 @@ type Config struct {
 	// ReplayWindow matches strongSwan's child replay_window: omitted uses 32,
 	// while an explicit 0 disables replay checking.
 	ReplayWindow *uint32 `yaml:"replay_window"`
+	// Rekey intervals default to one hour for Child SAs and three hours for
+	// IKE SAs. An explicit zero disables the corresponding proactive rekey.
+	ChildRekeyInterval *Duration `yaml:"child_rekey_interval"`
+	IKERekeyInterval   *Duration `yaml:"ike_rekey_interval"`
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
+}
+
+// Duration accepts standard Go duration strings and a bare YAML zero.
+// The latter keeps `child_rekey_interval: 0` concise when disabling rekeys.
+type Duration time.Duration
+
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode && value.Tag == "!!int" && value.Value == "0" {
+		*d = 0
+		return nil
+	}
+	parsed, err := time.ParseDuration(value.Value)
+	if err != nil {
+		return err
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 func (c *Config) ReplayWindowSize() uint32 {
@@ -42,6 +63,20 @@ func (c *Config) ReplayWindowSize() uint32 {
 		return 32
 	}
 	return *c.ReplayWindow
+}
+
+func (c *Config) ChildRekeyIntervalValue() time.Duration {
+	if c.ChildRekeyInterval == nil {
+		return time.Hour
+	}
+	return time.Duration(*c.ChildRekeyInterval)
+}
+
+func (c *Config) IKERekeyIntervalValue() time.Duration {
+	if c.IKERekeyInterval == nil {
+		return 3 * time.Hour
+	}
+	return time.Duration(*c.IKERekeyInterval)
 }
 
 // Endpoint mirrors the identity portion of ranet's endpoint configuration.
@@ -106,6 +141,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: registry is required")
 	case len(c.Peers) == 0:
 		return fmt.Errorf("config: at least one peer is required")
+	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
+		return fmt.Errorf("config: child_rekey_interval must be positive when set")
+	case c.IKERekeyInterval != nil && time.Duration(*c.IKERekeyInterval) < 0:
+		return fmt.Errorf("config: ike_rekey_interval must be positive when set")
 	}
 	for _, ep := range c.Endpoints {
 		if ep.SerialNumber == "" || (ep.AddressFamily != "ip4" && ep.AddressFamily != "ip6") {

@@ -13,7 +13,7 @@ func (s *Session) RekeyIKE() error {
 	s.requestMu.Lock()
 	defer s.requestMu.Unlock()
 
-	old := s.current
+	old := s.currentContext()
 	spiI := randUint64Nonzero()
 	for spiI == old.spiI {
 		spiI = randUint64Nonzero()
@@ -27,8 +27,12 @@ func (s *Session) RekeyIKE() error {
 	if _, err := rand.Read(ni); err != nil {
 		return fmt.Errorf("ike: generate IKE SA rekey nonce: %w", err)
 	}
+	s.stateMu.Lock()
 	s.localRekey = &ikeRekey{old: old, nonce: ni}
+	s.stateMu.Unlock()
 	defer func() {
+		s.stateMu.Lock()
+		defer s.stateMu.Unlock()
 		if s.localRekey != nil && s.localRekey.old == old {
 			s.localRekey = nil
 		}
@@ -109,28 +113,41 @@ func (s *Session) RekeyIKE() error {
 	// A peer candidate with the larger initiator nonce already replaced old.
 	// The peer will retire this lower-nonce candidate; do not displace its
 	// winner or send a Delete on the old SA.
-	if s.current != old {
+	s.stateMu.RLock()
+	current, collision := s.current, s.collision
+	s.stateMu.RUnlock()
+	if current != old {
 		return nil
 	}
-	if s.collision != nil {
-		loser := s.collision
+	if collision != nil {
+		loser := collision
 		if _, err := s.requestOnLocked(loser, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
 			return fmt.Errorf("ike: retire lower-nonce IKE SA: %w", err)
 		}
 		s.mux.UnregisterIKE(loser.spiI)
-		s.collision = nil
+		s.stateMu.Lock()
+		if s.collision == loser {
+			s.collision = nil
+		}
+		s.stateMu.Unlock()
 	}
 	if err := s.mux.RegisterIKE(spiI); err != nil {
 		return fmt.Errorf("ike: register rekeyed IKE SA: %w", err)
 	}
+	s.stateMu.Lock()
 	s.old = old
 	s.current = newContext
+	s.stateMu.Unlock()
 
 	if _, err := s.requestOnLocked(old, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
 		return fmt.Errorf("ike: retire replaced IKE SA: %w", err)
 	}
 	s.mux.UnregisterIKE(old.spiI)
-	s.old = nil
+	s.stateMu.Lock()
+	if s.old == old {
+		s.old = nil
+	}
+	s.stateMu.Unlock()
 	return nil
 }
 
@@ -138,7 +155,10 @@ func (s *Session) RekeyIKE() error {
 // protected by ctx; the newly-derived context becomes current for subsequent
 // exchanges while ctx stays available until the peer deletes it.
 func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
-	if ctx != s.current || (s.old != nil && s.localRekey == nil) || s.collision != nil {
+	s.stateMu.RLock()
+	accept := ctx == s.current && (s.old == nil || s.localRekey != nil) && s.collision == nil
+	s.stateMu.RUnlock()
+	if !accept {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	var sa, nonce, ke *RawPayload
@@ -203,7 +223,9 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return nil, fmt.Errorf("ike: register peer rekeyed IKE SA: %w", err)
 	}
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
-	if local := s.localRekey; local != nil && local.old == ctx && compareIKENonces(nonce.Body, local.nonce) < 0 {
+	s.stateMu.Lock()
+	local := s.localRekey
+	if local != nil && local.old == ctx && compareIKENonces(nonce.Body, local.nonce) < 0 {
 		// RFC 7296 section 2.8 retains the SA whose initiator nonce is larger.
 		// Keep this lower-nonce peer candidate reachable until RekeyIKE can
 		// delete it after its own candidate is established.
@@ -212,6 +234,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		s.old = ctx
 		s.current = newContext
 	}
+	s.stateMu.Unlock()
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiR)
 	response := Proposal{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: selected}

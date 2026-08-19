@@ -36,6 +36,14 @@ type pendingRequest struct {
 	deadline time.Time
 }
 
+type scheduledRekey uint8
+
+const (
+	noScheduledRekey scheduledRekey = iota
+	childScheduledRekey
+	ikeScheduledRekey
+)
+
 func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 	for i := range payloads {
 		if payloads[i].Type == t {
@@ -50,7 +58,79 @@ func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 func (s *Session) Run() error {
 	lastAuthenticated := time.Now()
 	var pending *pendingRequest
+	var childTimer, ikeTimer *time.Timer
+	var childDeadline, ikeDeadline time.Time
+	if s.childRekeyInterval > 0 {
+		childTimer = time.NewTimer(s.childRekeyInterval)
+		childDeadline = time.Now().Add(s.childRekeyInterval)
+		defer childTimer.Stop()
+	}
+	if s.ikeRekeyInterval > 0 {
+		ikeTimer = time.NewTimer(s.ikeRekeyInterval)
+		ikeDeadline = time.Now().Add(s.ikeRekeyInterval)
+		defer ikeTimer.Stop()
+	}
+	rekeyResult := make(chan error, 1)
+	var running scheduledRekey
+	var childDue, ikeDue bool
+	startRekey := func(kind scheduledRekey) {
+		running = kind
+		go func() {
+			if kind == childScheduledRekey {
+				rekeyResult <- s.RekeyChild()
+			} else {
+				rekeyResult <- s.RekeyIKE()
+			}
+		}()
+	}
+	startDueRekey := func() {
+		if running != noScheduledRekey {
+			return
+		}
+		if childDue {
+			childDue = false
+			startRekey(childScheduledRekey)
+		} else if ikeDue {
+			ikeDue = false
+			startRekey(ikeScheduledRekey)
+		}
+	}
 	for {
+		select {
+		case err := <-rekeyResult:
+			if err != nil {
+				s.mux.Close()
+				return fmt.Errorf("ike: scheduled rekey: %w", err)
+			}
+			if running == childScheduledRekey {
+				childTimer.Reset(s.childRekeyInterval)
+				childDeadline = time.Now().Add(s.childRekeyInterval)
+			} else {
+				ikeTimer.Reset(s.ikeRekeyInterval)
+				ikeDeadline = time.Now().Add(s.ikeRekeyInterval)
+			}
+			running = noScheduledRekey
+			startDueRekey()
+		default:
+		}
+		if childTimer != nil {
+			select {
+			case <-childTimer.C:
+				childDeadline = time.Time{}
+				childDue = true
+				startDueRekey()
+			default:
+			}
+		}
+		if ikeTimer != nil {
+			select {
+			case <-ikeTimer.C:
+				ikeDeadline = time.Time{}
+				ikeDue = true
+				startDueRekey()
+			default:
+			}
+		}
 		if nanos := s.lastTraffic.Load(); nanos != 0 {
 			if traffic := time.Unix(0, nanos); traffic.After(lastAuthenticated) {
 				lastAuthenticated = traffic
@@ -71,6 +151,12 @@ func (s *Session) Run() error {
 		deadline := lastAuthenticated.Add(dpdInterval)
 		if pending != nil && pending.deadline.Before(deadline) {
 			deadline = pending.deadline
+		}
+		if !childDeadline.IsZero() && childDeadline.Before(deadline) {
+			deadline = childDeadline
+		}
+		if !ikeDeadline.IsZero() && ikeDeadline.Before(deadline) {
+			deadline = ikeDeadline
 		}
 		// Mux has no selectable receive channel. Polling avoids another receiver.
 		if poll := time.Now().Add(requestPollInterval); poll.Before(deadline) {
@@ -127,7 +213,7 @@ func (s *Session) request(exchange ExchangeType, inner []RawPayload) ([]RawPaylo
 
 // requestLocked sends a local request while requestMu is held.
 func (s *Session) requestLocked(exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
-	return s.requestOnLocked(s.current, exchange, inner)
+	return s.requestOnLocked(s.currentContext(), exchange, inner)
 }
 
 func (s *Session) requestOnLocked(context *ikeContext, exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
@@ -140,7 +226,7 @@ func (s *Session) requestOnLocked(context *ikeContext, exchange ExchangeType, in
 func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 	context := req.context
 	if context == nil {
-		context = s.current
+		context = s.currentContext()
 	}
 	msgID := context.nextLocalMID
 	context.nextLocalMID++
@@ -197,9 +283,14 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	if hdr.IsInitiator() != ctx.responder || hdr.IsResponse() {
 		return false
 	}
-	if hdr.MessageID != ctx.nextPeerMID {
-		if ctx.nextPeerMID > 0 && hdr.MessageID == ctx.nextPeerMID-1 && ctx.lastPeerResponseID == hdr.MessageID {
-			if err := s.mux.SendIKE(ctx.lastPeerResponse); err != nil {
+	s.stateMu.RLock()
+	nextPeerMID := ctx.nextPeerMID
+	lastPeerResponseID := ctx.lastPeerResponseID
+	lastPeerResponse := ctx.lastPeerResponse
+	s.stateMu.RUnlock()
+	if hdr.MessageID != nextPeerMID {
+		if nextPeerMID > 0 && hdr.MessageID == nextPeerMID-1 && lastPeerResponseID == hdr.MessageID {
+			if err := s.mux.SendIKE(lastPeerResponse); err != nil {
 				s.mux.Close()
 			}
 		}
@@ -217,13 +308,17 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 		s.mux.Close()
 		return true
 	}
+	s.stateMu.Lock()
 	ctx.lastPeerResponseID = hdr.MessageID
 	ctx.lastPeerResponse = response
 	ctx.nextPeerMID++
+	s.stateMu.Unlock()
 	return true
 }
 
 func (s *Session) contextForHeader(hdr *Header) *ikeContext {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	if hdr.SPIInitiator == s.current.spiI && hdr.SPIResponder == s.current.spiR {
 		return s.current
 	}
@@ -251,13 +346,8 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				if err != nil {
 					return nil, err
 				}
-				if ctx == s.old || ctx == s.collision {
+				if s.removeRetainedContext(ctx) {
 					s.mux.UnregisterIKE(ctx.spiI)
-					if ctx == s.old {
-						s.old = nil
-					} else {
-						s.collision = nil
-					}
 					return response, nil
 				}
 				return response, fmt.Errorf("peer deleted IKE SA")

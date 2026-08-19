@@ -24,6 +24,11 @@ originate:
 # set to 0 to disable replay checking.
 # replay_window: 32
 
+# Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
+# Set either to 0 to disable it, or override the default with another duration.
+# child_rekey_interval: 1h
+# ike_rekey_interval: 3h
+
 # One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
 # endpoint only dials remote endpoints with the same address family.
 peers:
