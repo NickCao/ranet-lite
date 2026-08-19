@@ -169,12 +169,18 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		u.Ignore = true
 		return u, nil
 	}
+	sourcePrefixes := 0
 	for _, s := range subs {
 		if s.Type < 128 {
 			continue // non-mandatory: safe to skip if unrecognized
 		}
 		if s.Type != SubTLVSourcePrefix {
 			u.Ignore = true // some other mandatory sub-TLV we don't understand at all
+			continue
+		}
+		sourcePrefixes++
+		if sourcePrefixes > 1 {
+			u.Ignore = true
 			continue
 		}
 		if sp, ok := decodeSourcePrefix(ae, s.Body); ok {

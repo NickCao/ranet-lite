@@ -291,7 +291,7 @@ func randUint32Nonzero() uint32 {
 		var b [4]byte
 		rand.Read(b[:])
 		v := binary.BigEndian.Uint32(b[:])
-		if v != 0 {
+		if v > 255 {
 			return v
 		}
 	}
@@ -492,6 +492,10 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		return nil, fmt.Errorf("ike: KE group mismatch (got %d, used %d)", peerGroup, group)
 	}
 	nr := DecodeNonce(noncePl.Body)
+	if !validNonce(nr) {
+		mux.Close()
+		return nil, fmt.Errorf("ike: responder nonce length %d is outside 16..256", len(nr))
+	}
 
 	shared, err := dh.SharedSecret(peerPub)
 	if err != nil {
@@ -669,6 +673,9 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	responderSigned := concat(realMessage2, ni, macedIDForR)
 	if err := VerifyAuth(cfg.RemotePublicKey, responderSigned, authRecv.Body); err != nil {
 		return err
+	}
+	if string(idrRecv.Body) != string(idrBody) {
+		return fmt.Errorf("ike: responder identity does not match configured IDr")
 	}
 	if err := validateFullRangeSelectors(tsiRecv, tsrRecv); err != nil {
 		return err

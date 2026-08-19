@@ -67,11 +67,13 @@ func decodeChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, 
 			return childExchangePayloads{}, err
 		}
 	}
-	if out.sa == nil || out.nonce == nil || out.tsi == nil || out.tsr == nil || len(out.nonce.Body) == 0 {
+	if out.sa == nil || out.nonce == nil || out.tsi == nil || out.tsr == nil || !validNonce(out.nonce.Body) {
 		return childExchangePayloads{}, fmt.Errorf("ike: incomplete Child SA exchange")
 	}
 	return out, nil
 }
+
+func validNonce(nonce []byte) bool { return len(nonce) >= 16 && len(nonce) <= 256 }
 
 func canonicalEncryptionTransform(t Transform) (Transform, error) {
 	if t.Type != TransEncr {

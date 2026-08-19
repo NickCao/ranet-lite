@@ -68,7 +68,7 @@ func (s *Session) RekeyIKE() error {
 			ke = &response[i]
 		}
 	}
-	if sa == nil || nonce == nil || ke == nil || len(nonce.Body) == 0 {
+	if sa == nil || nonce == nil || ke == nil || !validNonce(nonce.Body) {
 		return fmt.Errorf("ike: incomplete IKE SA rekey response")
 	}
 	props, err := DecodeSA(sa.Body)
@@ -198,7 +198,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 		}
 	}
-	if sa == nil || nonce == nil || ke == nil || len(nonce.Body) == 0 {
+	if sa == nil || nonce == nil || ke == nil || !validNonce(nonce.Body) {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	props, err := DecodeSA(sa.Body)

@@ -201,6 +201,11 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	if padLen+2 > len(plain) {
 		return nil, 0, fmt.Errorf("esp: invalid padding")
 	}
+	for i, value := range plain[len(plain)-2-padLen : len(plain)-2] {
+		if value != byte(i+1) {
+			return nil, 0, fmt.Errorf("esp: invalid padding contents")
+		}
+	}
 
 	return plain[:len(plain)-2-padLen], nextHeader, nil
 }

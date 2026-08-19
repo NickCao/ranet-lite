@@ -184,6 +184,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: replay_window must not exceed %d", uint32(1<<20))
 	case c.Babel.HelloInterval < 0 || c.Babel.UpdateInterval < 0:
 		return fmt.Errorf("config: babel intervals must be nonnegative")
+	case c.Babel.HelloInterval > 0 && c.Babel.HelloInterval < 10*time.Millisecond:
+		return fmt.Errorf("config: babel hello_interval must be at least 10ms")
+	case c.Babel.UpdateInterval > 0 && c.Babel.UpdateInterval < 10*time.Millisecond:
+		return fmt.Errorf("config: babel update_interval must be at least 10ms")
 	case c.Babel.HelloInterval > 655350*time.Millisecond || c.Babel.UpdateInterval > 655350*time.Millisecond:
 		return fmt.Errorf("config: babel intervals must fit the protocol's 16-bit centisecond field")
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
