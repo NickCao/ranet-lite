@@ -113,25 +113,35 @@ func (s *Session) RekeyIKE() error {
 		return fmt.Errorf("ike: derive IKE SA rekey keys: %w", err)
 	}
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR}
-	// A peer candidate with the larger initiator nonce already replaced old.
-	// The peer will retire this lower-nonce candidate; do not displace its
-	// winner or send a Delete on the old SA.
 	s.stateMu.RLock()
-	current, collision := s.current, s.collision
+	collision := s.collision
+	localRekey := s.localRekey
 	s.stateMu.RUnlock()
-	if current != old {
-		slog.Info("ike simultaneous rekey selected peer candidate")
-		return nil
-	}
 	if collision != nil {
-		slog.Info("ike simultaneous rekey selected local candidate")
-		loser := collision
-		if _, err := s.requestOnLocked(loser, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
-			return fmt.Errorf("ike: retire lower-nonce IKE SA: %w", err)
+		localLoses := lowestNonceBelongsToFirst(ni, nonce.Body, localRekey.peerNonce, localRekey.peerResponseNonce)
+		if localLoses {
+			slog.Info("ike simultaneous rekey selected peer candidate")
+			if err := s.mux.RegisterIKE(spiI); err != nil {
+				return fmt.Errorf("ike: register redundant IKE SA: %w", err)
+			}
+			if _, err := s.requestOnLocked(newContext, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
+				return fmt.Errorf("ike: delete redundant local IKE SA: %w", err)
+			}
+			s.mux.UnregisterIKE(spiI)
+			s.stateMu.Lock()
+			s.old = old
+			s.current = collision
+			s.collision = nil
+			s.stateMu.Unlock()
+			return nil
 		}
-		s.mux.UnregisterIKE(loser.spiI)
+		slog.Info("ike simultaneous rekey selected local candidate")
+		if _, err := s.requestOnLocked(collision, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoIKE})}}); err != nil {
+			return fmt.Errorf("ike: delete redundant peer IKE SA: %w", err)
+		}
+		s.mux.UnregisterIKE(collision.spiI)
 		s.stateMu.Lock()
-		if s.collision == loser {
+		if s.collision == collision {
 			s.collision = nil
 		}
 		s.stateMu.Unlock()
@@ -230,14 +240,9 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	newContext := &ikeContext{suite: suite, skD: keys.SKd, skei: keys.SKei, sker: keys.SKer, skpi: keys.SKpi, skpr: keys.SKpr, spiI: spiI, spiR: spiR, responder: true}
 	s.stateMu.Lock()
 	local := s.localRekey
-	comparison := 0
 	if local != nil && local.old == ctx {
-		comparison = compareIKENonces(nonce.Body, local.nonce)
-	}
-	if local != nil && local.old == ctx && localRekeyWins(comparison, s.tieBreakLocalHigher) {
-		// RFC 7296 section 2.8 retains the SA whose initiator nonce is larger.
-		// Keep this lower-nonce peer candidate reachable until RekeyIKE can
-		// delete it after its own candidate is established.
+		local.peerNonce = append([]byte(nil), nonce.Body...)
+		local.peerResponseNonce = append([]byte(nil), nr...)
 		s.collision = newContext
 	} else {
 		s.old = ctx
@@ -254,10 +259,6 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	})
 }
 
-func localRekeyWins(nonceComparison int, localAddressHigher bool) bool {
-	return nonceComparison < 0 || (nonceComparison == 0 && localAddressHigher)
-}
-
 func (s *Session) fillIKERekeyNonce(nonce []byte) error {
 	if s.ikeRekeyNonce != nil {
 		return s.ikeRekeyNonce(nonce)
@@ -266,17 +267,26 @@ func (s *Session) fillIKERekeyNonce(nonce []byte) error {
 	return err
 }
 
-// compareIKENonces compares IKE initiator nonces as unsigned integers.
+// compareIKENonces compares complete nonce octet strings as specified by RFC
+// 7296 section 2.8.2; leading zero octets remain significant.
 func compareIKENonces(a, b []byte) int {
-	a = bytes.TrimLeft(a, "\x00")
-	b = bytes.TrimLeft(b, "\x00")
-	if len(a) < len(b) {
-		return -1
-	}
-	if len(a) > len(b) {
-		return 1
-	}
 	return bytes.Compare(a, b)
+}
+
+// lowestNonceBelongsToFirst reports whether the lowest of the four nonces is
+// from the first rekey exchange, whose candidate must therefore be deleted.
+func lowestNonceBelongsToFirst(firstI, firstR, secondI, secondR []byte) bool {
+	lowest := firstI
+	first := true
+	for _, candidate := range []struct {
+		nonce []byte
+		first bool
+	}{{firstR, true}, {secondI, false}, {secondR, false}} {
+		if bytes.Compare(candidate.nonce, lowest) < 0 {
+			lowest, first = candidate.nonce, candidate.first
+		}
+	}
+	return first
 }
 
 func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {

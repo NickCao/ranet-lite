@@ -609,15 +609,6 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	}
 }
 
-func TestLocalRekeyWinsTieBreak(t *testing.T) {
-	if !localRekeyWins(-1, false) || localRekeyWins(1, true) {
-		t.Fatal("nonce comparison did not select the higher candidate")
-	}
-	if !localRekeyWins(0, true) || localRekeyWins(0, false) {
-		t.Fatal("equal nonce tie break did not select the higher address")
-	}
-}
-
 func TestSessionRekeyIKECollisionKeepsHigherNonceCandidate(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
@@ -868,8 +859,8 @@ func TestCompareIKENonces(t *testing.T) {
 		{[]byte{0x00, 0xff}, []byte{0x01, 0x00}, -1},
 		{[]byte{0x80}, []byte{0x7f}, 1},
 		{[]byte{0x42}, []byte{0x42}, 0},
-		{[]byte{0x00, 0x01}, []byte{0x01}, 0},
-		{[]byte{0xff}, []byte{0x01, 0x00}, -1},
+		{[]byte{0x00, 0x01}, []byte{0x01}, -1},
+		{[]byte{0xff}, []byte{0x01, 0x00}, 1},
 	}
 	for _, test := range tests {
 		got := compareIKENonces(test.a, test.b)
@@ -877,6 +868,15 @@ func TestCompareIKENonces(t *testing.T) {
 			continue
 		}
 		t.Errorf("compareIKENonces(%x, %x) = %d, want sign %d", test.a, test.b, got, test.want)
+	}
+}
+
+func TestLowestNonceSelectsRedundantExchange(t *testing.T) {
+	if !lowestNonceBelongsToFirst([]byte{1}, []byte{4}, []byte{2}, []byte{3}) {
+		t.Fatal("did not select first exchange containing lowest nonce")
+	}
+	if lowestNonceBelongsToFirst([]byte{2}, []byte{4}, []byte{1}, []byte{3}) {
+		t.Fatal("selected first exchange when second contains lowest nonce")
 	}
 }
 
