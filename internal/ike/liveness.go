@@ -411,6 +411,11 @@ func (s *Session) contextForHeader(hdr *Header) *ikeContext {
 }
 
 func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload) ([]byte, error) {
+	for _, payload := range inner {
+		if payload.Critical && !supportedPayloadType(payload.Type) {
+			return s.responseNotifyData(ctx, hdr.MessageID, hdr.ExchangeType, N_UNSUPPORTED_CRITICAL_PAYLOAD, []byte{byte(payload.Type)})
+		}
+	}
 	if hdr.ExchangeType == INFORMATIONAL {
 		for _, p := range inner {
 			if p.Type != PayloadD {
@@ -418,7 +423,11 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 			}
 			d, err := DecodeDelete(p.Body)
 			if err != nil {
-				return nil, err
+				response, responseErr := s.responseNotify(ctx, hdr.MessageID, INFORMATIONAL, N_INVALID_SYNTAX)
+				if responseErr != nil {
+					return nil, responseErr
+				}
+				return response, err
 			}
 			if d.Protocol == ProtoIKE {
 				response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
@@ -468,7 +477,20 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 		}
 		return s.handleChildRekey(ctx, hdr.MessageID, inner)
 	}
-	return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
+	response, err := s.responseNotify(ctx, hdr.MessageID, hdr.ExchangeType, N_INVALID_SYNTAX)
+	if err != nil {
+		return nil, err
+	}
+	return response, fmt.Errorf("ike: unsupported exchange type %d", hdr.ExchangeType)
+}
+
+func supportedPayloadType(payloadType PayloadType) bool {
+	switch payloadType {
+	case PayloadSA, PayloadKE, PayloadIDi, PayloadIDr, PayloadAUTH, PayloadNonce, PayloadN, PayloadD, PayloadTSi, PayloadTSr:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
@@ -543,5 +565,9 @@ func (ctx *ikeContext) peerEncryptionKey() []byte {
 }
 
 func (s *Session) responseNotify(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType) ([]byte, error) {
-	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType})}})
+	return s.responseNotifyData(ctx, msgID, exchange, notifyType, nil)
+}
+
+func (s *Session) responseNotifyData(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType, data []byte) ([]byte, error) {
+	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType, Data: data})}})
 }

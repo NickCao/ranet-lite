@@ -34,6 +34,15 @@ func TestNextDueRekeyPreservesChildPriority(t *testing.T) {
 	}
 }
 
+func TestSupportedPayloadTypeRejectsUnknownCriticalType(t *testing.T) {
+	if supportedPayloadType(PayloadType(250)) {
+		t.Fatal("unknown payload type reported as supported")
+	}
+	if !supportedPayloadType(PayloadSA) {
+		t.Fatal("SA payload type reported as unsupported")
+	}
+}
+
 func TestRekeyRetryDelay(t *testing.T) {
 	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}
 	for _, test := range []struct {

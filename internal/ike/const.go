@@ -102,6 +102,7 @@ const (
 	N_NAT_DETECTION_DESTINATION_IP NotifyType = 16389
 
 	N_UNSUPPORTED_CRITICAL_PAYLOAD NotifyType = 1
+	N_INVALID_SYNTAX               NotifyType = 7
 	N_AUTHENTICATION_FAILED        NotifyType = 24
 	N_NO_PROPOSAL_CHOSEN           NotifyType = 14
 	N_INVALID_KE_PAYLOAD           NotifyType = 17
