@@ -26,3 +26,10 @@ func TestDecodeDeleteRejectsTruncatedSPI(t *testing.T) {
 		t.Fatal("DecodeDelete accepted a truncated SPI")
 	}
 }
+
+func TestDecodeTSRejectsUndersizedSelector(t *testing.T) {
+	body := []byte{1, 0, 0, 0, 7, 0, 0, 7, 0, 0, 0}
+	if _, err := DecodeTS(body); err == nil {
+		t.Fatal("DecodeTS accepted a selector shorter than its fixed header")
+	}
+}

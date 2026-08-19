@@ -80,6 +80,17 @@ func TestUpdatePrefixCompression(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsPrefixLengthBeyondAddressFamily(t *testing.T) {
+	for _, body := range [][]byte{
+		{AEIPv4, 0, 40, 5, 0, 0, 0, 0, 0, 0},
+		{AEIPv6, 0, 136, 17, 0, 0, 0, 0, 0, 0},
+	} {
+		if _, err := (&PrefixDecoder{}).Decode(body); err == nil {
+			t.Fatalf("Decode accepted invalid Update body %x", body)
+		}
+	}
+}
+
 // TestUpdateWithSourcePrefix guards real-world SADR interop (e.g. BIRD's
 // "ipv6 sadr" tables, draft-ietf-babel-source-specific): a well-formed
 // Source Prefix sub-TLV (type 128, mandatory bit set per RFC 8966 §4.4)

@@ -93,6 +93,22 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	metric := binary.BigEndian.Uint16(body[8:10])
 	sent := body[10:]
 
+	switch ae {
+	case AEWildcard:
+		if plen != 0 || omitted != 0 {
+			return Update{}, fmt.Errorf("babel: wildcard Update has a nonzero prefix length")
+		}
+	case AEIPv4:
+		if plen > 32 {
+			return Update{}, fmt.Errorf("babel: IPv4 Update prefix length %d exceeds 32", plen)
+		}
+	case AEIPv6:
+		if plen > 128 {
+			return Update{}, fmt.Errorf("babel: IPv6 Update prefix length %d exceeds 128", plen)
+		}
+	default:
+		return Update{}, fmt.Errorf("babel: Update: unsupported AE %d", ae)
+	}
 	total := prefixByteLen(plen)
 	if omitted > total {
 		return Update{}, fmt.Errorf("babel: Update Omitted %d exceeds prefix length", omitted)
@@ -121,8 +137,6 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		copy(buf[omitted:], sent[:sentLen])
 		d.lastV6 = [16]byte(buf)
 		ip = net.IP(buf)
-	default:
-		return Update{}, fmt.Errorf("babel: Update: unsupported AE %d", ae)
 	}
 
 	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}

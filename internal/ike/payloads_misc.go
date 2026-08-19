@@ -184,7 +184,7 @@ func DecodeTS(body []byte) ([]TrafficSelector, error) {
 			return nil, fmt.Errorf("ike: truncated traffic selector")
 		}
 		tlen := binary.BigEndian.Uint16(rest[2:4])
-		if int(tlen) > len(rest) {
+		if tlen < 8 || int(tlen) > len(rest) || (tlen-8)%2 != 0 {
 			return nil, fmt.Errorf("ike: invalid TS length")
 		}
 		ts := TrafficSelector{

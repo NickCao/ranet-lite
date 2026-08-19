@@ -99,6 +99,9 @@ func decodePayloadChain(first PayloadType, b []byte) ([]RawPayload, error) {
 		next = PayloadType(rest[0])
 		rest = rest[plLen:]
 	}
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("ike: %d trailing bytes after payload chain", len(rest))
+	}
 	return out, nil
 }
 
@@ -111,8 +114,11 @@ func DecodeMessage(b []byte) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	if int(h.Length) > len(b) {
-		return nil, fmt.Errorf("ike: header length %d exceeds packet size %d", h.Length, len(b))
+	if h.Length < HeaderLen {
+		return nil, fmt.Errorf("ike: header length %d is smaller than header size", h.Length)
+	}
+	if int(h.Length) != len(b) {
+		return nil, fmt.Errorf("ike: header length %d does not match packet size %d", h.Length, len(b))
 	}
 	m := &Message{Header: *h}
 	rest := b[HeaderLen:h.Length]
@@ -131,7 +137,7 @@ func DecodeMessage(b []byte) (*Message, error) {
 			Body:     rest[genericPayloadHeaderLen:plLen],
 		}
 		if p.Type == PayloadSK {
-			m.skHeaderOffset = len(b) - len(rest)
+			m.skHeaderOffset = int(h.Length) - len(rest)
 		}
 		next = PayloadType(rest[0])
 		m.Payloads = append(m.Payloads, p)
@@ -140,8 +146,14 @@ func DecodeMessage(b []byte) (*Message, error) {
 		// ciphertext; everything else in the message is encrypted inside it,
 		// so there is no further chain to walk in the outer message.
 		if p.Type == PayloadSK {
+			if len(rest) != 0 {
+				return nil, fmt.Errorf("ike: %d trailing bytes after SK payload", len(rest))
+			}
 			break
 		}
+	}
+	if next == PayloadNone && len(rest) != 0 {
+		return nil, fmt.Errorf("ike: %d trailing bytes after payload chain", len(rest))
 	}
 	return m, nil
 }
