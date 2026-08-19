@@ -175,6 +175,142 @@ func TestSessionRekeyChild(t *testing.T) {
 	}
 }
 
+func TestSessionRekeyIKE(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const oldSPIi = 0x0102030405060708
+	const oldSPIr = 0x1112131415161718
+	const newSPIr = 0x2122232425262728
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	old := &ikeContext{suite: suite, spiI: oldSPIi, spiR: oldSPIr, nextLocalMID: 2,
+		skD: []byte("old IKE rekey SK_d material-------"), skei: make([]byte, 20), sker: make([]byte, 20)}
+	child := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, LocalSPI: 0x10203040, RemoteSPI: 0x50607080}
+	s := &Session{mux: mux, current: old, Child: child, requests: make(chan *localRequest, 1)}
+	if err := mux.RegisterIKE(oldSPIi); err != nil {
+		t.Fatal(err)
+	}
+
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		buf := make([]byte, 2048)
+		n, addr, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read rekey request: %v", err)
+			return
+		}
+		raw := append([]byte(nil), buf[4:n]...)
+		m, err := DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode rekey request: %v", err)
+			return
+		}
+		inner, err := DecryptMessage(suite, old.skei, raw, m)
+		if err != nil {
+			t.Errorf("decrypt rekey request: %v", err)
+			return
+		}
+		sa, nonce, ke := findType(inner, PayloadSA), findType(inner, PayloadNonce), findType(inner, PayloadKE)
+		if m.Header.ExchangeType != CREATE_CHILD_SA || m.Header.MessageID != 2 || sa == nil || nonce == nil || ke == nil {
+			t.Errorf("incomplete IKE rekey request")
+			return
+		}
+		props, err := DecodeSA(sa.Body)
+		if err != nil || len(props) != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 {
+			t.Errorf("bad IKE rekey proposal: %#v, %v", props, err)
+			return
+		}
+		newSPIi := binary.BigEndian.Uint64(props[0].SPI)
+		group, _, err := DecodeKE(ke.Body)
+		if err != nil || group != DH_CURVE25519 || len(nonce.Body) == 0 || newSPIi == 0 {
+			t.Errorf("bad IKE rekey KE or nonce: %d, %v", group, err)
+			return
+		}
+		responderDH, err := GenerateDH(group)
+		if err != nil {
+			t.Errorf("generate responder DH: %v", err)
+			return
+		}
+		nr := []byte("responder nonce for IKE rekey")
+		spiR := make([]byte, 8)
+		binary.BigEndian.PutUint64(spiR, newSPIr)
+		response, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spiR, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransPRF, ID: PRF_HMAC_SHA2_256}, {Type: TransDH, ID: DH_CURVE25519}}}})},
+			{Type: PayloadNonce, Body: EncodeNonce(nr)},
+			{Type: PayloadKE, Body: EncodeKE(group, responderDH.PublicBytes())},
+		})
+		if err != nil {
+			t.Errorf("encrypt rekey response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write rekey response: %v", err)
+			return
+		}
+
+		n, addr, err = peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read old IKE delete: %v", err)
+			return
+		}
+		raw = append([]byte(nil), buf[4:n]...)
+		m, err = DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode old IKE delete: %v", err)
+			return
+		}
+		inner, err = DecryptMessage(suite, old.skei, raw, m)
+		if err != nil {
+			t.Errorf("decrypt old IKE delete: %v", err)
+			return
+		}
+		d := findType(inner, PayloadD)
+		if m.Header.SPIInitiator != oldSPIi || m.Header.SPIResponder != oldSPIr || m.Header.ExchangeType != INFORMATIONAL || m.Header.MessageID != 3 || d == nil {
+			t.Errorf("unexpected old IKE delete")
+			return
+		}
+		deletePayload, err := DecodeDelete(d.Body)
+		if err != nil || deletePayload.Protocol != ProtoIKE || len(deletePayload.SPIs) != 0 {
+			t.Errorf("bad old IKE delete: %#v, %v", deletePayload, err)
+			return
+		}
+		response, err = EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, nil)
+		if err != nil {
+			t.Errorf("encrypt old IKE delete response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write old IKE delete response: %v", err)
+		}
+	}()
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+	if err := s.RekeyIKE(); err != nil {
+		t.Fatalf("RekeyIKE: %v", err)
+	}
+	<-peerDone
+	if s.current == old || s.current.spiR != newSPIr || s.old != nil {
+		t.Fatalf("IKE contexts not promoted and retired: current=%#v old=%#v", s.current, s.old)
+	}
+	if got := s.currentChild(); got.EncrID != child.EncrID || got.EncrKeyBits != child.EncrKeyBits || got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || len(got.InboundKey) != 0 || len(got.OutboundKey) != 0 {
+		t.Fatalf("Child SA changed during IKE rekey: %#v, want %#v", got, child)
+	}
+	if s.contextForHeader(&Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr}) != nil {
+		t.Fatal("old IKE context is still retained")
+	}
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
+	}
+}
+
 func encodeTestMessage(t *testing.T, hdr Header, payloads []RawPayload) []byte {
 	t.Helper()
 	m := &Message{Header: hdr, Payloads: payloads}

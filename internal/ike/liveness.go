@@ -17,6 +17,7 @@ const (
 type localRequest struct {
 	exchange ExchangeType
 	inner    []RawPayload
+	context  *ikeContext
 	result   chan requestResult
 	dpd      bool
 }
@@ -121,21 +122,34 @@ func (s *Session) Run() error {
 func (s *Session) request(exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
 	s.requestMu.Lock()
 	defer s.requestMu.Unlock()
-	req := &localRequest{exchange: exchange, inner: inner, result: make(chan requestResult, 1)}
+	return s.requestLocked(exchange, inner)
+}
+
+// requestLocked sends a local request while requestMu is held.
+func (s *Session) requestLocked(exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
+	return s.requestOnLocked(s.current, exchange, inner)
+}
+
+func (s *Session) requestOnLocked(context *ikeContext, exchange ExchangeType, inner []RawPayload) ([]RawPayload, error) {
+	req := &localRequest{exchange: exchange, inner: inner, context: context, result: make(chan requestResult, 1)}
 	s.requests <- req
 	result := <-req.result
 	return result.inner, result.err
 }
 
 func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
-	msgID := s.current.nextLocalMID
-	s.current.nextLocalMID++
-	hdr := Header{SPIInitiator: s.current.spiI, SPIResponder: s.current.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
-	raw, err := EncryptMessage(s.current.suite, s.current.skei, hdr, nil, req.inner)
+	context := req.context
+	if context == nil {
+		context = s.current
+	}
+	msgID := context.nextLocalMID
+	context.nextLocalMID++
+	hdr := Header{SPIInitiator: context.spiI, SPIResponder: context.spiR, ExchangeType: req.exchange, Flags: FlagInitiator, MessageID: msgID}
+	raw, err := EncryptMessage(context.suite, context.skei, hdr, nil, req.inner)
 	if err != nil {
 		return nil, err
 	}
-	pending := &pendingRequest{localRequest: *req, context: s.current, msgID: msgID, raw: raw}
+	pending := &pendingRequest{localRequest: *req, context: context, msgID: msgID, raw: raw}
 	if err := s.sendPending(pending); err != nil {
 		return nil, err
 	}

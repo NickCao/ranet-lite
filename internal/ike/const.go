@@ -4,8 +4,9 @@
 // Digital Signature, ASN1_DN identity), X25519/AES-GCM or ChaCha20-Poly1305,
 // forced UDP encapsulation, and 0.0.0.0/0::/0 tunnel-mode traffic selectors.
 //
-// Out of scope by design: responder role, certificates, EAP, MOBIKE, IKE SA
-// IKE SA rekey, legacy transforms (CBC ciphers, MODP DH groups, SHA-1/MD5).
+// Out of scope by design: responder role, certificates, EAP, MOBIKE,
+// peer-initiated IKE SA rekey, legacy transforms (CBC ciphers, MODP DH groups,
+// SHA-1/MD5).
 package ike
 
 // Exchange types, RFC 7296 §3.1.
