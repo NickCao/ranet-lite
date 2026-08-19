@@ -12,6 +12,24 @@ import (
 //
 // key is SK_ei or SK_er (encryption key || salt) depending on direction.
 func EncryptMessage(suite SASuite, key []byte, hdr Header, cleartext, inner []RawPayload) ([]byte, error) {
+	var iv [8]byte
+	if _, err := rand.Read(iv[:]); err != nil {
+		return nil, err
+	}
+	return encryptMessageIV(suite, key, hdr, cleartext, inner, iv[:])
+}
+
+func (c *ikeContext) encrypt(key []byte, hdr Header, cleartext, inner []RawPayload) ([]byte, error) {
+	value := c.sendIV.Add(1)
+	if value == 0 {
+		return nil, fmt.Errorf("ike: AEAD IV space exhausted")
+	}
+	var iv [8]byte
+	binary.BigEndian.PutUint64(iv[:], value)
+	return encryptMessageIV(c.suite, key, hdr, cleartext, inner, iv[:])
+}
+
+func encryptMessageIV(suite SASuite, key []byte, hdr Header, cleartext, inner []RawPayload, iv []byte) ([]byte, error) {
 	ap, err := aeadParams(suite.EncrID, suite.EncrKeyBits)
 	if err != nil {
 		return nil, err
@@ -25,9 +43,8 @@ func EncryptMessage(suite SASuite, key []byte, hdr Header, cleartext, inner []Ra
 	}
 	salt := key[ap.KeyLen:]
 
-	iv := make([]byte, ap.IVLen)
-	if _, err := rand.Read(iv); err != nil {
-		return nil, err
+	if len(iv) != ap.IVLen {
+		return nil, fmt.Errorf("ike: IV length %d does not match suite", len(iv))
 	}
 	nonce := append(append([]byte{}, salt...), iv...)
 

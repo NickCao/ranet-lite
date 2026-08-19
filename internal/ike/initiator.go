@@ -61,6 +61,7 @@ type ikeContext struct {
 	spiI      uint64
 	spiR      uint64
 	responder bool // local endpoint is the responder for this IKE SA
+	sendIV    atomic.Uint64
 
 	nextLocalMID       uint32 // next Message ID we allocate for a local request
 	nextPeerMID        uint32 // next Message ID expected from a peer request
@@ -596,7 +597,7 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 		{Type: PayloadTSr, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},
 	}
 	hdr := Header{SPIInitiator: s.current.spiI, SPIResponder: s.current.spiR, ExchangeType: IKE_AUTH, Flags: FlagInitiator, MessageID: 1}
-	req, err := EncryptMessage(s.current.suite, s.current.skei, hdr, nil, inner)
+	req, err := s.current.encrypt(s.current.skei, hdr, nil, inner)
 	if err != nil {
 		return err
 	}

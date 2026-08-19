@@ -22,3 +22,21 @@ func TestDecodeMessageRejectsTrailingPayloadBytes(t *testing.T) {
 		t.Fatal("DecodeMessage accepted bytes after an empty payload chain")
 	}
 }
+
+func TestIKEContextAllocatesUniqueIVs(t *testing.T) {
+	context := &ikeContext{suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128}}
+	key := make([]byte, 20)
+	first, err := context.encrypt(key, Header{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := context.encrypt(key, Header{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstIV := first[HeaderLen+genericPayloadHeaderLen : HeaderLen+genericPayloadHeaderLen+8]
+	secondIV := second[HeaderLen+genericPayloadHeaderLen : HeaderLen+genericPayloadHeaderLen+8]
+	if string(firstIV) == string(secondIV) {
+		t.Fatalf("reused IKE IV %x", firstIV)
+	}
+}

@@ -314,7 +314,7 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 		flags = FlagInitiator
 	}
 	hdr := Header{SPIInitiator: context.spiI, SPIResponder: context.spiR, ExchangeType: req.exchange, Flags: flags, MessageID: msgID}
-	raw, err := EncryptMessage(context.suite, context.localEncryptionKey(), hdr, nil, req.inner)
+	raw, err := context.encrypt(context.localEncryptionKey(), hdr, nil, req.inner)
 	if err != nil {
 		return nil, err
 	}
@@ -521,7 +521,7 @@ func (s *Session) response(ctx *ikeContext, msgID uint32, exchange ExchangeType,
 		flags |= FlagInitiator
 	}
 	hdr := Header{SPIInitiator: ctx.spiI, SPIResponder: ctx.spiR, ExchangeType: exchange, Flags: flags, MessageID: msgID}
-	raw, err := EncryptMessage(ctx.suite, ctx.localEncryptionKey(), hdr, nil, inner)
+	raw, err := ctx.encrypt(ctx.localEncryptionKey(), hdr, nil, inner)
 	if err != nil {
 		return nil, fmt.Errorf("ike: build response: %w", err)
 	}
