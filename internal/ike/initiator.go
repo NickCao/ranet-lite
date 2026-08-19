@@ -380,10 +380,8 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		rand.Read(ni)
 
 		hdr := Header{SPIInitiator: spiI, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator, MessageID: 0}
-		hashAlgos := make([]byte, 6)
-		binary.BigEndian.PutUint16(hashAlgos[0:2], HashSHA2_256)
-		binary.BigEndian.PutUint16(hashAlgos[2:4], HashSHA2_384)
-		binary.BigEndian.PutUint16(hashAlgos[4:6], HashIdentity)
+		hashAlgos := make([]byte, 2)
+		binary.BigEndian.PutUint16(hashAlgos, HashIdentity)
 		payloads := []RawPayload{
 			{Type: PayloadSA, Body: EncodeSA([]Proposal{ikeProposal()})},
 			{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
@@ -461,6 +459,15 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 
 	spiR := resp.Header.SPIResponder
+	supportsIdentity, err := supportsSignatureHash(resp.Payloads, HashIdentity)
+	if err != nil {
+		mux.Close()
+		return nil, err
+	}
+	if !supportsIdentity {
+		mux.Close()
+		return nil, fmt.Errorf("ike: responder did not advertise Ed25519 Identity hash support")
+	}
 	saPl := resp.find(PayloadSA)
 	kePl := resp.find(PayloadKE)
 	noncePl := resp.find(PayloadNonce)
@@ -528,6 +535,31 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		return nil, err
 	}
 	return sess, nil
+}
+
+func supportsSignatureHash(payloads []RawPayload, wanted uint16) (bool, error) {
+	found := false
+	for _, payload := range payloads {
+		if payload.Type != PayloadN {
+			continue
+		}
+		notify, err := DecodeNotify(payload.Body)
+		if err != nil {
+			return false, err
+		}
+		if notify.Type != N_SIGNATURE_HASH_ALGORITHMS {
+			continue
+		}
+		if len(notify.Data) == 0 || len(notify.Data)%2 != 0 {
+			return false, fmt.Errorf("ike: malformed signature hash algorithms notification")
+		}
+		for i := 0; i < len(notify.Data); i += 2 {
+			if binary.BigEndian.Uint16(notify.Data[i:i+2]) == wanted {
+				found = true
+			}
+		}
+	}
+	return found, nil
 }
 
 func canonicalIP(ip net.IP) []byte {

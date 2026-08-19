@@ -1,6 +1,9 @@
 package ike
 
-import "testing"
+import (
+	"encoding/binary"
+	"testing"
+)
 
 func TestSuiteFromProposalRequiresExactOfferSelection(t *testing.T) {
 	valid := Proposal{Number: 1, Protocol: ProtoIKE, Transforms: []Transform{
@@ -42,5 +45,17 @@ func TestDecodeSARejectsInconsistentNestedFraming(t *testing.T) {
 				t.Fatal("DecodeSA accepted inconsistent framing")
 			}
 		})
+	}
+}
+
+func TestSupportsIdentitySignatureHash(t *testing.T) {
+	identity := make([]byte, 2)
+	binary.BigEndian.PutUint16(identity, HashIdentity)
+	payloads := []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_SIGNATURE_HASH_ALGORITHMS, Data: identity})}}
+	if ok, err := supportsSignatureHash(payloads, HashIdentity); err != nil || !ok {
+		t.Fatalf("identity support = %v, %v", ok, err)
+	}
+	if ok, err := supportsSignatureHash(nil, HashIdentity); err != nil || ok {
+		t.Fatalf("missing notification = %v, %v", ok, err)
 	}
 }
