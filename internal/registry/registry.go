@@ -48,62 +48,21 @@ func Load(path string) (Registry, error) {
 	if err := decoder.Decode(&r); err != nil {
 		return nil, fmt.Errorf("registry: parse %s: %w", path, err)
 	}
-	r, err = mergeOrganizations(r)
-	if err != nil {
-		return nil, err
-	}
 	return r, r.Validate()
 }
 
-func mergeOrganizations(registry Registry) (Registry, error) {
-	merged := make(Registry, 0, len(registry))
-	indexes := make(map[string]int, len(registry))
-	for _, organization := range registry {
-		index, exists := indexes[organization.Organization]
-		if !exists {
-			organization.Nodes = append([]Node(nil), organization.Nodes...)
-			indexes[organization.Organization] = len(merged)
-			merged = append(merged, organization)
-			continue
-		}
-		existingKey, err := merged[index].ParsePublicKey()
-		if err != nil {
-			return nil, err
-		}
-		additionalKey, err := organization.ParsePublicKey()
-		if err != nil {
-			return nil, err
-		}
-		if !bytes.Equal(existingKey, additionalKey) {
-			return nil, fmt.Errorf("registry: organization %q has conflicting public keys", organization.Organization)
-		}
-		merged[index].Nodes = append(merged[index].Nodes, organization.Nodes...)
-	}
-	return merged, nil
-}
-
 func (r Registry) Validate() error {
-	organizations := make(map[string]struct{}, len(r))
 	for _, organization := range r {
 		if organization.Organization == "" {
 			return fmt.Errorf("registry: organization name is required")
 		}
-		if _, exists := organizations[organization.Organization]; exists {
-			return fmt.Errorf("registry: duplicate organization %q", organization.Organization)
-		}
-		organizations[organization.Organization] = struct{}{}
 		if _, err := organization.ParsePublicKey(); err != nil {
 			return err
 		}
-		nodes := make(map[string]struct{}, len(organization.Nodes))
 		for _, node := range organization.Nodes {
 			if node.CommonName == "" {
 				return fmt.Errorf("registry: organization %q has a node without common_name", organization.Organization)
 			}
-			if _, exists := nodes[node.CommonName]; exists {
-				return fmt.Errorf("registry: duplicate node %q in organization %q", node.CommonName, organization.Organization)
-			}
-			nodes[node.CommonName] = struct{}{}
 			endpoints := make(map[string]struct{}, len(node.Endpoints))
 			for _, endpoint := range node.Endpoints {
 				if endpoint.SerialNumber == "" || endpoint.Port == 0 || (endpoint.AddressFamily != "ip4" && endpoint.AddressFamily != "ip6") {
@@ -144,6 +103,20 @@ func (r Registry) FindOrganization(name string) (Organization, bool) {
 		}
 	}
 	return Organization{}, false
+}
+
+// FindNode scans every matching organization block and returns the first
+// matching node. Organization names are not required to be unique.
+func (r Registry) FindNode(organization, commonName string) (Organization, Node, bool) {
+	for _, candidate := range r {
+		if candidate.Organization != organization {
+			continue
+		}
+		if node, ok := candidate.FindNode(commonName); ok {
+			return candidate, node, true
+		}
+	}
+	return Organization{}, Node{}, false
 }
 
 // FindNode returns the named node within organization, if present.

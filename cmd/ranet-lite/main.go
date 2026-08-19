@@ -167,9 +167,9 @@ func main() {
 }
 
 func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, reg registry.Registry) error {
-	organization, ok := reg.FindOrganization(cfg.Organization)
+	organization, localNode, ok := reg.FindNode(cfg.Organization, cfg.CommonName)
 	if !ok {
-		return fmt.Errorf("config: local organization %q not found in registry", cfg.Organization)
+		return fmt.Errorf("config: local node %q not found in organization %q", cfg.CommonName, cfg.Organization)
 	}
 	publicKey, err := organization.ParsePublicKey()
 	if err != nil {
@@ -177,10 +177,6 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 	}
 	if !bytes.Equal(privateKey.Public().(ed25519.PublicKey), publicKey) {
 		return fmt.Errorf("config: private key does not match organization %q", cfg.Organization)
-	}
-	localNode, ok := organization.FindNode(cfg.CommonName)
-	if !ok {
-		return fmt.Errorf("config: local node %q not found in organization %q", cfg.CommonName, cfg.Organization)
 	}
 	localFamilies := make(map[string]struct{}, len(cfg.Endpoints))
 	for _, endpoint := range cfg.Endpoints {
@@ -191,11 +187,7 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 		localFamilies[endpoint.AddressFamily] = struct{}{}
 	}
 	for _, peer := range cfg.Peers {
-		peerOrganization, ok := reg.FindOrganization(peer.Organization)
-		if !ok {
-			return fmt.Errorf("config: peer organization %q not found in registry", peer.Organization)
-		}
-		node, ok := peerOrganization.FindNode(peer.CommonName)
+		_, node, ok := reg.FindNode(peer.Organization, peer.CommonName)
 		if !ok {
 			return fmt.Errorf("config: peer node %q not found in organization %q", peer.CommonName, peer.Organization)
 		}
@@ -229,12 +221,7 @@ func validateRuntimeConfig(cfg *config.Config, privateKey ed25519.PrivateKey, re
 func runPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, local config.Endpoint, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, hub *transport.Hub) {
 	name := fmt.Sprintf("%s/%s@%s", p.Organization, p.CommonName, local.SerialNumber)
 	if p.SerialNumber != "" {
-		org, ok := reg.FindOrganization(p.Organization)
-		if !ok {
-			log.Printf("peer %s: organization %q not found", name, p.Organization)
-			return
-		}
-		node, ok := org.FindNode(p.CommonName)
+		_, node, ok := reg.FindNode(p.Organization, p.CommonName)
 		if !ok {
 			log.Printf("peer %s: node not found", name)
 			return
@@ -293,11 +280,7 @@ func resolveEndpoint(node registry.Node, serial, family string) (registry.Endpoi
 // it dies (network failure, peer restart, DPD timeout). Returning means
 // the connection is gone; runPeer decides whether/when to retry.
 func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Config, local config.Endpoint, p config.Peer, reg registry.Registry, mesh *netstack.Mesh, speaker *babel.Speaker, name string, hub *transport.Hub) error {
-	org, ok := reg.FindOrganization(p.Organization)
-	if !ok {
-		return fmt.Errorf("organization %q not found in registry", p.Organization)
-	}
-	node, ok := org.FindNode(p.CommonName)
+	org, node, ok := reg.FindNode(p.Organization, p.CommonName)
 	if !ok {
 		return fmt.Errorf("node %q not found in organization %q", p.CommonName, p.Organization)
 	}

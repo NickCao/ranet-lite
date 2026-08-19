@@ -112,7 +112,7 @@ func TestLoadRegistry(t *testing.T) {
 	}
 }
 
-func TestMergeOrganizations(t *testing.T) {
+func TestFindNodeContinuesAcrossDuplicateOrganizations(t *testing.T) {
 	reg, err := Load("testdata/registry.json")
 	if err != nil {
 		t.Fatal(err)
@@ -121,16 +121,13 @@ func TestMergeOrganizations(t *testing.T) {
 	left, right := first, first
 	left.Nodes = first.Nodes[:2]
 	right.Nodes = first.Nodes[2:]
-	merged, err := mergeOrganizations(Registry{left, reg[1], right})
-	if err != nil {
+	right.PublicKey = reg[1].PublicKey
+	duplicate := Registry{left, right}
+	if err := duplicate.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if len(merged) != 2 || len(merged[0].Nodes) != len(first.Nodes) {
-		t.Fatalf("merged registry has %d organizations and %d nodes in the first; want 2 and %d", len(merged), len(merged[0].Nodes), len(first.Nodes))
-	}
-	conflict := reg[1]
-	conflict.Organization = first.Organization
-	if _, err := mergeOrganizations(Registry{first, conflict}); err == nil {
-		t.Fatal("merged organizations with conflicting public keys")
+	organization, node, ok := duplicate.FindNode(first.Organization, first.Nodes[3].CommonName)
+	if !ok || node.CommonName != first.Nodes[3].CommonName || organization.PublicKey != right.PublicKey {
+		t.Fatalf("FindNode did not continue to the second organization block: %+v, %+v, %v", organization, node, ok)
 	}
 }
