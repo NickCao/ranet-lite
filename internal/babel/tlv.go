@@ -14,6 +14,34 @@ type RawTLV struct {
 	Body []byte
 }
 
+type framedTLV struct {
+	typeByte uint8
+	body     []byte
+}
+
+func decodeTLVFrames(body []byte) ([]framedTLV, error) {
+	var out []framedTLV
+	for len(body) > 0 {
+		t := body[0]
+		if t == uint8(TLVPad1) {
+			body = body[1:]
+			continue
+		}
+		if len(body) < 2 {
+			return nil, fmt.Errorf("babel: truncated TLV header")
+		}
+		length := int(body[1])
+		if 2+length > len(body) {
+			return nil, fmt.Errorf("babel: TLV type %d length %d exceeds enclosing data", t, length)
+		}
+		if t != uint8(TLVPadN) {
+			out = append(out, framedTLV{typeByte: t, body: append([]byte(nil), body[2:2+length]...)})
+		}
+		body = body[2+length:]
+	}
+	return out, nil
+}
+
 // EncodePacket frames a Babel packet: 4-byte header + concatenated TLVs.
 func EncodePacket(tlvs []RawTLV) []byte {
 	body := make([]byte, 0, 128)
@@ -55,24 +83,13 @@ func DecodePacket(b []byte) ([]RawTLV, error) {
 	}
 	body := b[headerLen : headerLen+int(bodyLen)]
 
-	var out []RawTLV
-	for len(body) > 0 {
-		t := TLVType(body[0])
-		if t == TLVPad1 {
-			body = body[1:]
-			continue
-		}
-		if len(body) < 2 {
-			return nil, fmt.Errorf("babel: truncated TLV header")
-		}
-		l := int(body[1])
-		if 2+l > len(body) {
-			return nil, fmt.Errorf("babel: TLV type %d length %d exceeds packet", t, l)
-		}
-		if t != TLVPadN {
-			out = append(out, RawTLV{Type: t, Body: append([]byte{}, body[2:2+l]...)})
-		}
-		body = body[2+l:]
+	frames, err := decodeTLVFrames(body)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RawTLV, 0, len(frames))
+	for _, frame := range frames {
+		out = append(out, RawTLV{Type: TLVType(frame.typeByte), Body: frame.body})
 	}
 	return out, nil
 }
@@ -93,26 +110,16 @@ func encodeSubTLVs(subs []SubTLV) []byte {
 	return out
 }
 
-func decodeSubTLVs(b []byte) []SubTLV {
-	var out []SubTLV
-	for len(b) > 0 {
-		if b[0] == SubTLVPad1 {
-			b = b[1:]
-			continue
-		}
-		if len(b) < 2 {
-			return out // truncated trailer: ignore rather than fail the whole TLV
-		}
-		l := int(b[1])
-		if 2+l > len(b) {
-			return out
-		}
-		if b[0] != SubTLVPadN {
-			out = append(out, SubTLV{Type: b[0], Body: append([]byte{}, b[2:2+l]...)})
-		}
-		b = b[2+l:]
+func decodeSubTLVs(b []byte) ([]SubTLV, error) {
+	frames, err := decodeTLVFrames(b)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	out := make([]SubTLV, 0, len(frames))
+	for _, frame := range frames {
+		out = append(out, SubTLV{Type: frame.typeByte, Body: frame.body})
+	}
+	return out, nil
 }
 
 func findSubTLV(subs []SubTLV, t uint8) ([]byte, bool) {

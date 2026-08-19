@@ -140,7 +140,11 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	}
 
 	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}
-	subs := decodeSubTLVs(sent[sentLen:])
+	subs, err := decodeSubTLVs(sent[sentLen:])
+	if err != nil {
+		u.Ignore = true
+		return u, nil
+	}
 	for _, s := range subs {
 		if s.Type < 128 {
 			continue // non-mandatory: safe to skip if unrecognized

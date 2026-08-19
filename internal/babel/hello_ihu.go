@@ -45,7 +45,10 @@ func DecodeHello(body []byte) (Hello, error) {
 		Seqno:    binary.BigEndian.Uint16(body[2:4]),
 		Interval: binary.BigEndian.Uint16(body[4:6]),
 	}
-	subs := decodeSubTLVs(body[6:])
+	subs, err := decodeSubTLVs(body[6:])
+	if err != nil {
+		return Hello{}, err
+	}
 	if ts, ok := findSubTLV(subs, SubTLVTimestamp); ok && len(ts) >= 4 {
 		h.TxTS = binary.BigEndian.Uint32(ts)
 		h.HasTS = true
@@ -109,7 +112,10 @@ func DecodeIHU(body []byte) (IHU, net.IP, error) {
 		}
 		rest = rest[alen:]
 	}
-	subs := decodeSubTLVs(rest)
+	subs, err := decodeSubTLVs(rest)
+	if err != nil {
+		return IHU{}, nil, err
+	}
 	if ts, ok := findSubTLV(subs, SubTLVTimestamp); ok && len(ts) >= 8 {
 		ihu.OriginTS = binary.BigEndian.Uint32(ts[0:4])
 		ihu.ReceiveTS = binary.BigEndian.Uint32(ts[4:8])

@@ -141,6 +141,28 @@ func TestUpdateWithSourcePrefix(t *testing.T) {
 	}
 }
 
+func TestUpdateIgnoresTruncatedMandatorySubTLV(t *testing.T) {
+	body := []byte{
+		AEIPv4, 0, 32, 0, 0, 0, 0, 1, 0, 64,
+		10, 0, 0, 1,
+		SubTLVSourcePrefix, 3, 16, 10,
+	}
+	got, err := (&PrefixDecoder{}).Decode(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Ignore {
+		t.Fatal("Update accepted a truncated mandatory sub-TLV")
+	}
+}
+
+func TestHelloRejectsTruncatedSubTLV(t *testing.T) {
+	body := append(make([]byte, 6), SubTLVTimestamp, 4, 0)
+	if _, err := DecodeHello(body); err == nil {
+		t.Fatal("DecodeHello accepted a truncated sub-TLV")
+	}
+}
+
 func TestRouterIDRoundTrip(t *testing.T) {
 	id := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 	tlv := EncodeRouterID(id)
