@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -92,6 +93,29 @@ func TestPackForGSOProvidesCoalescingCapacity(t *testing.T) {
 	reused := packForGSO(packed, bufs[:2])
 	if cap(reused) != cap(packed) {
 		t.Fatalf("packed allocation was not reused: capacity changed from %d to %d", cap(packed), cap(reused))
+	}
+}
+
+func TestHubFailureIsTerminal(t *testing.T) {
+	hub, err := NewHub(":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux, err := hub.NewMux(net.IPv4(127, 0, 0, 1), 4500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("receive failed")
+	hub.fail(cause)
+
+	if _, err := mux.RecvESP(); !errors.Is(err, cause) {
+		t.Fatalf("existing mux error = %v, want %v", err, cause)
+	}
+	if _, err := hub.NewMux(net.IPv4(127, 0, 0, 1), 4501); err == nil {
+		t.Fatal("failed hub accepted a new mux")
+	}
+	if err := hub.Close(); err != nil {
+		t.Fatalf("second terminal transition returned an error: %v", err)
 	}
 }
 

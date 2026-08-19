@@ -81,14 +81,13 @@ func (h *Hub) LocalAddr() net.Addr { return &net.UDPAddr{Port: int(h.port)} }
 
 // Close closes the socket and every mux using it.
 func (h *Hub) Close() error {
-	h.closed.Store(true)
-	err := h.bind.Close()
-	h.closeAll(fmt.Errorf("transport: closed"))
-	return err
+	return h.fail(fmt.Errorf("transport: closed"))
 }
 
-func (h *Hub) closeAll(err error) {
+func (h *Hub) fail(cause error) (bindErr error) {
 	h.closeOnce.Do(func() {
+		h.closed.Store(true)
+		bindErr = h.bind.Close()
 		h.mu.Lock()
 		muxes := make([]*Mux, 0, len(h.muxes))
 		for m := range h.muxes {
@@ -100,9 +99,10 @@ func (h *Hub) closeAll(err error) {
 		h.mu.Unlock()
 		for _, m := range muxes {
 			m.closed.Store(true)
-			m.closeDone(err)
+			m.closeDone(cause)
 		}
 	})
+	return bindErr
 }
 
 func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
@@ -115,9 +115,9 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 		n, err := fn(bufs, sizes, eps)
 		if err != nil {
 			if h.closed.Load() {
-				h.closeAll(fmt.Errorf("transport: closed"))
+				h.fail(fmt.Errorf("transport: closed"))
 			} else {
-				h.closeAll(fmt.Errorf("transport: read: %w", err))
+				h.fail(fmt.Errorf("transport: read: %w", err))
 			}
 			return
 		}
