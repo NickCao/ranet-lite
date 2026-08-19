@@ -44,7 +44,7 @@ func buildPacket(src, dst netip.Addr, payload []byte) []byte {
 
 // parsePacket extracts the Babel payload and source address from a raw
 // IPv6+UDP packet, rejecting anything not addressed to the Babel port.
-func parsePacket(raw []byte) (src netip.Addr, payload []byte, err error) {
+func parsePacket(raw []byte, localAddr netip.Addr) (src netip.Addr, payload []byte, err error) {
 	if len(raw) < ipv6HeaderLen+udpHeaderLen {
 		return netip.Addr{}, nil, fmt.Errorf("babel: packet too short")
 	}
@@ -66,8 +66,8 @@ func parsePacket(raw []byte) (src netip.Addr, payload []byte, err error) {
 		return netip.Addr{}, nil, fmt.Errorf("babel: source is not IPv6 link-local")
 	}
 	dstAddr, ok := netip.AddrFromSlice(raw[24:40])
-	if !ok || dstAddr != multicastGroup {
-		return netip.Addr{}, nil, fmt.Errorf("babel: wrong multicast destination")
+	if !ok || (dstAddr != multicastGroup && dstAddr != localAddr) {
+		return netip.Addr{}, nil, fmt.Errorf("babel: packet is not addressed to this speaker")
 	}
 	udp := raw[ipv6HeaderLen:]
 	if binary.BigEndian.Uint16(udp[0:2]) != Port {

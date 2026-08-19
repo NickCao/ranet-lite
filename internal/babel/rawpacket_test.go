@@ -10,7 +10,7 @@ func TestRawPacketRoundTrip(t *testing.T) {
 	payload := EncodePacket([]RawTLV{EncodeAck(42)})
 
 	pkt := buildPacket(src, multicastGroup, payload)
-	gotSrc, gotPayload, err := parsePacket(pkt)
+	gotSrc, gotPayload, err := parsePacket(pkt, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestRawPacketRejectsWrongPort(t *testing.T) {
 	pkt := buildPacket(src, multicastGroup, []byte{1, 2, 3})
 	// Corrupt the destination port.
 	pkt[ipv6HeaderLen+2] ^= 0xff
-	if _, _, err := parsePacket(pkt); err == nil {
+	if _, _, err := parsePacket(pkt, src); err == nil {
 		t.Fatal("expected rejection of a packet not addressed to the babel port")
 	}
 }
@@ -36,7 +36,7 @@ func TestRawPacketRejectsTamperedLength(t *testing.T) {
 	src := netip.MustParseAddr("fe80::1")
 	pkt := buildPacket(src, multicastGroup, []byte{1, 2, 3})
 	pkt = pkt[:len(pkt)-1] // truncate
-	if _, _, err := parsePacket(pkt); err == nil {
+	if _, _, err := parsePacket(pkt, src); err == nil {
 		t.Fatal("expected rejection of a truncated packet")
 	}
 }
@@ -53,9 +53,18 @@ func TestRawPacketRejectsInvalidEnvelope(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			packet := buildPacket(src, multicastGroup, EncodePacket(nil))
 			mutate(packet)
-			if _, _, err := parsePacket(packet); err == nil {
+			if _, _, err := parsePacket(packet, src); err == nil {
 				t.Fatal("parsePacket accepted invalid envelope")
 			}
 		})
+	}
+}
+
+func TestRawPacketAcceptsLocalUnicastDestination(t *testing.T) {
+	src := netip.MustParseAddr("fe80::1")
+	local := netip.MustParseAddr("fe80::2")
+	packet := buildPacket(src, local, EncodePacket([]RawTLV{EncodeAck(1)}))
+	if _, _, err := parsePacket(packet, local); err != nil {
+		t.Fatal(err)
 	}
 }

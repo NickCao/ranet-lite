@@ -217,7 +217,7 @@ func (s *Speaker) removePeer(n *neighborState) {
 // fully handled); the caller should deliver anything else (false) to the
 // mesh's netstack as usual.
 func (s *Speaker) Receive(peer *netstack.Peer, raw []byte) bool {
-	src, payload, err := parsePacket(raw)
+	src, payload, err := parsePacket(raw, s.cfg.LinkLocalAddr)
 	if err != nil {
 		return false
 	}
