@@ -39,13 +39,20 @@ type pendingRequest struct {
 	deadline time.Time
 }
 
-type scheduledRekey uint8
+type rekeySchedule struct {
+	name     string
+	interval time.Duration
+	run      func() error
+	timer    *time.Timer
+	deadline time.Time
+	due      bool
+	failures uint
+}
 
-const (
-	noScheduledRekey scheduledRekey = iota
-	childScheduledRekey
-	ikeScheduledRekey
-)
+type rekeyScheduleResult struct {
+	schedule *rekeySchedule
+	err      error
+}
 
 func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 	for i := range payloads {
@@ -99,6 +106,44 @@ func (s *Session) rekeyRetryDelay(failures uint) time.Duration {
 	return delay
 }
 
+func (s *Session) newRekeySchedule(name string, interval time.Duration, run func() error) (*rekeySchedule, error) {
+	if interval <= 0 {
+		return nil, nil
+	}
+	delay, err := s.rekeyDelay(interval)
+	if err != nil {
+		return nil, err
+	}
+	return &rekeySchedule{name: name, interval: interval, run: run, timer: time.NewTimer(delay), deadline: time.Now().Add(delay)}, nil
+}
+
+func (r *rekeySchedule) poll() {
+	select {
+	case <-r.timer.C:
+		r.deadline = time.Time{}
+		r.due = true
+	default:
+	}
+}
+
+func (r *rekeySchedule) reset(delay time.Duration) {
+	r.timer.Reset(delay)
+	r.deadline = time.Now().Add(delay)
+}
+
+func nextDueRekey(schedules []*rekeySchedule, running *rekeySchedule) *rekeySchedule {
+	if running != nil {
+		return nil
+	}
+	for _, schedule := range schedules {
+		if schedule.due {
+			schedule.due = false
+			return schedule
+		}
+	}
+	return nil
+}
+
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run(ctx context.Context) error {
@@ -110,124 +155,62 @@ func (s *Session) Run(ctx context.Context) error {
 		s.rekeyRetryMax = 5 * time.Minute
 	}
 	var pending *pendingRequest
-	var childTimer, ikeTimer *time.Timer
-	var childDeadline, ikeDeadline time.Time
-	if s.childRekeyInterval > 0 {
-		delay, err := s.rekeyDelay(s.childRekeyInterval)
-		if err != nil {
-			return err
-		}
-		childTimer = time.NewTimer(delay)
-		childDeadline = time.Now().Add(delay)
-		defer childTimer.Stop()
+	var schedules []*rekeySchedule
+	childSchedule, err := s.newRekeySchedule("Child SA", s.childRekeyInterval, s.RekeyChild)
+	if err != nil {
+		return err
 	}
-	if s.ikeRekeyInterval > 0 {
-		delay, err := s.rekeyDelay(s.ikeRekeyInterval)
-		if err != nil {
-			return err
-		}
-		ikeTimer = time.NewTimer(delay)
-		ikeDeadline = time.Now().Add(delay)
-		defer ikeTimer.Stop()
+	if childSchedule != nil {
+		defer childSchedule.timer.Stop()
+		schedules = append(schedules, childSchedule)
 	}
-	rekeyResult := make(chan error, 1)
-	var running scheduledRekey
-	var childDue, ikeDue bool
-	var childFailures, ikeFailures uint
-	startRekey := func(kind scheduledRekey) {
-		running = kind
-		kindName := "IKE SA"
-		if kind == childScheduledRekey {
-			kindName = "Child SA"
-		}
-		slog.Info("ike scheduled rekey starting", "sa", kindName)
-		go func() {
-			if kind == childScheduledRekey {
-				rekeyResult <- s.RekeyChild()
-			} else {
-				rekeyResult <- s.RekeyIKE()
-			}
-		}()
+	ikeSchedule, err := s.newRekeySchedule("IKE SA", s.ikeRekeyInterval, s.RekeyIKE)
+	if err != nil {
+		return err
+	}
+	if ikeSchedule != nil {
+		defer ikeSchedule.timer.Stop()
+		schedules = append(schedules, ikeSchedule)
+	}
+	rekeyResult := make(chan rekeyScheduleResult, 1)
+	var running *rekeySchedule
+	startRekey := func(schedule *rekeySchedule) {
+		running = schedule
+		slog.Info("ike scheduled rekey starting", "sa", schedule.name)
+		go func() { rekeyResult <- rekeyScheduleResult{schedule, schedule.run()} }()
 	}
 	startDueRekey := func() {
-		if running != noScheduledRekey {
-			return
-		}
-		if childDue {
-			childDue = false
-			startRekey(childScheduledRekey)
-		} else if ikeDue {
-			ikeDue = false
-			startRekey(ikeScheduledRekey)
+		if schedule := nextDueRekey(schedules, running); schedule != nil {
+			startRekey(schedule)
 		}
 	}
 	for {
 		select {
-		case err := <-rekeyResult:
-			if err != nil {
-				var delay time.Duration
-				kindName := "IKE SA"
-				if running == childScheduledRekey {
-					childFailures++
-					delay = s.rekeyRetryDelay(childFailures)
-					childTimer.Reset(delay)
-					childDeadline = time.Now().Add(delay)
-					kindName = "Child SA"
-				} else {
-					ikeFailures++
-					delay = s.rekeyRetryDelay(ikeFailures)
-					ikeTimer.Reset(delay)
-					ikeDeadline = time.Now().Add(delay)
-				}
-				slog.Warn("ike scheduled rekey failed; retrying", "sa", kindName, "err", err, "retry_in", delay)
-				running = noScheduledRekey
+		case result := <-rekeyResult:
+			if result.err != nil {
+				result.schedule.failures++
+				delay := s.rekeyRetryDelay(result.schedule.failures)
+				result.schedule.reset(delay)
+				slog.Warn("ike scheduled rekey failed; retrying", "sa", result.schedule.name, "err", result.err, "retry_in", delay)
+				running = nil
 				startDueRekey()
 				continue
 			}
-			if running == childScheduledRekey {
-				slog.Info("ike scheduled rekey completed", "sa", "Child SA")
-			} else {
-				slog.Info("ike scheduled rekey completed", "sa", "IKE SA")
+			slog.Info("ike scheduled rekey completed", "sa", result.schedule.name)
+			result.schedule.failures = 0
+			delay, err := s.rekeyDelay(result.schedule.interval)
+			if err != nil {
+				return err
 			}
-			if running == childScheduledRekey {
-				childFailures = 0
-				delay, err := s.rekeyDelay(s.childRekeyInterval)
-				if err != nil {
-					return err
-				}
-				childTimer.Reset(delay)
-				childDeadline = time.Now().Add(delay)
-			} else {
-				ikeFailures = 0
-				delay, err := s.rekeyDelay(s.ikeRekeyInterval)
-				if err != nil {
-					return err
-				}
-				ikeTimer.Reset(delay)
-				ikeDeadline = time.Now().Add(delay)
-			}
-			running = noScheduledRekey
+			result.schedule.reset(delay)
+			running = nil
 			startDueRekey()
 		default:
 		}
-		if childTimer != nil {
-			select {
-			case <-childTimer.C:
-				childDeadline = time.Time{}
-				childDue = true
-				startDueRekey()
-			default:
-			}
+		for _, schedule := range schedules {
+			schedule.poll()
 		}
-		if ikeTimer != nil {
-			select {
-			case <-ikeTimer.C:
-				ikeDeadline = time.Time{}
-				ikeDue = true
-				startDueRekey()
-			default:
-			}
-		}
+		startDueRekey()
 		if nanos := s.lastTraffic.Load(); nanos != 0 {
 			if traffic := time.Unix(0, nanos); traffic.After(lastAuthenticated) {
 				lastAuthenticated = traffic
@@ -249,11 +232,10 @@ func (s *Session) Run(ctx context.Context) error {
 		if pending != nil && pending.deadline.Before(deadline) {
 			deadline = pending.deadline
 		}
-		if !childDeadline.IsZero() && childDeadline.Before(deadline) {
-			deadline = childDeadline
-		}
-		if !ikeDeadline.IsZero() && ikeDeadline.Before(deadline) {
-			deadline = ikeDeadline
+		for _, schedule := range schedules {
+			if !schedule.deadline.IsZero() && schedule.deadline.Before(deadline) {
+				deadline = schedule.deadline
+			}
 		}
 		// Mux has no selectable receive channel. Polling avoids another receiver.
 		if poll := time.Now().Add(requestPollInterval); poll.Before(deadline) {

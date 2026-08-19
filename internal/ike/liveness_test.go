@@ -20,6 +20,20 @@ func TestSessionRunStopsOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestNextDueRekeyPreservesChildPriority(t *testing.T) {
+	child := &rekeySchedule{name: "Child SA", due: true}
+	ike := &rekeySchedule{name: "IKE SA", due: true}
+	if got := nextDueRekey([]*rekeySchedule{child, ike}, nil); got != child {
+		t.Fatalf("first due schedule = %v, want Child SA", got)
+	}
+	if got := nextDueRekey([]*rekeySchedule{child, ike}, child); got != nil {
+		t.Fatalf("selected %v while another rekey was running", got)
+	}
+	if got := nextDueRekey([]*rekeySchedule{child, ike}, nil); got != ike {
+		t.Fatalf("second due schedule = %v, want IKE SA", got)
+	}
+}
+
 func TestRekeyRetryDelay(t *testing.T) {
 	s := &Session{rekeyRetryInitial: 5 * time.Second, rekeyRetryMax: time.Minute}
 	for _, test := range []struct {
