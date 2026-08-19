@@ -39,6 +39,8 @@ type PeerConfig struct {
 	IKERekeyInterval   time.Duration
 	RekeyMargin        time.Duration
 	RekeyJitter        time.Duration
+	RekeyRetryInitial  time.Duration
+	RekeyRetryMax      time.Duration
 }
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
@@ -96,6 +98,8 @@ type Session struct {
 	ikeRekeyInterval   time.Duration
 	rekeyMargin        time.Duration
 	rekeyJitter        time.Duration
+	rekeyRetryInitial  time.Duration
+	rekeyRetryMax      time.Duration
 	rekeyJitterSource  func(time.Duration) (time.Duration, error)
 }
 
@@ -163,6 +167,20 @@ func (s *Session) SetRekeyTiming(margin, jitter time.Duration) error {
 	}
 	s.rekeyMargin = margin
 	s.rekeyJitter = jitter
+	return nil
+}
+
+// SetRekeyRetry configures the capped exponential backoff after a scheduled
+// rekey failure. It must be called before Run.
+func (s *Session) SetRekeyRetry(initial, max time.Duration) error {
+	if initial <= 0 || max <= 0 {
+		return fmt.Errorf("ike: rekey retry delays must be positive")
+	}
+	if initial > max {
+		return fmt.Errorf("ike: initial rekey retry delay must not exceed maximum")
+	}
+	s.rekeyRetryInitial = initial
+	s.rekeyRetryMax = max
 	return nil
 }
 
@@ -487,6 +505,14 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		return nil, err
 	}
 	if err := sess.SetRekeyIntervals(cfg.ChildRekeyInterval, cfg.IKERekeyInterval); err != nil {
+		mux.Close()
+		return nil, err
+	}
+	if cfg.RekeyRetryInitial == 0 && cfg.RekeyRetryMax == 0 {
+		cfg.RekeyRetryInitial = 5 * time.Second
+		cfg.RekeyRetryMax = 5 * time.Minute
+	}
+	if err := sess.SetRekeyRetry(cfg.RekeyRetryInitial, cfg.RekeyRetryMax); err != nil {
 		mux.Close()
 		return nil, err
 	}

@@ -32,6 +32,10 @@ originate:
 # ike_rekey_interval: 3h
 # rekey_margin: 5m
 # rekey_jitter: 1m
+# Failed scheduled rekeys retry after 5s, doubling up to 5m. Both must be
+# positive and the initial delay cannot exceed the maximum.
+# rekey_retry_initial: 5s
+# rekey_retry_max: 5m
 
 # One or more existing mesh nodes to dial as IKEv2/babel peers. Each local
 # endpoint only dials remote endpoints with the same address family.

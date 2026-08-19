@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"net"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +23,7 @@ func listenPeer(t *testing.T) *net.UDPConn {
 	return conn
 }
 
-func TestSessionScheduledRekeyFailureEndsRun(t *testing.T) {
+func TestSessionScheduledRekeyFailureRetries(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
 	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
@@ -49,7 +48,11 @@ func TestSessionScheduledRekeyFailureEndsRun(t *testing.T) {
 	if err := s.SetRekeyIntervals(time.Millisecond, 0); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.SetRekeyRetry(10*time.Millisecond, time.Second); err != nil {
+		t.Fatal(err)
+	}
 
+	retried := make(chan struct{})
 	go func() {
 		buf := make([]byte, 2048)
 		n, addr, err := peer.ReadFromUDP(buf)
@@ -70,12 +73,30 @@ func TestSessionScheduledRekeyFailureEndsRun(t *testing.T) {
 		}
 		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
 			t.Errorf("write scheduled rekey response: %v", err)
+			return
 		}
+		if _, _, err := peer.ReadFromUDP(buf); err != nil {
+			t.Errorf("read scheduled rekey retry: %v", err)
+			return
+		}
+		close(retried)
 	}()
 
-	err = s.Run()
-	if err == nil || !strings.Contains(err.Error(), "scheduled rekey") {
-		t.Fatalf("Run error = %v, want scheduled rekey failure", err)
+	runDone := make(chan error, 1)
+	go func() { runDone <- s.Run() }()
+	select {
+	case <-retried:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduled rekey was not retried")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("Run returned after scheduled rekey failure: %v", err)
+	default:
+	}
+	_ = mux.Close()
+	if err := <-runDone; err == nil {
+		t.Fatal("Run returned nil after mux close")
 	}
 }
 
@@ -104,7 +125,7 @@ func TestRekeyDelay(t *testing.T) {
 	}
 }
 
-func TestSessionRekeyChild(t *testing.T) {
+func TestSessionScheduledRekeyChild(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
 	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
@@ -129,9 +150,24 @@ func TestSessionRekeyChild(t *testing.T) {
 	if err := mux.RegisterIKE(spiI); err != nil {
 		t.Fatal(err)
 	}
+	s.rekeyJitterSource = func(time.Duration) (time.Duration, error) { return 0, nil }
+	if err := s.SetRekeyTiming(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetRekeyIntervals(25*time.Millisecond, 0); err != nil {
+		t.Fatal(err)
+	}
 	installed := make(chan ChildSA, 1)
 	s.SetChildHandler(func(child ChildSA) error {
 		installed <- child
+		return nil
+	})
+	rekeyed := make(chan struct{})
+	s.SetChildRetireHandler(func(spi uint32) error {
+		if spi != oldLocalSPI {
+			t.Errorf("retired SPI = %08x, want %08x", spi, oldLocalSPI)
+		}
+		close(rekeyed)
 		return nil
 	})
 
@@ -234,13 +270,46 @@ func TestSessionRekeyChild(t *testing.T) {
 		}
 		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
 			t.Errorf("write delete response: %v", err)
+			return
+		}
+		n, addr, err = peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read post-rekey request: %v", err)
+			return
+		}
+		raw = append([]byte(nil), buf[4:n]...)
+		m, err = DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode post-rekey request: %v", err)
+			return
+		}
+		if _, err := DecryptMessage(suite, s.current.skei, raw, m); err != nil {
+			t.Errorf("decrypt post-rekey request: %v", err)
+			return
+		}
+		if m.Header.ExchangeType != INFORMATIONAL {
+			t.Errorf("post-rekey exchange = %d, want INFORMATIONAL", m.Header.ExchangeType)
+			return
+		}
+		response, err = EncryptMessage(suite, s.current.sker, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, nil)
+		if err != nil {
+			t.Errorf("encrypt post-rekey response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write post-rekey response: %v", err)
 		}
 	}()
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run() }()
-	if err := s.RekeyChild(); err != nil {
-		t.Fatalf("RekeyChild: %v", err)
+	select {
+	case <-rekeyed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduled Child SA rekey did not complete")
+	}
+	if _, err := s.request(INFORMATIONAL, nil); err != nil {
+		t.Fatalf("post-rekey request: %v", err)
 	}
 	<-peerDone
 	child := <-installed

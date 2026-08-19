@@ -86,10 +86,26 @@ func (s *Session) rekeyDelay(interval time.Duration) (time.Duration, error) {
 	return delay, nil
 }
 
+func (s *Session) rekeyRetryDelay(failures uint) time.Duration {
+	delay := s.rekeyRetryInitial
+	for failures > 1 {
+		if delay >= s.rekeyRetryMax/2 {
+			return s.rekeyRetryMax
+		}
+		delay *= 2
+		failures--
+	}
+	return delay
+}
+
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run() error {
 	lastAuthenticated := time.Now()
+	if s.rekeyRetryInitial == 0 && s.rekeyRetryMax == 0 {
+		s.rekeyRetryInitial = 5 * time.Second
+		s.rekeyRetryMax = 5 * time.Minute
+	}
 	var pending *pendingRequest
 	var childTimer, ikeTimer *time.Timer
 	var childDeadline, ikeDeadline time.Time
@@ -114,6 +130,7 @@ func (s *Session) Run() error {
 	rekeyResult := make(chan error, 1)
 	var running scheduledRekey
 	var childDue, ikeDue bool
+	var childFailures, ikeFailures uint
 	startRekey := func(kind scheduledRekey) {
 		running = kind
 		kindName := "IKE SA"
@@ -145,9 +162,24 @@ func (s *Session) Run() error {
 		select {
 		case err := <-rekeyResult:
 			if err != nil {
-				slog.Error("ike scheduled rekey failed", "err", err)
-				s.mux.Close()
-				return fmt.Errorf("ike: scheduled rekey: %w", err)
+				var delay time.Duration
+				kindName := "IKE SA"
+				if running == childScheduledRekey {
+					childFailures++
+					delay = s.rekeyRetryDelay(childFailures)
+					childTimer.Reset(delay)
+					childDeadline = time.Now().Add(delay)
+					kindName = "Child SA"
+				} else {
+					ikeFailures++
+					delay = s.rekeyRetryDelay(ikeFailures)
+					ikeTimer.Reset(delay)
+					ikeDeadline = time.Now().Add(delay)
+				}
+				slog.Warn("ike scheduled rekey failed; retrying", "sa", kindName, "err", err, "retry_in", delay)
+				running = noScheduledRekey
+				startDueRekey()
+				continue
 			}
 			if running == childScheduledRekey {
 				slog.Info("ike scheduled rekey completed", "sa", "Child SA")
@@ -155,6 +187,7 @@ func (s *Session) Run() error {
 				slog.Info("ike scheduled rekey completed", "sa", "IKE SA")
 			}
 			if running == childScheduledRekey {
+				childFailures = 0
 				delay, err := s.rekeyDelay(s.childRekeyInterval)
 				if err != nil {
 					return err
@@ -162,6 +195,7 @@ func (s *Session) Run() error {
 				childTimer.Reset(delay)
 				childDeadline = time.Now().Add(delay)
 			} else {
+				ikeFailures = 0
 				delay, err := s.rekeyDelay(s.ikeRekeyInterval)
 				if err != nil {
 					return err

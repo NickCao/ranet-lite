@@ -119,6 +119,9 @@ originate:
 # ike_rekey_interval: 3h
 # rekey_margin: 5m
 # rekey_jitter: 1m
+# Failed rekeys retry after 5s, doubling up to 5m.
+# rekey_retry_initial: 5s
+# rekey_retry_max: 5m
 
 # Optional fixed TUN name. It attaches to an existing compatible device or
 # creates it when absent. Omit to create an automatically named ranet%d device.

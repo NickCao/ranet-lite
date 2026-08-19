@@ -40,6 +40,9 @@ type Config struct {
 	// and jitter is independently randomized from zero through its value.
 	RekeyMargin *Duration `yaml:"rekey_margin"`
 	RekeyJitter *Duration `yaml:"rekey_jitter"`
+	// A failed scheduled rekey is retried with capped exponential backoff.
+	RekeyRetryInitial *Duration `yaml:"rekey_retry_initial"`
+	RekeyRetryMax     *Duration `yaml:"rekey_retry_max"`
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
@@ -95,6 +98,20 @@ func (c *Config) RekeyJitterValue() time.Duration {
 		return time.Minute
 	}
 	return time.Duration(*c.RekeyJitter)
+}
+
+func (c *Config) RekeyRetryInitialValue() time.Duration {
+	if c.RekeyRetryInitial == nil {
+		return 5 * time.Second
+	}
+	return time.Duration(*c.RekeyRetryInitial)
+}
+
+func (c *Config) RekeyRetryMaxValue() time.Duration {
+	if c.RekeyRetryMax == nil {
+		return 5 * time.Minute
+	}
+	return time.Duration(*c.RekeyRetryMax)
 }
 
 // Endpoint mirrors the identity portion of ranet's endpoint configuration.
@@ -167,6 +184,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: rekey_margin must be nonnegative when set")
 	case c.RekeyJitter != nil && time.Duration(*c.RekeyJitter) < 0:
 		return fmt.Errorf("config: rekey_jitter must be nonnegative when set")
+	case c.RekeyRetryInitial != nil && time.Duration(*c.RekeyRetryInitial) <= 0:
+		return fmt.Errorf("config: rekey_retry_initial must be positive when set")
+	case c.RekeyRetryMax != nil && time.Duration(*c.RekeyRetryMax) <= 0:
+		return fmt.Errorf("config: rekey_retry_max must be positive when set")
+	case c.RekeyRetryInitialValue() > c.RekeyRetryMaxValue():
+		return fmt.Errorf("config: rekey_retry_initial must not exceed rekey_retry_max")
 	case !validRekeyTiming(c.ChildRekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
 		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than child_rekey_interval")
 	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
