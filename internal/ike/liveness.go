@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/NickCao/ranet-lite/internal/transport"
@@ -53,6 +54,37 @@ func findType(payloads []RawPayload, t PayloadType) *RawPayload {
 	return nil
 }
 
+func randomRekeyJitter(max time.Duration) (time.Duration, error) {
+	if max == 0 {
+		return 0, nil
+	}
+	limit := new(big.Int).Add(big.NewInt(int64(max)), big.NewInt(1))
+	v, err := rand.Int(rand.Reader, limit)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(v.Int64()), nil
+}
+
+func (s *Session) rekeyDelay(interval time.Duration) (time.Duration, error) {
+	source := s.rekeyJitterSource
+	if source == nil {
+		source = randomRekeyJitter
+	}
+	jitter, err := source(s.rekeyJitter)
+	if err != nil {
+		return 0, fmt.Errorf("ike: generate rekey jitter: %w", err)
+	}
+	if jitter < 0 || jitter > s.rekeyJitter {
+		return 0, fmt.Errorf("ike: invalid rekey jitter %s", jitter)
+	}
+	delay := interval - s.rekeyMargin - jitter
+	if delay <= 0 {
+		return 0, fmt.Errorf("ike: nonpositive rekey delay")
+	}
+	return delay, nil
+}
+
 // Run is the sole post-handshake IKE receiver. It dispatches authenticated
 // peer requests and correlated local responses while also driving DPD.
 func (s *Session) Run() error {
@@ -61,13 +93,21 @@ func (s *Session) Run() error {
 	var childTimer, ikeTimer *time.Timer
 	var childDeadline, ikeDeadline time.Time
 	if s.childRekeyInterval > 0 {
-		childTimer = time.NewTimer(s.childRekeyInterval)
-		childDeadline = time.Now().Add(s.childRekeyInterval)
+		delay, err := s.rekeyDelay(s.childRekeyInterval)
+		if err != nil {
+			return err
+		}
+		childTimer = time.NewTimer(delay)
+		childDeadline = time.Now().Add(delay)
 		defer childTimer.Stop()
 	}
 	if s.ikeRekeyInterval > 0 {
-		ikeTimer = time.NewTimer(s.ikeRekeyInterval)
-		ikeDeadline = time.Now().Add(s.ikeRekeyInterval)
+		delay, err := s.rekeyDelay(s.ikeRekeyInterval)
+		if err != nil {
+			return err
+		}
+		ikeTimer = time.NewTimer(delay)
+		ikeDeadline = time.Now().Add(delay)
 		defer ikeTimer.Stop()
 	}
 	rekeyResult := make(chan error, 1)
@@ -103,11 +143,19 @@ func (s *Session) Run() error {
 				return fmt.Errorf("ike: scheduled rekey: %w", err)
 			}
 			if running == childScheduledRekey {
-				childTimer.Reset(s.childRekeyInterval)
-				childDeadline = time.Now().Add(s.childRekeyInterval)
+				delay, err := s.rekeyDelay(s.childRekeyInterval)
+				if err != nil {
+					return err
+				}
+				childTimer.Reset(delay)
+				childDeadline = time.Now().Add(delay)
 			} else {
-				ikeTimer.Reset(s.ikeRekeyInterval)
-				ikeDeadline = time.Now().Add(s.ikeRekeyInterval)
+				delay, err := s.rekeyDelay(s.ikeRekeyInterval)
+				if err != nil {
+					return err
+				}
+				ikeTimer.Reset(delay)
+				ikeDeadline = time.Now().Add(delay)
 			}
 			running = noScheduledRekey
 			startDueRekey()

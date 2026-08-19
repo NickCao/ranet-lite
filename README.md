@@ -112,9 +112,13 @@ originate:
 # replay_window: 32
 
 # Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
-# Set either to 0 to disable it, or override the default with another duration.
+# Set either to 0 to disable it. Rekeys run interval minus the 5m margin and
+# an independently random 0-1m jitter. Margin plus jitter must be shorter
+# than every enabled interval.
 # child_rekey_interval: 1h
 # ike_rekey_interval: 3h
+# rekey_margin: 5m
+# rekey_jitter: 1m
 
 # Optional fixed TUN name. It attaches to an existing compatible device or
 # creates it when absent. Omit to create an automatically named ranet%d device.

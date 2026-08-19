@@ -36,6 +36,10 @@ type Config struct {
 	// IKE SAs. An explicit zero disables the corresponding proactive rekey.
 	ChildRekeyInterval *Duration `yaml:"child_rekey_interval"`
 	IKERekeyInterval   *Duration `yaml:"ike_rekey_interval"`
+	// Rekeys run before their interval expires: margin is always subtracted
+	// and jitter is independently randomized from zero through its value.
+	RekeyMargin *Duration `yaml:"rekey_margin"`
+	RekeyJitter *Duration `yaml:"rekey_jitter"`
 
 	Peers []Peer `yaml:"peers"`
 	Babel Babel  `yaml:"babel"`
@@ -77,6 +81,20 @@ func (c *Config) IKERekeyIntervalValue() time.Duration {
 		return 3 * time.Hour
 	}
 	return time.Duration(*c.IKERekeyInterval)
+}
+
+func (c *Config) RekeyMarginValue() time.Duration {
+	if c.RekeyMargin == nil {
+		return 5 * time.Minute
+	}
+	return time.Duration(*c.RekeyMargin)
+}
+
+func (c *Config) RekeyJitterValue() time.Duration {
+	if c.RekeyJitter == nil {
+		return time.Minute
+	}
+	return time.Duration(*c.RekeyJitter)
 }
 
 // Endpoint mirrors the identity portion of ranet's endpoint configuration.
@@ -142,9 +160,17 @@ func (c *Config) validate() error {
 	case len(c.Peers) == 0:
 		return fmt.Errorf("config: at least one peer is required")
 	case c.ChildRekeyInterval != nil && time.Duration(*c.ChildRekeyInterval) < 0:
-		return fmt.Errorf("config: child_rekey_interval must be positive when set")
+		return fmt.Errorf("config: child_rekey_interval must be nonnegative when set")
 	case c.IKERekeyInterval != nil && time.Duration(*c.IKERekeyInterval) < 0:
-		return fmt.Errorf("config: ike_rekey_interval must be positive when set")
+		return fmt.Errorf("config: ike_rekey_interval must be nonnegative when set")
+	case c.RekeyMargin != nil && time.Duration(*c.RekeyMargin) < 0:
+		return fmt.Errorf("config: rekey_margin must be nonnegative when set")
+	case c.RekeyJitter != nil && time.Duration(*c.RekeyJitter) < 0:
+		return fmt.Errorf("config: rekey_jitter must be nonnegative when set")
+	case !validRekeyTiming(c.ChildRekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
+		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than child_rekey_interval")
+	case !validRekeyTiming(c.IKERekeyIntervalValue(), c.RekeyMarginValue(), c.RekeyJitterValue()):
+		return fmt.Errorf("config: rekey_margin plus rekey_jitter must be less than ike_rekey_interval")
 	}
 	for _, ep := range c.Endpoints {
 		if ep.SerialNumber == "" || (ep.AddressFamily != "ip4" && ep.AddressFamily != "ip6") {
@@ -152,4 +178,8 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+func validRekeyTiming(interval, margin, jitter time.Duration) bool {
+	return interval == 0 || (margin < interval && jitter < interval-margin)
 }

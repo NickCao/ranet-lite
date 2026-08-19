@@ -22,17 +22,24 @@ peers:
 
 func TestRekeyIntervals(t *testing.T) {
 	tests := []struct {
-		name      string
-		yaml      string
-		wantChild time.Duration
-		wantIKE   time.Duration
-		wantErr   bool
+		name       string
+		yaml       string
+		wantChild  time.Duration
+		wantIKE    time.Duration
+		wantMargin time.Duration
+		wantJitter time.Duration
+		wantErr    bool
 	}{
-		{name: "defaults", yaml: testConfig, wantChild: time.Hour, wantIKE: 3 * time.Hour},
-		{name: "explicitly disabled", yaml: testConfig + "child_rekey_interval: 0\nike_rekey_interval: 0\n"},
-		{name: "configured", yaml: testConfig + "child_rekey_interval: 2h\nike_rekey_interval: 8h\n", wantChild: 2 * time.Hour, wantIKE: 8 * time.Hour},
+		{name: "defaults", yaml: testConfig, wantChild: time.Hour, wantIKE: 3 * time.Hour, wantMargin: 5 * time.Minute, wantJitter: time.Minute},
+		{name: "explicitly disabled", yaml: testConfig + "child_rekey_interval: 0\nike_rekey_interval: 0\n", wantMargin: 5 * time.Minute, wantJitter: time.Minute},
+		{name: "configured", yaml: testConfig + "child_rekey_interval: 2h\nike_rekey_interval: 8h\nrekey_margin: 10m\nrekey_jitter: 2m\n", wantChild: 2 * time.Hour, wantIKE: 8 * time.Hour, wantMargin: 10 * time.Minute, wantJitter: 2 * time.Minute},
 		{name: "negative child", yaml: testConfig + "child_rekey_interval: -1s\n", wantErr: true},
 		{name: "negative IKE", yaml: testConfig + "ike_rekey_interval: -1s\n", wantErr: true},
+		{name: "negative margin", yaml: testConfig + "rekey_margin: -1s\n", wantErr: true},
+		{name: "negative jitter", yaml: testConfig + "rekey_jitter: -1s\n", wantErr: true},
+		{name: "child timing too short", yaml: testConfig + "child_rekey_interval: 5m\n", wantErr: true},
+		{name: "IKE timing too short", yaml: testConfig + "ike_rekey_interval: 6m\n", wantErr: true},
+		{name: "disabled interval ignores timing", yaml: testConfig + "child_rekey_interval: 0\nrekey_margin: 1h\nrekey_jitter: 1h\n", wantIKE: 3 * time.Hour, wantMargin: time.Hour, wantJitter: time.Hour},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -50,8 +57,8 @@ func TestRekeyIntervals(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if cfg.ChildRekeyIntervalValue() != test.wantChild || cfg.IKERekeyIntervalValue() != test.wantIKE {
-				t.Fatalf("rekey intervals = %s, %s; want %s, %s", cfg.ChildRekeyIntervalValue(), cfg.IKERekeyIntervalValue(), test.wantChild, test.wantIKE)
+			if cfg.ChildRekeyIntervalValue() != test.wantChild || cfg.IKERekeyIntervalValue() != test.wantIKE || cfg.RekeyMarginValue() != test.wantMargin || cfg.RekeyJitterValue() != test.wantJitter {
+				t.Fatalf("rekey timing = %s, %s, %s, %s; want %s, %s, %s, %s", cfg.ChildRekeyIntervalValue(), cfg.IKERekeyIntervalValue(), cfg.RekeyMarginValue(), cfg.RekeyJitterValue(), test.wantChild, test.wantIKE, test.wantMargin, test.wantJitter)
 			}
 		})
 	}

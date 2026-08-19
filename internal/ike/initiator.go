@@ -37,6 +37,8 @@ type PeerConfig struct {
 
 	ChildRekeyInterval time.Duration
 	IKERekeyInterval   time.Duration
+	RekeyMargin        time.Duration
+	RekeyJitter        time.Duration
 }
 
 // ChildSA is the negotiated ESP keying material and parameters handed to
@@ -91,6 +93,9 @@ type Session struct {
 
 	childRekeyInterval time.Duration
 	ikeRekeyInterval   time.Duration
+	rekeyMargin        time.Duration
+	rekeyJitter        time.Duration
+	rekeyJitterSource  func(time.Duration) (time.Duration, error)
 }
 
 type ikeRekey struct {
@@ -136,11 +141,32 @@ func (s *Session) removeRetainedContext(ctx *ikeContext) bool {
 // Zero disables an interval. It must be called before Run.
 func (s *Session) SetRekeyIntervals(child, ike time.Duration) error {
 	if child < 0 || ike < 0 {
-		return fmt.Errorf("ike: rekey intervals must be positive when set")
+		return fmt.Errorf("ike: rekey intervals must be nonnegative when set")
+	}
+	if !validRekeyTiming(child, s.rekeyMargin, s.rekeyJitter) || !validRekeyTiming(ike, s.rekeyMargin, s.rekeyJitter) {
+		return fmt.Errorf("ike: rekey margin plus jitter must be less than each enabled interval")
 	}
 	s.childRekeyInterval = child
 	s.ikeRekeyInterval = ike
 	return nil
+}
+
+// SetRekeyTiming configures when scheduled rekeys run relative to their
+// intervals. Zero intervals remain disabled.
+func (s *Session) SetRekeyTiming(margin, jitter time.Duration) error {
+	if margin < 0 || jitter < 0 {
+		return fmt.Errorf("ike: rekey margin and jitter must be nonnegative")
+	}
+	if !validRekeyTiming(s.childRekeyInterval, margin, jitter) || !validRekeyTiming(s.ikeRekeyInterval, margin, jitter) {
+		return fmt.Errorf("ike: rekey margin plus jitter must be less than each enabled interval")
+	}
+	s.rekeyMargin = margin
+	s.rekeyJitter = jitter
+	return nil
+}
+
+func validRekeyTiming(interval, margin, jitter time.Duration) bool {
+	return interval == 0 || (margin < interval && jitter < interval-margin)
 }
 
 // SetChildHandler installs replacement ESP SAs before Run acknowledges a
@@ -452,6 +478,10 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 	}
 
 	if err := sess.doIKEAuth(cfg, req, respRaw, ni, nr); err != nil {
+		mux.Close()
+		return nil, err
+	}
+	if err := sess.SetRekeyTiming(cfg.RekeyMargin, cfg.RekeyJitter); err != nil {
 		mux.Close()
 		return nil, err
 	}

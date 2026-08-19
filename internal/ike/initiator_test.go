@@ -79,6 +79,31 @@ func TestSessionScheduledRekeyFailureEndsRun(t *testing.T) {
 	}
 }
 
+func TestRekeyDelay(t *testing.T) {
+	s := &Session{rekeyMargin: 5 * time.Minute, rekeyJitter: time.Minute}
+	var limits []time.Duration
+	s.rekeyJitterSource = func(max time.Duration) (time.Duration, error) {
+		limits = append(limits, max)
+		return max, nil
+	}
+
+	delay, err := s.rekeyDelay(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 54 * time.Minute; delay != want {
+		t.Fatalf("rekey delay = %s, want %s", delay, want)
+	}
+	if len(limits) != 1 || limits[0] != time.Minute {
+		t.Fatalf("jitter limits = %v, want [%s]", limits, time.Minute)
+	}
+
+	s.rekeyJitterSource = func(time.Duration) (time.Duration, error) { return time.Minute + time.Nanosecond, nil }
+	if _, err := s.rekeyDelay(time.Hour); err == nil {
+		t.Fatal("rekeyDelay succeeded with out-of-range jitter")
+	}
+}
+
 func TestSessionRekeyChild(t *testing.T) {
 	peer := listenPeer(t)
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)

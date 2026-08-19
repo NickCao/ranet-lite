@@ -265,6 +265,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		Hub:                hub,
 		ChildRekeyInterval: cfg.ChildRekeyIntervalValue(),
 		IKERekeyInterval:   cfg.IKERekeyIntervalValue(),
+		RekeyMargin:        cfg.RekeyMarginValue(),
+		RekeyJitter:        cfg.RekeyJitterValue(),
 	}
 	sess, err := ike.Initiate(ikeCfg)
 	if err != nil {
