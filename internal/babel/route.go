@@ -140,6 +140,9 @@ func (rt *routeTable) expireNeighbor(n *neighborState) (changed []routeKey) {
 			ke.selected = ke.bestReachable()
 			changed = append(changed, key)
 		}
+		if len(ke.routes) == 0 {
+			delete(rt.entries, key)
+		}
 	}
 	return changed
 }
@@ -154,9 +157,20 @@ func (rt *routeTable) sweepExpired(install func(key routeKey, sel *routeInfo)) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	for key, ke := range rt.entries {
-		if ke.selected != nil && !ke.selected.reachable() {
-			ke.selected = ke.bestReachable()
-			install(key, ke.selected)
+		previous := ke.selected
+		for neighbor, route := range ke.routes {
+			if !route.reachable() {
+				delete(ke.routes, neighbor)
+			}
+		}
+		if previous != nil {
+			if _, ok := ke.routes[previous.neighbor]; !ok {
+				ke.selected = ke.bestReachable()
+				install(key, ke.selected)
+			}
+		}
+		if len(ke.routes) == 0 {
+			delete(rt.entries, key)
 		}
 	}
 }
