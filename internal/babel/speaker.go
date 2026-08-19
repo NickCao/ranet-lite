@@ -60,6 +60,12 @@ func (n *neighborState) learnAddr(addr netip.Addr) {
 	n.mu.Unlock()
 }
 
+func (n *neighborState) address() netip.Addr {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.addr
+}
+
 func deadTimeout(interval time.Duration) time.Duration {
 	// Common babel convention (babeld/bird): declare a neighbor dead after
 	// missing several Hello intervals, not just one.
@@ -253,7 +259,11 @@ func (s *Speaker) Run(ctx context.Context) error {
 }
 
 func (s *Speaker) send(n *neighborState, tlvs []RawTLV) {
-	pkt := buildPacket(s.cfg.LinkLocalAddr, multicastGroup, EncodePacket(tlvs))
+	s.sendTo(n, multicastGroup, tlvs)
+}
+
+func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) {
+	pkt := buildPacket(s.cfg.LinkLocalAddr, destination, EncodePacket(tlvs))
 	if err := n.peer.SendRaw(pkt, esp.NextHeaderIPv6); err != nil {
 		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
 	} else {
@@ -525,8 +535,8 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 
 		case TLVAckReq:
 			nonce, err := DecodeAckReq(t.Body)
-			if err == nil {
-				s.send(n, []RawTLV{EncodeAck(nonce)})
+			if destination := n.address(); err == nil && destination.IsValid() {
+				s.sendTo(n, destination, []RawTLV{EncodeAck(nonce)})
 			}
 		}
 	}

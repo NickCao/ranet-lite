@@ -327,3 +327,26 @@ func TestWildcardUpdateRetractsEveryRouteFromNeighbor(t *testing.T) {
 		t.Fatalf("wildcard retraction left routes installed: %v", debug)
 	}
 }
+
+func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := New(Config{}, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sent []byte
+	peer := netstack.NewPeer("peer", func(raw []byte, _ byte) ([]byte, error) { return raw, nil }, func(raw []byte) error {
+		sent = append([]byte(nil), raw...)
+		return nil
+	})
+	handle := speaker.AddPeer(peer)
+	defer handle.Close()
+	neighbor := speaker.neighbors[peer.ID]
+	destination := netip.MustParseAddr("fe80::2")
+	neighbor.learnAddr(destination)
+	speaker.sendTo(neighbor, destination, []RawTLV{EncodeAck(1)})
+	got, ok := netip.AddrFromSlice(sent[24:40])
+	if !ok || got != destination {
+		t.Fatalf("Ack destination = %v, want %v", got, destination)
+	}
+}
