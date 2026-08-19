@@ -112,13 +112,25 @@ func TestLoadRegistry(t *testing.T) {
 	}
 }
 
-func TestRegistryValidationRejectsDuplicateIdentities(t *testing.T) {
+func TestMergeOrganizations(t *testing.T) {
 	reg, err := Load("testdata/registry.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg = append(reg, reg[0])
-	if err := reg.Validate(); err == nil {
-		t.Fatal("Validate accepted duplicate organizations")
+	first := reg[0]
+	left, right := first, first
+	left.Nodes = first.Nodes[:2]
+	right.Nodes = first.Nodes[2:]
+	merged, err := mergeOrganizations(Registry{left, reg[1], right})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged) != 2 || len(merged[0].Nodes) != len(first.Nodes) {
+		t.Fatalf("merged registry has %d organizations and %d nodes in the first; want 2 and %d", len(merged), len(merged[0].Nodes), len(first.Nodes))
+	}
+	conflict := reg[1]
+	conflict.Organization = first.Organization
+	if _, err := mergeOrganizations(Registry{first, conflict}); err == nil {
+		t.Fatal("merged organizations with conflicting public keys")
 	}
 }

@@ -48,7 +48,38 @@ func Load(path string) (Registry, error) {
 	if err := decoder.Decode(&r); err != nil {
 		return nil, fmt.Errorf("registry: parse %s: %w", path, err)
 	}
+	r, err = mergeOrganizations(r)
+	if err != nil {
+		return nil, err
+	}
 	return r, r.Validate()
+}
+
+func mergeOrganizations(registry Registry) (Registry, error) {
+	merged := make(Registry, 0, len(registry))
+	indexes := make(map[string]int, len(registry))
+	for _, organization := range registry {
+		index, exists := indexes[organization.Organization]
+		if !exists {
+			organization.Nodes = append([]Node(nil), organization.Nodes...)
+			indexes[organization.Organization] = len(merged)
+			merged = append(merged, organization)
+			continue
+		}
+		existingKey, err := merged[index].ParsePublicKey()
+		if err != nil {
+			return nil, err
+		}
+		additionalKey, err := organization.ParsePublicKey()
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(existingKey, additionalKey) {
+			return nil, fmt.Errorf("registry: organization %q has conflicting public keys", organization.Organization)
+		}
+		merged[index].Nodes = append(merged[index].Nodes, organization.Nodes...)
+	}
+	return merged, nil
 }
 
 func (r Registry) Validate() error {
