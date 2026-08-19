@@ -308,9 +308,6 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		saMu.Lock()
 		out, in = newOut, newIn
 		inbound = append([]inboundSA{{spi: child.LocalSPI, sa: in}}, inbound...)
-		if len(inbound) > 2 {
-			inbound = inbound[:2]
-		}
 		saMu.Unlock()
 		return nil
 	})

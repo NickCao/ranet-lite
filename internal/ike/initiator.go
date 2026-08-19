@@ -207,6 +207,11 @@ func (s *Session) SetChildRetireHandler(fn func(uint32) error) {
 }
 
 func (s *Session) replaceChild(child ChildSA) error {
+	s.childMu.Lock()
+	defer s.childMu.Unlock()
+	if s.retiring.LocalSPI != 0 {
+		return fmt.Errorf("ike: Child SA %08x is still awaiting retirement", s.retiring.LocalSPI)
+	}
 	if err := s.mux.RegisterESP(child.LocalSPI); err != nil {
 		return err
 	}
@@ -215,16 +220,15 @@ func (s *Session) replaceChild(child ChildSA) error {
 	s.handlerMu.RUnlock()
 	if fn != nil {
 		if err := fn(child); err != nil {
+			s.mux.UnregisterESP(child.LocalSPI)
 			return err
 		}
 	}
-	s.childMu.Lock()
 	old := s.Child
 	s.Child = child
 	if old.LocalSPI != 0 {
 		s.retiring = old
 	}
-	s.childMu.Unlock()
 	return nil
 }
 
@@ -242,20 +246,21 @@ func (s *Session) retiringChild() ChildSA {
 
 func (s *Session) retireChild(remoteSPI uint32) error {
 	s.childMu.Lock()
+	defer s.childMu.Unlock()
 	retiring := s.retiring
 	if retiring.RemoteSPI != remoteSPI {
-		s.childMu.Unlock()
 		return fmt.Errorf("ike: no retiring Child SA with remote SPI %08x", remoteSPI)
 	}
-	s.retiring = ChildSA{}
-	s.childMu.Unlock()
-	s.mux.UnregisterESP(retiring.LocalSPI)
 	s.handlerMu.RLock()
 	fn := s.onRetire
 	s.handlerMu.RUnlock()
 	if fn != nil {
-		return fn(retiring.LocalSPI)
+		if err := fn(retiring.LocalSPI); err != nil {
+			return err
+		}
 	}
+	s.mux.UnregisterESP(retiring.LocalSPI)
+	s.retiring = ChildSA{}
 	return nil
 }
 
