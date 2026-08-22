@@ -308,10 +308,8 @@ in
             "birdc show route for ${clientTunnel}/128 | grep -F '${clientTunnel}/128'",
             timeout=convergence_timeout,
         )
-        print(client.wait_until_succeeds(
-            "iperf3 --client ${gatewayTunnel} -6 --time 3 --connect-timeout 2000",
-            timeout=convergence_timeout,
-        ))
+        print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5"))
+        print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5 --reverse"))
     finally:
         print(gateway.succeed("swanctl --list-sas"))
         print(gateway.succeed("birdc show babel neighbors"))
