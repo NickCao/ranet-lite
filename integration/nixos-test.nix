@@ -313,15 +313,8 @@ in
             timeout=convergence_timeout,
         ))
     finally:
-        diagnostics = [
-            (client, "client ranet", "journalctl -b -u ranet-lite.service --no-pager"),
-            (client, "client routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
-            (gateway, "gateway strongSwan", "journalctl -b -u strongswan-swanctl.service --no-pager; swanctl --list-sas"),
-            (gateway, "gateway BIRD", "birdc show protocols all; birdc show route all"),
-            (gateway, "gateway routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
-        ]
-        for machine, label, command in diagnostics:
-            status, output = machine.execute(command)
-            print(f"--- {label} (status {status}) ---\n{output}")
+        print(gateway.succeed("swanctl --list-sas"))
+        print(gateway.succeed("birdc show babel neighbors"))
+        print(gateway.succeed("birdc show babel routes"))
   '';
 }
