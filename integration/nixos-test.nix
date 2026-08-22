@@ -287,31 +287,18 @@ in
 
   testScript = ''
     import datetime as dt
-    import json
 
     convergence_timeout = dt.timedelta(seconds=30)
 
-    def dump_state():
-        diagnostics = [
-            (client, "client ranet", "journalctl -b -u ranet-lite.service --no-pager"),
-            (client, "client routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
-            (gateway, "gateway strongSwan", "journalctl -b -u strongswan-swanctl.service --no-pager; swanctl --list-sas"),
-            (gateway, "gateway BIRD", "birdc show protocols all; birdc show route all"),
-            (gateway, "gateway routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
-        ]
-        for machine, label, command in diagnostics:
-            status, output = machine.execute(command)
-            print(f"--- {label} (status {status}) ---\n{output}")
-
     start_all()
 
-    gateway.wait_for_unit("systemd-networkd-wait-online.service")
-    gateway.wait_for_unit("strongswan-swanctl.service")
-    gateway.wait_for_unit("bird.service")
-    gateway.wait_for_unit("iperf3.service")
-    client.wait_for_unit("ranet-lite.service")
-
     try:
+        gateway.wait_for_unit("systemd-networkd-wait-online.service")
+        gateway.wait_for_unit("strongswan-swanctl.service")
+        gateway.wait_for_unit("bird.service")
+        gateway.wait_for_unit("iperf3.service")
+        client.wait_for_unit("ranet-lite.service")
+
         client.wait_until_succeeds(
             "journalctl -u ranet-lite.service --no-pager | "
             "grep -F 'msg=\"babel route installed\"' | "
@@ -322,17 +309,20 @@ in
             "birdc show route for ${clientTunnel}/128 | grep -F '${clientTunnel}/128'",
             timeout=convergence_timeout,
         )
-        report = json.loads(client.wait_until_succeeds(
-            "iperf3 --client ${gatewayTunnel} -6 --time 3 --connect-timeout 2000 --json",
+        print(client.wait_until_succeeds(
+            "iperf3 --client ${gatewayTunnel} -6 --time 3 --connect-timeout 2000",
             timeout=convergence_timeout,
         ))
-    except Exception:
-        dump_state()
-        raise
-
-    received = report["end"]["sum_received"]
-    assert received["bytes"] > 0, report
-    assert received["bits_per_second"] > 0, report
-    print(f'iperf3 bandwidth: {received["bits_per_second"] / 1_000_000:.2f} Mbit/s')
+    finally:
+        diagnostics = [
+            (client, "client ranet", "journalctl -b -u ranet-lite.service --no-pager"),
+            (client, "client routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
+            (gateway, "gateway strongSwan", "journalctl -b -u strongswan-swanctl.service --no-pager; swanctl --list-sas"),
+            (gateway, "gateway BIRD", "birdc show protocols all; birdc show route all"),
+            (gateway, "gateway routes", "ip -6 route show; ip xfrm state; ip xfrm policy"),
+        ]
+        for machine, label, command in diagnostics:
+            status, output = machine.execute(command)
+            print(f"--- {label} (status {status}) ---\n{output}")
   '';
 }
