@@ -350,3 +350,113 @@ func TestAcknowledgmentUsesUnicastDestination(t *testing.T) {
 		t.Fatalf("Ack destination = %v, want %v", got, destination)
 	}
 }
+
+func captureSpeaker(t *testing.T, cfg Config) (*Speaker, *neighborState, *[][]byte) {
+	t.Helper()
+	mesh := &netstack.Mesh{Routes: netstack.NewRouteTable()}
+	speaker, err := New(cfg, mesh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packets := new([][]byte)
+	peer := netstack.NewPeer("peer", func(raw []byte, _ byte) ([]byte, error) { return raw, nil }, func(raw []byte) error {
+		*packets = append(*packets, append([]byte(nil), raw...))
+		return nil
+	})
+	speaker.AddPeer(peer)
+	neighbor := speaker.neighbors[peer.ID]
+	neighbor.learnAddr(netip.MustParseAddr("fe80::2"))
+	return speaker, neighbor, packets
+}
+
+func TestUnscheduledAndUnicastHelloState(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 1, Interval: 100})}))
+	neighbor.mu.Lock()
+	deadline := neighbor.lastHelloTime.Add(deadTimeout(neighbor.helloInterval))
+	neighbor.mu.Unlock()
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 2, Interval: 0})}))
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeHello(Hello{Seqno: 3, Interval: 200, Unicast: true})}))
+	neighbor.mu.Lock()
+	defer neighbor.mu.Unlock()
+	if got := neighbor.lastHelloTime.Add(deadTimeout(neighbor.helloInterval)); !got.Equal(deadline) {
+		t.Fatalf("unscheduled Hello moved deadline from %v to %v", deadline, got)
+	}
+	if neighbor.unicastHelloInterval != 2*time.Second {
+		t.Fatalf("unicast interval = %v", neighbor.unicastHelloInterval)
+	}
+}
+
+func TestIHUAddressAndRTTOrder(t *testing.T) {
+	speaker, neighbor, _ := captureSpeaker(t, Config{})
+	now := nowMicros()
+	neighbor.mu.Lock()
+	neighbor.ourHelloTxTS, neighbor.haveOurHello = now-10_000, true
+	neighbor.mu.Unlock()
+	// First, an explicitly addressed IHU for another interface is ignored.
+	body := make([]byte, 22)
+	body[0] = AEIPv6
+	body[2], body[3], body[4], body[5] = 0, 77, 0, 100
+	copy(body[6:], net.ParseIP("fe80::dead").To16())
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{{Type: TLVIHU, Body: body}}))
+	neighbor.mu.Lock()
+	haveCost := neighbor.haveReportedCost
+	neighbor.mu.Unlock()
+	if haveCost {
+		t.Fatal("accepted IHU addressed to a different local interface")
+	}
+
+	// IHU preceding Hello in the same packet still yields a valid sample.
+	ihu := EncodeIHU(IHU{RxCost: 64, Interval: 100, OriginTS: now - 10_000, ReceiveTS: 1_000, HasTS: true})
+	hello := EncodeHello(Hello{Seqno: 1, Interval: 100, TxTS: 1_500, HasTS: true})
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{ihu, hello}))
+	neighbor.mu.Lock()
+	haveRTT := neighbor.haveRTT
+	neighbor.mu.Unlock()
+	if !haveRTT {
+		t.Fatal("IHU-before-Hello packet did not produce an RTT sample")
+	}
+}
+
+func TestOriginRequestsAndUpdateSplitting(t *testing.T) {
+	routerID := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	speaker, neighbor, packets := captureSpeaker(t, Config{RouterID: routerID, PacketSize: 48})
+	first := netip.MustParsePrefix("10.0.0.1/32")
+	second := netip.MustParsePrefix("2001:db8::1/128")
+	speaker.Originate(first)
+	speaker.Originate(second)
+	*packets = nil
+	speaker.flushUpdates()
+	if len(*packets) < 2 {
+		t.Fatalf("oversized update dump used %d packet(s), want multiple", len(*packets))
+	}
+	for _, packet := range *packets {
+		if got := len(packet) - ipv6HeaderLen - udpHeaderLen; got > speaker.cfg.PacketSize {
+			t.Fatalf("Babel packet is %d bytes, limit %d", got, speaker.cfg.PacketSize)
+		}
+	}
+
+	*packets = nil
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeSeqnoRequest(SeqnoRequest{
+		AE: AEIPv4, Prefix: first, Seqno: 9, HopCount: 64, RouterID: routerID,
+	})}))
+	if len(*packets) != 1 || speaker.originSeqno != 2 {
+		t.Fatalf("Seqno Request produced %d replies and seqno %d", len(*packets), speaker.originSeqno)
+	}
+
+	*packets = nil
+	missing := netip.MustParsePrefix("10.0.0.9/32")
+	speaker.handlePacket(neighbor, EncodePacket([]RawTLV{EncodeRouteRequest(RouteRequest{AE: AEIPv4, Prefix: missing})}))
+	if len(*packets) != 1 {
+		t.Fatalf("missing Route Request produced %d replies", len(*packets))
+	}
+	payload := (*packets)[0][ipv6HeaderLen+udpHeaderLen:]
+	tlvs, err := DecodePacket(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	update, err := (&PrefixDecoder{}).Decode(tlvs[len(tlvs)-1].Body)
+	if err != nil || update.Metric != MetricInfinity {
+		t.Fatalf("missing route reply = %+v, %v", update, err)
+	}
+}

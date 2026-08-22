@@ -12,7 +12,21 @@ import (
 // The old Child SA is intentionally retained: retiring it requires a correct
 // INFORMATIONAL Delete exchange and an ESP overlap policy.
 func (s *Session) RekeyChild() error {
+	return s.rekeyChild(false)
+}
+
+// RekeyChildProactively starts a packet-count-triggered Child-SA rekey. If a
+// Child-SA rekey is already running, that exchange already satisfies the
+// request and this method succeeds without starting a duplicate.
+func (s *Session) RekeyChildProactively() error {
+	return s.rekeyChild(true)
+}
+
+func (s *Session) rekeyChild(alreadyRunningIsSuccess bool) error {
 	if !s.childRekeying.CompareAndSwap(false, true) {
+		if alreadyRunningIsSuccess {
+			return nil
+		}
 		return fmt.Errorf("ike: Child SA rekey already in progress")
 	}
 	defer s.childRekeying.Store(false)

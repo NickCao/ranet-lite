@@ -241,7 +241,7 @@ func (s *Session) Run(ctx context.Context) error {
 		if poll := time.Now().Add(requestPollInterval); poll.Before(deadline) {
 			deadline = poll
 		}
-		raw, err := s.mux.RecvIKEUntil(deadline)
+		raw, source, err := s.mux.RecvIKEFromUntil(deadline)
 		if err != nil {
 			if !transport.IsTimeout(err) {
 				if pending != nil {
@@ -276,7 +276,7 @@ func (s *Session) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		if s.dispatch(raw, &pending) {
+		if s.dispatch(raw, source, &pending) {
 			lastAuthenticated = time.Now()
 		}
 	}
@@ -330,17 +330,37 @@ func (s *Session) sendPending(pending *pendingRequest) error {
 		return err
 	}
 	pending.attempts++
-	pending.deadline = time.Now().Add(requestTimeout)
+	pending.deadline = time.Now().Add(retransmitDelay(pending.attempts))
 	return nil
 }
 
-func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
+func retransmitDelay(attempt int) time.Duration {
+	if attempt <= 1 {
+		return requestTimeout
+	}
+	return requestTimeout << min(attempt-1, maxRetransmits-1)
+}
+
+func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pendingRequest) bool {
 	hdr, err := decodeHeader(raw)
 	if err != nil {
 		return false
 	}
+	if hdr.MajorVersion != 2 || hdr.Length != uint32(len(raw)) {
+		return false
+	}
 	ctx := s.contextForHeader(hdr)
 	if ctx == nil {
+		return false
+	}
+	var matching *pendingRequest
+	if hdr.IsResponse() {
+		matching = *pending
+		if hdr.IsInitiator() != ctx.responder || matching == nil || matching.context != ctx ||
+			hdr.MessageID != matching.msgID || hdr.ExchangeType != matching.exchange {
+			return false
+		}
+	} else if hdr.IsInitiator() != ctx.responder {
 		return false
 	}
 	outer, err := DecodeMessage(raw)
@@ -351,17 +371,14 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	if err != nil {
 		return false
 	}
-	if hdr.IsResponse() && hdr.IsInitiator() == ctx.responder {
-		if current := *pending; current != nil && current.context == ctx && hdr.MessageID == current.msgID && hdr.ExchangeType == current.exchange {
-			current.result <- requestResult{inner: inner}
-			*pending = nil
-			return true
-		}
-		return false
+	if matching != nil {
+		matching.result <- requestResult{inner: inner}
+		*pending = nil
+		return true
 	}
-	if hdr.IsInitiator() != ctx.responder || hdr.IsResponse() {
-		return false
-	}
+	// Authentication proves the request's source endpoint belongs to this
+	// peer. Retain it for future IKE requests and ESP after NAT port rebinding.
+	s.mux.AdoptEndpoint(source)
 	s.stateMu.RLock()
 	nextPeerMID := ctx.nextPeerMID
 	lastPeerResponseID := ctx.lastPeerResponseID
@@ -369,7 +386,7 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	s.stateMu.RUnlock()
 	if hdr.MessageID != nextPeerMID {
 		if nextPeerMID > 0 && hdr.MessageID == nextPeerMID-1 && lastPeerResponseID == hdr.MessageID {
-			if err := s.mux.SendIKE(lastPeerResponse); err != nil {
+			if err := s.mux.SendIKETo(lastPeerResponse, source); err != nil {
 				s.mux.Close()
 			}
 		}
@@ -378,7 +395,7 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	response, err := s.handleRequest(ctx, hdr, inner)
 	if err != nil {
 		if response != nil {
-			_ = s.mux.SendIKE(response)
+			_ = s.mux.SendIKETo(response, source)
 		}
 		s.mux.Close()
 		return true
@@ -388,7 +405,7 @@ func (s *Session) dispatch(raw []byte, pending **pendingRequest) bool {
 	ctx.lastPeerResponse = response
 	ctx.nextPeerMID++
 	s.stateMu.Unlock()
-	if err := s.mux.SendIKE(response); err != nil {
+	if err := s.mux.SendIKETo(response, source); err != nil {
 		s.mux.Close()
 		return true
 	}

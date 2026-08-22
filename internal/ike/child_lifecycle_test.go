@@ -74,6 +74,17 @@ func TestReplaceChildRejectsOverlappingRetirement(t *testing.T) {
 	}
 }
 
+func TestProactiveChildRekeyCoalescesWithRunningExchange(t *testing.T) {
+	s := new(Session)
+	s.childRekeying.Store(true)
+	if err := s.RekeyChildProactively(); err != nil {
+		t.Fatalf("proactive rekey did not coalesce: %v", err)
+	}
+	if err := s.RekeyChild(); err == nil {
+		t.Fatal("ordinary rekey did not report the running exchange")
+	}
+}
+
 func TestChildRekeyGuardSerializesAttempts(t *testing.T) {
 	s := &Session{}
 	if !s.childRekeying.CompareAndSwap(false, true) {

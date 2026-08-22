@@ -4,11 +4,84 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 )
+
+func mustHex(t *testing.T, value string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// RFC 7634 Appendix A publishes a complete tunnel-mode ChaCha20-Poly1305
+// ESP packet. Opening its ESP wire image guards the SPI/sequence AAD, explicit
+// IV, ciphertext, tag, padding, pad length, and Next Header together.
+func TestRFC7634ESPWireImage(t *testing.T) {
+	key := mustHex(t, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3")
+	packet := mustHex(t, "01020304000000051011121314151617"+
+		"24039428b97f417e3c13753a4f05087b67c352e6a7fab1b982d466ef407ae5c6"+
+		"14ee8099d52844eb61aa95dfab4c02f72aa71e7c4c4f64c9befe2facc638e8f3"+
+		"cbec163fac469b502773f6fb94e664da9165b82829f641e0"+
+		"76aaa8266b7fb0f7b11b369907e1ad43")
+	want := mustHex(t, "45000054a6f200004001e778c6336405c000020508005b7a3a080000553bec10"+
+		"0007362708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223"+
+		"2425262728292a2b2c2d2e2f3031323334353637")
+	in, err := NewInbound(ChildSA{EncrID: ENCRChaCha20Poly1305, LocalSPI: 0x01020304, InboundKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, nextHeader, err := in.Open(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextHeader != NextHeaderIPv4 || !bytes.Equal(plain, want) {
+		t.Fatalf("RFC 7634 packet decoded to next-header %d, plaintext %x", nextHeader, plain)
+	}
+}
+
+// This fixed AES-GCM packet exercises RFC 4106's complete ESP construction,
+// not merely a local encrypt/decrypt round trip.
+func TestRFC4106ESPWireImage(t *testing.T) {
+	key := mustHex(t, "000102030405060708090a0b0c0d0e0f10111213")
+	want := mustHex(t, "010203040000000100000000000000010c00b9b18f251e201fc6e81e37c3b1abf1d5002d1ae464e91ab3d134327602fe5e5ec36e3774fa67")
+	out, err := NewOutbound(ChildSA{EncrID: ENCRAESGCM16, EncrKeyBits: 128, RemoteSPI: 0x01020304, OutboundKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := out.Seal([]byte("RFC 4106 AES-GCM ESP"), NextHeaderIPv4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("RFC 4106 wire image = %x", got)
+	}
+}
+
+func TestProactivePacketCountRekey(t *testing.T) {
+	out, err := NewOutbound(testChild(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var called atomic.Int32
+	out.SetRekeyCallback(func() { called.Add(1) })
+	out.seq.Store(ProactiveRekeySequence - 1)
+	if _, err := out.Seal(nil, NextHeaderIPv4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Seal(nil, NextHeaderIPv4); err != nil {
+		t.Fatal(err)
+	}
+	if got := called.Load(); got != 1 {
+		t.Fatalf("rekey callback called %d times, want once", got)
+	}
+}
 
 func testChild(t *testing.T) ChildSA {
 	t.Helper()

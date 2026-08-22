@@ -21,6 +21,9 @@ const (
 	NextHeaderNone = 59
 
 	headerLen = 8 // SPI + 32-bit Sequence Number
+	// ProactiveRekeySequence leaves a 65536-packet safety margin before a
+	// non-ESN SA's sequence space is exhausted.
+	ProactiveRekeySequence = uint64(0xffffffff - 0xffff)
 )
 
 // OutboundSA encrypts packets for the direction this client originates.
@@ -36,8 +39,15 @@ type OutboundSA struct {
 	salt   []byte
 	spi    uint32
 
-	seq atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
+	seq       atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
+	rekeyOnce sync.Once
+	onRekey   func()
 }
+
+// SetRekeyCallback installs a one-shot notification fired when the outbound
+// packet counter reaches ProactiveRekeySequence. Configure it before Seal is
+// called concurrently.
+func (o *OutboundSA) SetRekeyCallback(fn func()) { o.onRekey = fn }
 
 // InboundSA decrypts packets sent to this client's SPI. Open supports calls
 // from concurrent workers using a locked check-decrypt-recheck-commit pattern:
@@ -142,6 +152,9 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 // Seal needs to serialize.
 func (o *OutboundSA) nextSeq() (uint64, error) {
 	seq := o.seq.Add(1)
+	if seq >= ProactiveRekeySequence && seq <= 0xffffffff && o.onRekey != nil {
+		o.rekeyOnce.Do(o.onRekey)
+	}
 	if seq > 0xffffffff {
 		// No ESN: once the 32-bit sequence space is exhausted this SA is
 		// unusable and the session must be re-established or rekeyed.

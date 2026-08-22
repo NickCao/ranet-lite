@@ -54,6 +54,42 @@ func TestUpdateRoundTripNoCompression(t *testing.T) {
 	}
 }
 
+func TestUpdateRouterIDFlagDerivesAndUpdatesState(t *testing.T) {
+	body := EncodeUpdate(Update{AE: AEIPv6, Plen: 128, Prefix: net.ParseIP("2001:db8::0102:0304:0506:0708")}).Body
+	body[1] |= updateFlagRouterID | 0x01 // unknown flag bits are ignored
+	got, err := (&PrefixDecoder{}).Decode(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	if got.Ignore || !got.HasRouterID || got.RouterID != want {
+		t.Fatalf("R-flag Update = %+v, want router-id %x", got, want)
+	}
+	v4 := EncodeUpdate(Update{AE: AEIPv4, Plen: 25, Prefix: net.IPv4(192, 0, 2, 255)}).Body
+	v4[1] |= updateFlagRouterID
+	got, err = (&PrefixDecoder{}).Decode(v4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = [8]byte{0, 0, 0, 0, 192, 0, 2, 128}
+	if got.RouterID != want {
+		t.Fatalf("masked IPv4 R-flag router-id = %x, want %x", got.RouterID, want)
+	}
+}
+
+func TestRequestRoundTrips(t *testing.T) {
+	prefix := netip.MustParsePrefix("2001:db8::/64")
+	route, err := DecodeRouteRequest(EncodeRouteRequest(RouteRequest{AE: AEIPv6, Prefix: prefix}).Body)
+	if err != nil || route.Prefix != prefix {
+		t.Fatalf("Route Request = %+v, %v", route, err)
+	}
+	want := SeqnoRequest{AE: AEIPv6, Prefix: prefix, Seqno: 42, HopCount: 64, RouterID: [8]byte{1, 2, 3}}
+	seqno, err := DecodeSeqnoRequest(EncodeSeqnoRequest(want).Body)
+	if err != nil || seqno != want {
+		t.Fatalf("Seqno Request = %+v, %v; want %+v", seqno, err, want)
+	}
+}
+
 func TestUpdatePrefixCompression(t *testing.T) {
 	// Simulate what a compressing sender (e.g. BIRD) would produce: two
 	// IPv4 /32 updates sharing the first 3 bytes, second one omits them.

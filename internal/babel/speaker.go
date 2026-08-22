@@ -30,11 +30,13 @@ var multicastGroup = netip.MustParseAddr("ff02::1:6")
 type neighborState struct {
 	peer *netstack.Peer
 
-	mu            sync.Mutex
-	addr          netip.Addr
-	alive         bool
-	lastHelloTime time.Time
-	helloInterval time.Duration
+	mu                   sync.Mutex
+	addr                 netip.Addr
+	alive                bool
+	lastHelloTime        time.Time
+	helloInterval        time.Duration
+	unicastHelloTime     time.Time
+	unicastHelloInterval time.Duration
 
 	// RFC 9616 RTT extension state. theirHello* is what we need to build
 	// our own outgoing IHU (echoing their last Hello's transmit time plus
@@ -88,7 +90,10 @@ func (n *neighborState) isAlive() bool {
 }
 
 func (n *neighborState) isAliveLocked() bool {
-	return n.alive && n.helloInterval > 0 && time.Now().Before(n.lastHelloTime.Add(deadTimeout(n.helloInterval)))
+	now := time.Now()
+	multicastAlive := n.helloInterval > 0 && now.Before(n.lastHelloTime.Add(deadTimeout(n.helloInterval)))
+	unicastAlive := n.unicastHelloInterval > 0 && now.Before(n.unicastHelloTime.Add(deadTimeout(n.unicastHelloInterval)))
+	return n.alive && (multicastAlive || unicastAlive)
 }
 
 // shouldDeclareDown reports whether we've heard from this neighbor before
@@ -97,7 +102,7 @@ func (n *neighborState) isAliveLocked() bool {
 func (n *neighborState) shouldDeclareDown() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.helloInterval > 0 && !n.isAliveLocked()
+	return (n.helloInterval > 0 || n.unicastHelloInterval > 0) && !n.isAliveLocked()
 }
 
 // Config holds Speaker tuning parameters. Zero values fall back to
@@ -109,6 +114,9 @@ type Config struct {
 	HelloInterval  time.Duration
 	UpdateInterval time.Duration
 	Cost           CostParams
+	// PacketSize is the maximum encoded Babel UDP payload. Zero uses the
+	// IPv6-adjusted default mesh MTU (1400 - 40 - 8 = 1352 bytes).
+	PacketSize int
 }
 
 func randomLinkLocal() netip.Addr {
@@ -127,6 +135,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Cost == (CostParams{}) {
 		c.Cost = DefaultCostParams()
+	}
+	if c.PacketSize == 0 {
+		c.PacketSize = netstack.DefaultMTU - ipv6HeaderLen - udpHeaderLen
 	}
 	if c.RouterID == ([8]byte{}) {
 		rand.Read(c.RouterID[:])
@@ -150,10 +161,11 @@ type Speaker struct {
 	cfg  Config
 	mesh *netstack.Mesh
 
-	mu        sync.Mutex
-	neighbors map[string]*neighborState // keyed by netstack.Peer.ID
-	originate map[netip.Prefix]struct{}
-	routes    *routeTable
+	mu          sync.Mutex
+	neighbors   map[string]*neighborState // keyed by netstack.Peer.ID
+	originate   map[netip.Prefix]struct{}
+	routes      *routeTable
+	originSeqno uint16
 
 	changed chan struct{}
 }
@@ -179,8 +191,8 @@ func New(cfg Config, mesh *netstack.Mesh) (*Speaker, error) {
 		cfg: cfg, mesh: mesh,
 		neighbors: map[string]*neighborState{},
 		originate: map[netip.Prefix]struct{}{},
-		routes:    newRouteTable(),
-		changed:   make(chan struct{}, 1),
+		routes:    newRouteTable(), originSeqno: 1,
+		changed: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -268,6 +280,33 @@ func (s *Speaker) sendTo(n *neighborState, destination netip.Addr, tlvs []RawTLV
 		slog.Warn("babel send failed", "peer", n.peer.ID, "err", err)
 	} else {
 		slog.Debug("babel sent packet", "peer", n.peer.ID, "tlvs", len(tlvs), "bytes", len(pkt))
+	}
+}
+
+func (s *Speaker) sendBatchesTo(n *neighborState, destination netip.Addr, tlvs []RawTLV) {
+	var batch []RawTLV
+	size := headerLen
+	for i := 0; i < len(tlvs); {
+		end := i + 1
+		// Router-Id parser state is packet-local, so never split it from the
+		// Update that consumes it.
+		if tlvs[i].Type == TLVRouterID && end < len(tlvs) && tlvs[end].Type == TLVUpdate {
+			end++
+		}
+		groupSize := 0
+		for _, tlv := range tlvs[i:end] {
+			groupSize += 2 + len(tlv.Body)
+		}
+		if len(batch) > 0 && size+groupSize > s.cfg.PacketSize {
+			s.sendTo(n, destination, batch)
+			batch, size = nil, headerLen
+		}
+		batch = append(batch, tlvs[i:end]...)
+		size += groupSize
+		i = end
+	}
+	if len(batch) > 0 {
+		s.sendTo(n, destination, batch)
 	}
 }
 
@@ -381,6 +420,7 @@ func (s *Speaker) flushUpdates() {
 	for p := range s.originate {
 		originate = append(originate, p)
 	}
+	seqno := s.originSeqno
 	s.mu.Unlock()
 
 	centis := uint16(s.cfg.UpdateInterval / (10 * time.Millisecond))
@@ -399,10 +439,10 @@ func (s *Speaker) flushUpdates() {
 		for _, p := range originate {
 			tlvs = append(tlvs, EncodeRouterID(s.cfg.RouterID))
 			tlvs = append(tlvs, EncodeUpdate(Update{
-				AE: aeFor(p), Plen: p.Bits(), Interval: centis, Seqno: 1, Metric: 0, Prefix: net.IP(p.Addr().AsSlice()),
+				AE: aeFor(p), Plen: p.Bits(), Interval: centis, Seqno: seqno, Metric: 0, Prefix: net.IP(p.Addr().AsSlice()),
 			}))
 		}
-		s.send(n, tlvs)
+		s.sendBatchesTo(n, multicastGroup, tlvs)
 	}
 }
 
@@ -416,6 +456,8 @@ func aeFor(p netip.Prefix) uint8 {
 // --- receiving ---
 
 func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
+	receivedAt := time.Now()
+	recvTS := uint32(receivedAt.UnixMicro())
 	tlvs, err := DecodePacket(raw)
 	if err != nil {
 		slog.Warn("babel bad packet", "err", err)
@@ -426,6 +468,16 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 	var haveRouterID bool
 	var freshHelloTxTS uint32
 	var haveFreshHello bool
+	// RFC 9616 associates a packet's Hello and IHU regardless of their TLV
+	// order. Record the packet's timestamped Hello before processing either.
+	for _, t := range tlvs {
+		if t.Type == TLVHello {
+			if h, err := DecodeHello(t.Body); err == nil && h.HasTS {
+				freshHelloTxTS, haveFreshHello = h.TxTS, true
+				break
+			}
+		}
+	}
 
 	for _, t := range tlvs {
 		switch t.Type {
@@ -434,27 +486,40 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			if err != nil {
 				continue
 			}
-			recvTS := nowMicros()
 			n.mu.Lock()
 			if !n.alive {
 				slog.Info("babel neighbor up", "peer", n.peer.ID)
 			}
 			n.alive = true
-			n.lastHelloTime = time.Now()
-			n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
+			// An unscheduled Hello (Interval 0) must not postpone the
+			// deadline promised by the last scheduled Hello of this class.
+			if h.Interval != 0 {
+				if h.Unicast {
+					n.unicastHelloTime = receivedAt
+					n.unicastHelloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
+				} else {
+					n.lastHelloTime = receivedAt
+					n.helloInterval = time.Duration(h.Interval) * 10 * time.Millisecond
+				}
+			}
 			if h.HasTS {
 				n.theirHelloTxTS, n.theirHelloRxTS, n.haveTheirHello = h.TxTS, recvTS, true
-				freshHelloTxTS, haveFreshHello = h.TxTS, true
 			}
 			n.mu.Unlock()
 			s.routes.recomputeNeighbor(n, s.installRoute)
 
 		case TLVIHU:
-			ihu, _, err := DecodeIHU(t.Body)
+			ihu, addr, err := DecodeIHU(t.Body)
 			if err != nil {
 				continue
 			}
-			now := nowMicros()
+			if addr != nil {
+				address, ok := netip.AddrFromSlice(addr)
+				if !ok || address.Unmap() != s.cfg.LinkLocalAddr.Unmap() {
+					continue
+				}
+			}
+			now := recvTS
 			n.mu.Lock()
 			n.reportedCost = ihu.RxCost
 			n.haveReportedCost = true
@@ -464,10 +529,15 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			// the same packet also carries a fresh Hello from them — that
 			// second timestamp is what lets us subtract their processing
 			// delay back out, rather than counting it as network latency.
-			if ihu.HasTS && haveFreshHello && n.haveOurHello && ihu.OriginTS == n.ourHelloTxTS {
-				rtt := microDelta(now, n.ourHelloTxTS) - microDelta(freshHelloTxTS, ihu.ReceiveTS)
+			if ihu.HasTS && haveFreshHello && n.haveOurHello && ihu.OriginTS == n.ourHelloTxTS &&
+				validTimestampGap(microDelta(now, ihu.OriginTS)) && validTimestampGap(microDelta(freshHelloTxTS, ihu.ReceiveTS)) {
+				rtt := microDelta(now, ihu.OriginTS) - microDelta(freshHelloTxTS, ihu.ReceiveTS)
 				if rtt > 0 {
-					n.measuredRTT, n.haveRTT = rtt, true
+					if n.haveRTT {
+						n.measuredRTT = (836*n.measuredRTT + 164*rtt) / 1000
+					} else {
+						n.measuredRTT, n.haveRTT = rtt, true
+					}
 				}
 			}
 			n.mu.Unlock()
@@ -487,11 +557,17 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 				continue
 			}
 			if u.Ignore {
+				if u.HasRouterID {
+					curRouterID, haveRouterID = u.RouterID, true
+				}
 				// Carries some other mandatory sub-TLV we don't recognize
 				// at all, or a malformed Source Prefix. Per RFC 8966
 				// §4.4 the whole TLV is ignored; the prefix-compression
 				// state above was still updated.
 				continue
+			}
+			if u.HasRouterID {
+				curRouterID, haveRouterID = u.RouterID, true
 			}
 			if u.AE == AEWildcard {
 				for _, key := range s.routes.expireNeighbor(n) {
@@ -538,7 +614,78 @@ func (s *Speaker) handlePacket(n *neighborState, raw []byte) {
 			if destination := n.address(); err == nil && destination.IsValid() {
 				s.sendTo(n, destination, []RawTLV{EncodeAck(nonce)})
 			}
+
+		case TLVRouteRequest:
+			if request, err := DecodeRouteRequest(t.Body); err == nil {
+				s.handleRouteRequest(n, request)
+			}
+
+		case TLVSeqnoRequest:
+			if request, err := DecodeSeqnoRequest(t.Body); err == nil {
+				s.handleSeqnoRequest(n, request)
+			}
 		}
+	}
+}
+
+const rttTimestampHorizon = 3 * time.Minute
+
+func validTimestampGap(gap time.Duration) bool {
+	return gap >= 0 && gap <= rttTimestampHorizon
+}
+
+func (s *Speaker) originatedUpdate(prefix netip.Prefix, metric uint16) []RawTLV {
+	s.mu.Lock()
+	seqno := s.originSeqno
+	s.mu.Unlock()
+	centis := uint16(s.cfg.UpdateInterval / (10 * time.Millisecond))
+	return []RawTLV{EncodeRouterID(s.cfg.RouterID), EncodeUpdate(Update{
+		AE: aeFor(prefix), Plen: prefix.Bits(), Interval: centis, Seqno: seqno,
+		Metric: metric, Prefix: net.IP(prefix.Addr().AsSlice()),
+	})}
+}
+
+func (s *Speaker) handleRouteRequest(n *neighborState, request RouteRequest) {
+	destination := n.address()
+	if !destination.IsValid() {
+		return
+	}
+	s.mu.Lock()
+	var prefixes []netip.Prefix
+	if request.AE == AEWildcard {
+		for prefix := range s.originate {
+			prefixes = append(prefixes, prefix)
+		}
+	} else if _, ok := s.originate[request.Prefix]; ok {
+		prefixes = append(prefixes, request.Prefix)
+	}
+	s.mu.Unlock()
+	if request.AE != AEWildcard && len(prefixes) == 0 {
+		s.sendBatchesTo(n, destination, s.originatedUpdate(request.Prefix, MetricInfinity))
+		return
+	}
+	var tlvs []RawTLV
+	for _, prefix := range prefixes {
+		tlvs = append(tlvs, s.originatedUpdate(prefix, 0)...)
+	}
+	s.sendBatchesTo(n, destination, tlvs)
+}
+
+func (s *Speaker) handleSeqnoRequest(n *neighborState, request SeqnoRequest) {
+	if request.RouterID != s.cfg.RouterID {
+		return // Appendix-E leaf: no transit request forwarding.
+	}
+	s.mu.Lock()
+	_, originated := s.originate[request.Prefix]
+	if originated && seqnoGT(request.Seqno, s.originSeqno) {
+		s.originSeqno++ // at most one increment for a single request
+	}
+	s.mu.Unlock()
+	if !originated {
+		return
+	}
+	if destination := n.address(); destination.IsValid() {
+		s.sendBatchesTo(n, destination, s.originatedUpdate(request.Prefix, 0))
 	}
 }
 

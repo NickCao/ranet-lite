@@ -359,6 +359,19 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	if err != nil {
 		return err
 	}
+	setProactiveRekey := func(sa *esp.OutboundSA) {
+		sa.SetRekeyCallback(func() {
+			go func() {
+				if err := sess.RekeyChildProactively(); err != nil && !sess.Mux().IsClosed() {
+					log.Printf("peer %s: proactive Child SA rekey: %v", name, err)
+					// Continuing to use this SA indefinitely would eventually
+					// reuse the non-ESN sequence space. Reconnect with fresh SAs.
+					_ = sess.Mux().Close()
+				}
+			}()
+		})
+	}
+	setProactiveRekey(out)
 	in, err := esp.NewInbound(sess.Child, esp.WithReplayWindow(cfg.ReplayWindowSize()))
 	if err != nil {
 		return err
@@ -378,6 +391,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		if err != nil {
 			return err
 		}
+		setProactiveRekey(newOut)
 		newIn, err := esp.NewInbound(child, esp.WithReplayWindow(cfg.ReplayWindowSize()))
 		if err != nil {
 			return err

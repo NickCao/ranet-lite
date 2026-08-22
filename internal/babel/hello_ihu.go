@@ -18,6 +18,7 @@ import (
 type Hello struct {
 	Seqno    uint16
 	Interval uint16 // centiseconds
+	Unicast  bool
 	TxTS     uint32 // RFC 9616 §6.1 Transmit Timestamp (microseconds, arbitrary origin); 0 if omitted
 	HasTS    bool
 }
@@ -26,7 +27,10 @@ func EncodeHello(h Hello) RawTLV {
 	body := make([]byte, 6)
 	// Flags left at 0: this is a "Multicast Hello" per RFC 8966 §3.2.4's
 	// classification (see the Hello doc comment above) — the Unicast flag
-	// is deliberately never set.
+	// is deliberately never set by Speaker's multicast Hello loop.
+	if h.Unicast {
+		binary.BigEndian.PutUint16(body[0:2], 0x8000)
+	}
 	binary.BigEndian.PutUint16(body[2:4], h.Seqno)
 	binary.BigEndian.PutUint16(body[4:6], h.Interval)
 	if h.HasTS {
@@ -44,6 +48,7 @@ func DecodeHello(body []byte) (Hello, error) {
 	h := Hello{
 		Seqno:    binary.BigEndian.Uint16(body[2:4]),
 		Interval: binary.BigEndian.Uint16(body[4:6]),
+		Unicast:  binary.BigEndian.Uint16(body[0:2])&0x8000 != 0,
 	}
 	subs, err := decodeSubTLVs(body[6:])
 	if err != nil {

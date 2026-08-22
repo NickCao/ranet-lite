@@ -62,6 +62,36 @@ func TestRekeyRetryDelay(t *testing.T) {
 	}
 }
 
+func TestRequestRetransmitDelayIsExponential(t *testing.T) {
+	want := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second}
+	for i, delay := range want {
+		if got := retransmitDelay(i + 1); got != delay {
+			t.Fatalf("attempt %d delay = %v, want %v", i+1, got, delay)
+		}
+	}
+}
+
+func TestInitialResponseHeaderValidation(t *testing.T) {
+	req := &Header{SPIInitiator: 1, SPIResponder: 0, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator, MessageID: 0}
+	valid := &Header{SPIInitiator: 1, SPIResponder: 2, MajorVersion: 2, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0, Length: HeaderLen}
+	if !validResponseHeader(req, valid, HeaderLen) {
+		t.Fatal("valid initial response rejected")
+	}
+	mutations := []func(*Header){
+		func(h *Header) { h.MajorVersion = 3 }, func(h *Header) { h.ExchangeType = IKE_AUTH },
+		func(h *Header) { h.Flags |= FlagInitiator }, func(h *Header) { h.SPIResponder = 0 },
+		func(h *Header) { h.SPIInitiator++ }, func(h *Header) { h.MessageID++ },
+		func(h *Header) { h.Length++ },
+	}
+	for i, mutate := range mutations {
+		got := *valid
+		mutate(&got)
+		if validResponseHeader(req, &got, HeaderLen) {
+			t.Errorf("invalid header mutation %d accepted: %+v", i, got)
+		}
+	}
+}
+
 func TestSetRekeyRetry(t *testing.T) {
 	s := new(Session)
 	if err := s.SetRekeyRetry(5*time.Second, time.Minute); err != nil {

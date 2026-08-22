@@ -33,6 +33,10 @@ type Update struct {
 	Seqno    uint16
 	Metric   uint16 // MetricInfinity means "route retracted"
 	Prefix   net.IP
+	// RouterID is derived from Prefix when the R flag is set. HasRouterID
+	// distinguishes the valid all-zero-derived IPv4 form from no R flag.
+	RouterID    [8]byte
+	HasRouterID bool
 
 	// Ignore is set when this Update carries a sub-TLV with the mandatory
 	// bit set (type 128-255, RFC 8966 §4.4) that we don't recognize at
@@ -143,6 +147,7 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		buf := make([]byte, 4)
 		copy(buf, d.lastV4[:omitted])
 		copy(buf[omitted:], sent[:sentLen])
+		clearPrefixTail(buf, plen)
 		if flags&updateFlagPrefix != 0 {
 			d.lastV4, d.haveV4 = [4]byte(buf), true
 		}
@@ -151,6 +156,7 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		buf := make([]byte, 16)
 		copy(buf, d.lastV6[:omitted])
 		copy(buf[omitted:], sent[:sentLen])
+		clearPrefixTail(buf, plen)
 		if flags&updateFlagPrefix != 0 {
 			d.lastV6, d.haveV6 = [16]byte(buf), true
 		}
@@ -158,8 +164,13 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 	}
 
 	u := Update{AE: ae, Plen: plen, Interval: interval, Seqno: seqno, Metric: metric, Prefix: ip}
-	if flags&updateFlagRouterID != 0 || flags & ^uint8(updateFlagPrefix|updateFlagRouterID) != 0 {
-		u.Ignore = true
+	if flags&updateFlagRouterID != 0 && ae != AEWildcard {
+		raw := ip.To16()
+		if ae == AEIPv4 {
+			raw = ip.To4()
+		}
+		copy(u.RouterID[8-min(8, len(raw)):], raw[max(0, len(raw)-8):])
+		u.HasRouterID = true
 	}
 	if ae == AEWildcard && metric != MetricInfinity {
 		u.Ignore = true
@@ -190,6 +201,12 @@ func (d *PrefixDecoder) Decode(body []byte) (Update, error) {
 		}
 	}
 	return u, nil
+}
+
+func clearPrefixTail(raw []byte, plen int) {
+	if plen > 0 && plen%8 != 0 {
+		raw[plen/8] &= byte(0xff << (8 - plen%8))
+	}
 }
 
 // decodeSourcePrefix parses a Source Prefix sub-TLV body (draft-ietf-babel

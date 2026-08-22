@@ -872,11 +872,23 @@ func TestCompareIKENonces(t *testing.T) {
 }
 
 func TestLowestNonceSelectsRedundantExchange(t *testing.T) {
-	if !lowestNonceBelongsToFirst([]byte{1}, []byte{4}, []byte{2}, []byte{3}) {
-		t.Fatal("did not select first exchange containing lowest nonce")
+	tests := []struct {
+		name                             string
+		firstI, firstR, secondI, secondR byte
+		firstLoses                       bool
+	}{
+		{"first initiator lowest", 1, 4, 2, 3, true},
+		{"first responder lowest", 4, 1, 2, 3, true},
+		{"second initiator lowest", 2, 4, 1, 3, false},
+		{"second responder lowest", 2, 3, 4, 1, false},
 	}
-	if lowestNonceBelongsToFirst([]byte{2}, []byte{4}, []byte{1}, []byte{3}) {
-		t.Fatal("selected first exchange when second contains lowest nonce")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := lowestNonceBelongsToFirst([]byte{test.firstI}, []byte{test.firstR}, []byte{test.secondI}, []byte{test.secondR})
+			if got != test.firstLoses {
+				t.Fatalf("firstLoses = %v, want %v", got, test.firstLoses)
+			}
+		})
 	}
 }
 
@@ -980,7 +992,8 @@ func TestSendRecvAcceptsNilAsAlwaysTrue(t *testing.T) {
 	defer mux.Close()
 
 	const spiI = 0xaabbccddeeff0011
-	req := encodeTestMessage(t, Header{SPIInitiator: spiI, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 3}, nil)
+	const spiR = 0x1122334455667788
+	req := encodeTestMessage(t, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagInitiator, MessageID: 3}, nil)
 
 	done := make(chan []byte, 1)
 	go func() {
@@ -997,7 +1010,7 @@ func TestSendRecvAcceptsNilAsAlwaysTrue(t *testing.T) {
 	if _, clientAddr, err := peer.ReadFromUDP(buf); err != nil {
 		t.Fatalf("peer did not receive request: %v", err)
 	} else {
-		resp := withNonESPMarker(encodeTestMessage(t, Header{SPIInitiator: spiI, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: 3}, nil))
+		resp := withNonESPMarker(encodeTestMessage(t, Header{SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL, Flags: FlagResponse, MessageID: 3}, nil))
 		if _, err := peer.WriteToUDP(resp, clientAddr); err != nil {
 			t.Fatal(err)
 		}

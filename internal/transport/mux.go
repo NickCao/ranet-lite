@@ -36,6 +36,15 @@ type Hub struct {
 	closeOnce sync.Once
 }
 
+// Endpoint is the authenticated datagram source retained by IKE so replies
+// can follow a peer whose NAT mapping changed.
+type Endpoint = conn.Endpoint
+
+type ikeDatagram struct {
+	raw      []byte
+	endpoint Endpoint
+}
+
 // NewHub binds localAddr. A specific IP is not supported by conn.Bind, so only
 // its port is used.
 func NewHub(localAddr string) (*Hub, error) {
@@ -64,7 +73,7 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan []byte, 16), espCh: make(chan []byte, espChanSize), espOut: make(chan [][]byte, espOutBatchSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan []byte, espChanSize), espOut: make(chan [][]byte, espOutBatchSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -144,7 +153,7 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 			}
 			if len(pkt) >= nonESPMarkerLen && raw[0]|raw[1]|raw[2]|raw[3] == 0 {
 				select {
-				case m.ikeCh <- pkt:
+				case m.ikeCh <- ikeDatagram{raw: pkt, endpoint: eps[i]}:
 				default:
 					log.Printf("transport: ikeCh full, dropping IKE message")
 				}
@@ -161,16 +170,17 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 
 // Mux is one peer's logical IKE and ESP channel on a Hub.
 type Mux struct {
-	hub      *Hub
-	endpoint conn.Endpoint
-	ikeCh    chan []byte
-	espCh    chan []byte
-	espOut   chan [][]byte
-	done     chan struct{}
-	doneOnce sync.Once
-	doneErr  atomic.Value
-	closed   atomic.Bool
-	ownHub   bool
+	hub        *Hub
+	endpointMu sync.RWMutex
+	endpoint   conn.Endpoint
+	ikeCh      chan ikeDatagram
+	espCh      chan []byte
+	espOut     chan [][]byte
+	done       chan struct{}
+	doneOnce   sync.Once
+	doneErr    atomic.Value
+	closed     atomic.Bool
+	ownHub     bool
 }
 
 // Dial preserves the one-peer convenience path. The returned mux owns its
@@ -190,6 +200,7 @@ func Dial(localAddr string, remoteIP net.IP, remotePort int) (*Mux, error) {
 }
 
 func (m *Mux) LocalAddr() net.Addr { return m.hub.LocalAddr() }
+func (m *Mux) IsClosed() bool      { return m.closed.Load() || m.hub.closed.Load() }
 
 // RegisterIKE routes packets whose marked IKE header has spi as SPIi to m.
 func (m *Mux) RegisterIKE(spi uint64) error { return m.registerIKE(spi) }
@@ -242,9 +253,27 @@ func (m *Mux) UnregisterESP(spi uint32) {
 }
 
 func (m *Mux) SendIKE(b []byte) error {
+	return m.SendIKETo(b, m.currentEndpoint())
+}
+
+func (m *Mux) currentEndpoint() Endpoint {
+	m.endpointMu.RLock()
+	defer m.endpointMu.RUnlock()
+	return m.endpoint
+}
+
+// AdoptEndpoint changes the destination used for subsequent IKE and ESP
+// traffic. IKE calls this only after authenticating a request from endpoint.
+func (m *Mux) AdoptEndpoint(endpoint Endpoint) {
+	m.endpointMu.Lock()
+	m.endpoint = endpoint
+	m.endpointMu.Unlock()
+}
+
+func (m *Mux) SendIKETo(b []byte, endpoint Endpoint) error {
 	out := make([]byte, nonESPMarkerLen+len(b))
 	copy(out[nonESPMarkerLen:], b)
-	return m.hub.bind.Send([][]byte{out}, m.endpoint)
+	return m.hub.bind.Send([][]byte{out}, endpoint)
 }
 func (m *Mux) SendESP(b []byte) error { return m.SendESPBatch([][]byte{b}) }
 func (m *Mux) SendESPBatch(bufs [][]byte) error {
@@ -288,7 +317,7 @@ func (m *Mux) sendESPLoop() {
 		if len(bufs) > 1 {
 			packed = packForGSO(packed, bufs)
 		}
-		if err := m.hub.bind.Send(bufs, m.endpoint); err != nil {
+		if err := m.hub.bind.Send(bufs, m.currentEndpoint()); err != nil {
 			log.Printf("transport: batch send of %d packets: %v", len(bufs), err)
 		}
 		bufs = bufs[:0]
@@ -314,21 +343,29 @@ func packForGSO(dst []byte, bufs [][]byte) []byte {
 }
 
 func (m *Mux) RecvIKE() ([]byte, error) {
+	b, _, err := m.RecvIKEFrom()
+	return b, err
+}
+func (m *Mux) RecvIKEFrom() ([]byte, Endpoint, error) {
 	select {
-	case b := <-m.ikeCh:
-		return b, nil
+	case d := <-m.ikeCh:
+		return d.raw, d.endpoint, nil
 	case <-m.done:
-		return nil, m.doneError()
+		return nil, nil, m.doneError()
 	}
 }
 func (m *Mux) RecvIKEUntil(deadline time.Time) ([]byte, error) {
+	b, _, err := m.RecvIKEFromUntil(deadline)
+	return b, err
+}
+func (m *Mux) RecvIKEFromUntil(deadline time.Time) ([]byte, Endpoint, error) {
 	select {
-	case b := <-m.ikeCh:
-		return b, nil
+	case d := <-m.ikeCh:
+		return d.raw, d.endpoint, nil
 	case <-m.done:
-		return nil, m.doneError()
+		return nil, nil, m.doneError()
 	case <-time.After(time.Until(deadline)):
-		return nil, errTimeout
+		return nil, nil, errTimeout
 	}
 }
 func (m *Mux) RecvESP() ([]byte, error) {

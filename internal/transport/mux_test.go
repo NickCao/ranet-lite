@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"testing"
@@ -155,6 +156,57 @@ func TestSendIKEUnbatchedAndMarked(t *testing.T) {
 	if string(buf[nonESPMarkerLen:n]) != string(payload) {
 		t.Fatalf("payload mismatch: got %q want %q", buf[nonESPMarkerLen:n], payload)
 	}
+}
+
+func TestSendIKEToReceivedSourceEndpoint(t *testing.T) {
+	configured := listenPeer(t, "udp4", "127.0.0.1")
+	rebound := listenPeer(t, "udp4", "127.0.0.1")
+	configuredAddr := configured.LocalAddr().(*net.UDPAddr)
+	m, err := Dial("", configuredAddr.IP, configuredAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	const spiI = uint64(0x0102030405060708)
+	if err := m.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: m.LocalAddr().(*net.UDPAddr).Port}
+	request := make([]byte, 28)
+	binary.BigEndian.PutUint64(request[:8], spiI)
+	if _, err := rebound.WriteToUDP(withMarker(request), dst); err != nil {
+		t.Fatal(err)
+	}
+	_, source, err := m.RecvIKEFromUntil(time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SendIKETo([]byte("response"), source); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	rebound.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := rebound.ReadFromUDP(buf)
+	if err != nil || string(buf[nonESPMarkerLen:n]) != "response" {
+		t.Fatalf("rebound endpoint response = %q, %v", buf[:n], err)
+	}
+	m.AdoptEndpoint(source)
+	if err := m.SendIKE([]byte("future")); err != nil {
+		t.Fatal(err)
+	}
+	rebound.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err = rebound.ReadFromUDP(buf)
+	if err != nil || string(buf[nonESPMarkerLen:n]) != "future" {
+		t.Fatalf("adopted endpoint response = %q, %v", buf[:n], err)
+	}
+	configured.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	if _, _, err := configured.ReadFromUDP(buf); err == nil {
+		t.Fatal("response was also sent to the stale configured endpoint")
+	}
+}
+
+func withMarker(payload []byte) []byte {
+	return append(make([]byte, nonESPMarkerLen), payload...)
 }
 
 func testRecvESPBatch(t *testing.T, network, addr string) {

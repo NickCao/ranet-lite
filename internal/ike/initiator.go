@@ -724,7 +724,7 @@ func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte,
 		if err := mux.SendIKE(req); err != nil {
 			return nil, err
 		}
-		deadline := time.Now().Add(requestTimeout)
+		deadline := time.Now().Add(retransmitDelay(attempt + 1))
 		for time.Now().Before(deadline) {
 			raw, err := mux.RecvIKEUntil(deadline)
 			if err != nil {
@@ -734,7 +734,7 @@ func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte,
 			if err != nil {
 				continue
 			}
-			if h.SPIInitiator == reqHdr.SPIInitiator && h.MessageID == reqHdr.MessageID && h.IsResponse() {
+			if validResponseHeader(reqHdr, h, len(raw)) {
 				if accept == nil || accept(raw) {
 					return raw, nil
 				}
@@ -747,4 +747,17 @@ func sendRecv(mux *transport.Mux, req []byte, accept func([]byte) bool) ([]byte,
 		}
 	}
 	return nil, fmt.Errorf("ike: no response after %d attempts", maxRetransmits)
+}
+
+func validResponseHeader(request, response *Header, rawLen int) bool {
+	if response.MajorVersion != 2 || response.ExchangeType != request.ExchangeType ||
+		response.MessageID != request.MessageID || !response.IsResponse() ||
+		response.IsInitiator() == request.IsInitiator() ||
+		response.SPIInitiator != request.SPIInitiator || response.Length != uint32(rawLen) {
+		return false
+	}
+	if request.SPIResponder == 0 {
+		return request.ExchangeType == IKE_SA_INIT && response.SPIResponder != 0
+	}
+	return response.SPIResponder == request.SPIResponder
 }
