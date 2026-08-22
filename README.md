@@ -173,10 +173,22 @@ go test ./... -race
 ```
 
 None of the unit tests require root or any privileged resource. Protocol-
-level correctness (IKE handshake, ESP crypto, Babel wire format and RTT
-extension, the TUN device itself) has additionally been validated by hand
-against a real strongSwan responder and a real BIRD Babel peer using the
-throwaway binaries under `cmd/`.
+level interoperability with strongSwan is covered by an opt-in
+[testcontainers-go](https://github.com/testcontainers/testcontainers-go)
+test. It builds a disposable Debian container, installs Debian's strongSwan
+packages, and verifies a real Ed25519-authenticated IKEv2 and Child SA
+negotiation:
+
+```sh
+DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock" \
+  go test -tags=integration ./integration -v
+```
+
+For local Podman, start the user socket first (`systemctl --user start
+podman.socket`) and set `DOCKER_HOST` as above. The test itself does not pin a
+container engine, so GitHub Actions can use its default Docker service without
+special configuration. testcontainers-go automatically removes the test
+container afterward.
 
 ## License
 
