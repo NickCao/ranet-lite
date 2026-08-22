@@ -67,6 +67,7 @@ in
           enable = true;
           strongswan.extraConfig = ''
             charon-systemd {
+              interfaces_use = eth1
               port = 0
               port_nat_t = 13000
             }
@@ -77,15 +78,14 @@ in
               local_addrs = [ "0.0.0.0/0" ];
               remote_addrs = [ "0.0.0.0/0" ];
               local_port = 13000;
-              if_id_in = "1";
-              if_id_out = "1";
-              proposals = [
-                "aes256gcm16-prfsha384-curve25519"
-                "aes128gcm16-prfsha256-curve25519"
-                "chacha20poly1305-prfsha256-curve25519"
-              ];
+              remote_port = 14000;
               encap = true;
               mobike = false;
+              dpd_delay = "10s";
+              keyingtries = 0;
+              unique = "replace";
+              if_id_in = "1";
+              if_id_out = "1";
               local.main = {
                 auth = "pubkey";
                 pubkeys = [ "org-pub.pem" ];
@@ -96,8 +96,7 @@ in
                 pubkeys = [ "org-pub.pem" ];
                 id = "O=testorg, CN=client, serialNumber=2";
               };
-              children.mesh = {
-                mode = "tunnel";
+              children.default = {
                 local_ts = [
                   "0.0.0.0/0"
                   "::/0"
@@ -106,16 +105,15 @@ in
                   "0.0.0.0/0"
                   "::/0"
                 ];
-                esp_proposals = [
-                  "aes256gcm16-noesn"
-                  "aes128gcm16-noesn"
-                  "chacha20poly1305-noesn"
-                ];
+                mode = "tunnel";
+                dpd_action = "restart";
                 start_action = "none";
+                close_action = "none";
               };
             };
           };
         };
+
         systemd.services.strongswan-swanctl = {
           requires = [ "network-online.target" ];
           after = [ "network-online.target" ];
