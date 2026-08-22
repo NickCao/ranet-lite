@@ -77,9 +77,14 @@ func TestInitialResponseHeaderValidation(t *testing.T) {
 	if !validResponseHeader(req, valid, HeaderLen) {
 		t.Fatal("valid initial response rejected")
 	}
+	initialError := *valid
+	initialError.SPIResponder = 0
+	if !validResponseHeader(req, &initialError, HeaderLen) {
+		t.Fatal("valid initial error response rejected")
+	}
 	mutations := []func(*Header){
 		func(h *Header) { h.MajorVersion = 3 }, func(h *Header) { h.ExchangeType = IKE_AUTH },
-		func(h *Header) { h.Flags |= FlagInitiator }, func(h *Header) { h.SPIResponder = 0 },
+		func(h *Header) { h.Flags |= FlagInitiator },
 		func(h *Header) { h.SPIInitiator++ }, func(h *Header) { h.MessageID++ },
 		func(h *Header) { h.Length++ },
 	}

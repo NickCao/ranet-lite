@@ -298,8 +298,8 @@ func randUint32Nonzero() uint32 {
 }
 
 // ikeProposal is the single modern-crypto-only IKE SA proposal we offer:
-// AES-256-GCM or ChaCha20-Poly1305, PRF-HMAC-SHA-384/256, Curve25519 with
-// P-384/P-256 fallback. No legacy transforms, no separate integrity
+// AES-256/128-GCM or ChaCha20-Poly1305, PRF-HMAC-SHA-384/256, and
+// Curve25519/P-384/P-256. No legacy transforms, no separate integrity
 // transform (all offered ciphers are AEAD).
 func ikeProposal() Proposal {
 	return Proposal{
@@ -757,7 +757,11 @@ func validResponseHeader(request, response *Header, rawLen int) bool {
 		return false
 	}
 	if request.SPIResponder == 0 {
-		return request.ExchangeType == IKE_SA_INIT && response.SPIResponder != 0
+		// IKE_SA_INIT error responses such as COOKIE and
+		// INVALID_KE_PAYLOAD carry a zero responder SPI (RFC 7296
+		// §2.6.1). The exchange-specific accept callback validates the
+		// payload before treating such an unauthenticated response as useful.
+		return request.ExchangeType == IKE_SA_INIT
 	}
 	return response.SPIResponder == request.SPIResponder
 }

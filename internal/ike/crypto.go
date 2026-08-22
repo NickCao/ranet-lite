@@ -17,8 +17,7 @@ import (
 // --- Diffie-Hellman ---
 
 // DHKeyPair wraps a crypto/ecdh key pair for one of the modern groups we
-// support: Curve25519 (31, preferred) or NIST P-256/P-384 (19/20) as a
-// fallback if a responder's default proposal doesn't include group 31.
+// offer: Curve25519 (31) or NIST P-256/P-384 (19/20).
 type DHKeyPair struct {
 	Group uint16
 	curve ecdh.Curve
