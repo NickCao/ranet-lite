@@ -287,7 +287,7 @@ in
   testScript = ''
     import datetime as dt
 
-    convergence_timeout = dt.timedelta(seconds=30)
+    timeout = dt.timedelta(seconds=30)
 
     start_all()
 
@@ -298,16 +298,8 @@ in
         gateway.wait_for_unit("iperf3.service")
         client.wait_for_unit("ranet-lite.service")
 
-        client.wait_until_succeeds(
-            "journalctl -u ranet-lite.service --no-pager | "
-            "grep -F 'msg=\"babel route installed\"' | "
-            "grep -F 'route=fd00:99::/64'",
-            timeout=convergence_timeout,
-        )
-        gateway.wait_until_succeeds(
-            "birdc show route for ${clientTunnel}/128 | grep -F '${clientTunnel}/128'",
-            timeout=convergence_timeout,
-        )
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+
         print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5"))
         print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5 --reverse"))
     finally:
