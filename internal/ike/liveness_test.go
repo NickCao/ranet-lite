@@ -2,8 +2,11 @@ package ike
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/NickCao/ranet-lite/internal/transport"
 )
 
 func TestSessionRunStopsOnContextCancellation(t *testing.T) {
@@ -68,6 +71,51 @@ func TestRequestRetransmitDelayIsExponential(t *testing.T) {
 		if got := retransmitDelay(i + 1); got != delay {
 			t.Fatalf("attempt %d delay = %v, want %v", i+1, got, delay)
 		}
+	}
+}
+
+func TestOnlyDPDExhaustsPostHandshakeRetransmits(t *testing.T) {
+	ordinary := &pendingRequest{attempts: maxRetransmits}
+	if pendingRetransmitsExhausted(ordinary) {
+		t.Fatal("ordinary request exhausted retransmissions")
+	}
+	dpd := &pendingRequest{attempts: maxRetransmits, localRequest: localRequest{dpd: true}}
+	if !pendingRetransmitsExhausted(dpd) {
+		t.Fatal("DPD request did not exhaust retransmissions")
+	}
+}
+
+func TestStartRequestConsumesMessageIDOnlyAfterSuccessfulSend(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	ctx := &ikeContext{
+		suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128},
+		skei:  make([]byte, 20), spiI: 1, spiR: 2, nextLocalMID: 7,
+	}
+	s := &Session{mux: mux, current: ctx}
+	if _, err := s.startRequest(&localRequest{exchange: INFORMATIONAL}); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.nextLocalMID != 8 {
+		t.Fatalf("Message ID after successful send = %d, want 8", ctx.nextLocalMID)
+	}
+
+	failedMux, err := transport.Dial(":0", net.IPv4(127, 0, 0, 1), 4500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failedMux.Close(); err != nil {
+		t.Fatal(err)
+	}
+	failedCtx := &ikeContext{
+		suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128},
+		skei:  make([]byte, 20), spiI: 3, spiR: 4, nextLocalMID: 11,
+	}
+	failed := &Session{mux: failedMux, current: failedCtx}
+	if _, err := failed.startRequest(&localRequest{exchange: INFORMATIONAL}); err == nil {
+		t.Fatal("startRequest succeeded with a closed transport")
+	}
+	if failedCtx.nextLocalMID != 11 {
+		t.Fatalf("Message ID after failed send = %d, want 11", failedCtx.nextLocalMID)
 	}
 }
 

@@ -250,20 +250,20 @@ func (s *Session) Run(ctx context.Context) error {
 				return err
 			}
 			if pending != nil && !time.Now().Before(pending.deadline) {
-				if pending.attempts == maxRetransmits {
-					if pending.dpd {
-						s.mux.Close()
-						return fmt.Errorf("ike: DPD failed: no response after %d attempts", maxRetransmits)
-					}
-					pending.result <- requestResult{err: fmt.Errorf("no response after %d attempts", maxRetransmits)}
-					pending = nil
-				} else if err := s.sendPending(pending); err != nil {
+				if pendingRetransmitsExhausted(pending) {
+					s.mux.Close()
+					return fmt.Errorf("ike: DPD failed: no response after %d attempts", maxRetransmits)
+				}
+				// RFC 7296 §2.1 requires retaining and retransmitting the
+				// bitwise-identical request until a response arrives or the IKE SA
+				// is declared failed. Ordinary exchanges keep retrying at the
+				// capped interval; only DPD applies the finite failure policy.
+				if err := s.sendPending(pending); err != nil {
 					if pending.dpd {
 						s.mux.Close()
 						return fmt.Errorf("ike: DPD failed: %w", err)
 					}
-					pending.result <- requestResult{err: err}
-					pending = nil
+					slog.Warn("ike request retransmission failed; retrying", "exchange", pending.exchange, "message_id", pending.msgID, "err", err)
 				}
 				continue
 			}
@@ -308,7 +308,6 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 		context = s.currentContext()
 	}
 	msgID := context.nextLocalMID
-	context.nextLocalMID++
 	flags := uint8(0)
 	if !context.responder {
 		flags = FlagInitiator
@@ -322,16 +321,25 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 	if err := s.sendPending(pending); err != nil {
 		return nil, err
 	}
+	// A failed first send did not put a request on the wire, so it must not
+	// consume a Message ID. Once sent, this exact request owns the ID until its
+	// response arrives (RFC 7296 §2.1-§2.2).
+	context.nextLocalMID++
 	return pending, nil
 }
 
 func (s *Session) sendPending(pending *pendingRequest) error {
+	nextAttempt := min(pending.attempts+1, maxRetransmits)
+	pending.deadline = time.Now().Add(retransmitDelay(nextAttempt))
 	if err := s.mux.SendIKE(pending.raw); err != nil {
 		return err
 	}
-	pending.attempts++
-	pending.deadline = time.Now().Add(retransmitDelay(pending.attempts))
+	pending.attempts = nextAttempt
 	return nil
+}
+
+func pendingRetransmitsExhausted(pending *pendingRequest) bool {
+	return pending.dpd && pending.attempts >= maxRetransmits
 }
 
 func retransmitDelay(attempt int) time.Duration {
