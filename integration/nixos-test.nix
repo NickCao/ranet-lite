@@ -123,30 +123,30 @@ in
 
         services.bird = {
           enable = true;
-          package = pkgs.bird2;
+          package = pkgs.bird3;
           config = ''
-            log stderr all;
-            router id 192.0.2.1;
+            ipv6 sadr table sadr6;
 
             protocol device {
+              scan time 1;
             }
 
-            protocol kernel kernel6 {
-              ipv6 {
-                import none;
+            protocol kernel {
+              ipv6 sadr {
                 export all;
+                import none;
               };
             }
 
-            protocol static test_routes {
-              ipv6;
-              route fd00:99::/64 blackhole;
+            protocol static {
+              ipv6 sadr ;
+              route fd00:99::/64 from ::/0 unreachable;
             }
 
-            protocol babel ranet {
-              ipv6 {
+            protocol babel {
+              ipv6 sadr {
+                export all;
                 import all;
-                export where source = RTS_STATIC;
               };
               randomize router id;
               interface "swan0" {
@@ -161,20 +161,15 @@ in
             }
           '';
         };
+
         systemd.services.bird = {
           requires = [ "network-online.target" ];
           after = [ "network-online.target" ];
         };
 
-        systemd.services.iperf3 = {
-          description = "iperf3 server for the ranet integration test";
-          wantedBy = [ "multi-user.target" ];
-          requires = [ "network-online.target" ];
-          after = [ "network-online.target" ];
-          serviceConfig = {
-            ExecStart = "${pkgs.iperf3}/bin/iperf3 --server --bind ${gatewayTunnel}";
-            Restart = "on-failure";
-          };
+        services.iperf3 = {
+          enable = true;
+          bind = gatewayTunnel;
         };
       };
 
