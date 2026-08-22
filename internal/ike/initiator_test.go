@@ -2,7 +2,10 @@ package ike
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sort"
 	"sync"
@@ -903,6 +906,145 @@ func encodeTestMessage(t *testing.T, hdr Header, payloads []RawPayload) []byte {
 // mock peer below would be classified as ESP and never reach RecvIKEUntil.
 func withNonESPMarker(b []byte) []byte {
 	return append([]byte{0, 0, 0, 0}, b...)
+}
+
+func TestIKEAuthAuthenticatesBeforeChildFailure(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	_, localPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remotePublic, remotePrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := PeerConfig{
+		Organization:     "ranet-test",
+		LocalCommonName:  "initiator",
+		LocalSerial:      "1",
+		LocalPrivateKey:  localPrivate,
+		RemoteCommonName: "responder",
+		RemoteSerial:     "2",
+		RemotePublicKey:  remotePublic,
+	}
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	s := &Session{
+		mux: mux,
+		current: &ikeContext{
+			suite: suite, spiI: spiI, spiR: spiR, nextLocalMID: 2,
+			skei: make([]byte, 20), sker: make([]byte, 20),
+			skD: make([]byte, 32), skpi: make([]byte, 32), skpr: make([]byte, 32),
+		},
+		requests: make(chan *localRequest, 1),
+	}
+	realMessage1 := []byte("test IKE_SA_INIT request")
+	realMessage2 := []byte("test IKE_SA_INIT response")
+	ni := make([]byte, 32)
+	nr := make([]byte, 32)
+
+	peerDone := make(chan error, 1)
+	go func() {
+		peerDone <- func() error {
+			buf := make([]byte, 4096)
+			peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+			n, clientAddr, err := peer.ReadFromUDP(buf)
+			if err != nil {
+				return fmt.Errorf("read IKE_AUTH request: %w", err)
+			}
+			if n <= 4 {
+				return fmt.Errorf("short marked IKE_AUTH request: %d bytes", n)
+			}
+			raw := append([]byte(nil), buf[4:n]...)
+			request, err := DecodeMessage(raw)
+			if err != nil {
+				return fmt.Errorf("decode IKE_AUTH request: %w", err)
+			}
+			if request.Header.ExchangeType != IKE_AUTH || request.Header.MessageID != 1 {
+				return fmt.Errorf("unexpected IKE_AUTH header: exchange=%d message-id=%d", request.Header.ExchangeType, request.Header.MessageID)
+			}
+			if _, err := DecryptMessage(suite, s.current.skei, raw, request); err != nil {
+				return fmt.Errorf("decrypt IKE_AUTH request: %w", err)
+			}
+
+			idr := EncodeID(ID_DER_ASN1_DN, EncodeIdentityDN(cfg.Organization, cfg.RemoteCommonName, cfg.RemoteSerial))
+			macedID := prf(suite.PRFID, s.current.skpr, idr)
+			auth := BuildAuth(remotePrivate, concat(realMessage2, ni, macedID))
+			response, err := EncryptMessage(suite, s.current.sker, Header{
+				SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: IKE_AUTH,
+				Flags: FlagResponse, MessageID: 1,
+			}, nil, []RawPayload{
+				{Type: PayloadIDr, Body: idr},
+				{Type: PayloadAUTH, Body: auth},
+				{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_NO_PROPOSAL_CHOSEN})},
+			})
+			if err != nil {
+				return fmt.Errorf("encrypt IKE_AUTH response: %w", err)
+			}
+			if _, err := peer.WriteToUDP(withNonESPMarker(response), clientAddr); err != nil {
+				return fmt.Errorf("write IKE_AUTH response: %w", err)
+			}
+
+			n, _, err = peer.ReadFromUDP(buf)
+			if err != nil {
+				return fmt.Errorf("read IKE Delete request: %w", err)
+			}
+			if n <= 4 {
+				return fmt.Errorf("short marked IKE Delete request: %d bytes", n)
+			}
+			raw = append([]byte(nil), buf[4:n]...)
+			deleteMessage, err := DecodeMessage(raw)
+			if err != nil {
+				return fmt.Errorf("decode IKE Delete request: %w", err)
+			}
+			if deleteMessage.Header.ExchangeType != INFORMATIONAL || deleteMessage.Header.MessageID != 2 {
+				return fmt.Errorf("unexpected IKE Delete header: exchange=%d message-id=%d", deleteMessage.Header.ExchangeType, deleteMessage.Header.MessageID)
+			}
+			deleteInner, err := DecryptMessage(suite, s.current.skei, raw, deleteMessage)
+			if err != nil {
+				return fmt.Errorf("decrypt IKE Delete request: %w", err)
+			}
+			if len(deleteInner) != 1 || deleteInner[0].Type != PayloadD {
+				return fmt.Errorf("IKE Delete inner payloads = %v, want one Delete", deleteInner)
+			}
+			deletePayload, err := DecodeDelete(deleteInner[0].Body)
+			if err != nil {
+				return fmt.Errorf("decode IKE Delete payload: %w", err)
+			}
+			if deletePayload.Protocol != ProtoIKE || len(deletePayload.SPIs) != 0 {
+				return fmt.Errorf("IKE Delete = %+v, want protocol IKE and no SPIs", deletePayload)
+			}
+
+			deleteResponse, err := EncryptMessage(suite, s.current.sker, Header{
+				SPIInitiator: spiI, SPIResponder: spiR, ExchangeType: INFORMATIONAL,
+				Flags: FlagResponse, MessageID: 2,
+			}, nil, nil)
+			if err != nil {
+				return fmt.Errorf("encrypt IKE Delete response: %w", err)
+			}
+			if _, err := peer.WriteToUDP(withNonESPMarker(deleteResponse), clientAddr); err != nil {
+				return fmt.Errorf("write IKE Delete response: %w", err)
+			}
+			return nil
+		}()
+	}()
+
+	err = s.completeIKEAuth(cfg, realMessage1, realMessage2, ni, nr)
+	if err == nil || err.Error() != "ike: Child SA rejected: notify type 14" {
+		t.Fatalf("completeIKEAuth error = %v, want authenticated Child SA rejection", err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestSendRecvIgnoresUnauthenticatedErrorNotify verifies the RFC 7815 §2.1
