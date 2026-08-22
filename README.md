@@ -188,7 +188,8 @@ For local Podman, start the user socket first (`systemctl --user start
 podman.socket`) and set `DOCKER_HOST` as above. The test itself does not pin a
 container engine, so GitHub Actions can use its default Docker service without
 special configuration. testcontainers-go automatically removes the test
-container afterward.
+container afterward. strongSwan's container log is streamed into verbose test
+output on every run.
 
 ## License
 

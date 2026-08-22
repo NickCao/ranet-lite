@@ -105,15 +105,7 @@ func TestStrongSwanHandshake(t *testing.T) {
 		RemotePort:       int(port.Num()),
 	})
 	if err != nil {
-		// Give charon's worker thread time to emit the authentication reason
-		// before collecting logs and terminating the container.
-		time.Sleep(200 * time.Millisecond)
-		logs, logsErr := container.Logs(ctx)
-		if logsErr == nil {
-			defer logs.Close()
-			output, _ := io.ReadAll(logs)
-			t.Logf("strongSwan logs:\n%s", output)
-		}
+		logStrongSwan(t, ctx, container)
 		t.Fatalf("IKEv2 handshake: %v", err)
 	}
 	defer session.Mux().Close()
@@ -121,6 +113,25 @@ func TestStrongSwanHandshake(t *testing.T) {
 	if session.Child.LocalSPI == 0 || session.Child.RemoteSPI == 0 {
 		t.Fatalf("strongSwan returned an invalid Child SA: %+v", session.Child)
 	}
+	logStrongSwan(t, ctx, container)
+}
+
+func logStrongSwan(t *testing.T, ctx context.Context, container *testcontainers.DockerContainer) {
+	t.Helper()
+	// Give charon's worker thread time to emit the final authentication result.
+	time.Sleep(200 * time.Millisecond)
+	logs, err := container.Logs(ctx)
+	if err != nil {
+		t.Logf("read strongSwan logs: %v", err)
+		return
+	}
+	defer logs.Close()
+	output, err := io.ReadAll(logs)
+	if err != nil {
+		t.Logf("read strongSwan logs: %v", err)
+		return
+	}
+	t.Logf("strongSwan logs:\n%s", output)
 }
 
 func writeStrongSwanCredentials(t *testing.T, publicKey ed25519.PublicKey, privateKey ed25519.PrivateKey) string {
