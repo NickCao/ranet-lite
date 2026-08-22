@@ -46,11 +46,11 @@ func (s *Session) rekeyChild(alreadyRunningIsSuccess bool) error {
 	}
 	oldLocalSPI := make([]byte, 4)
 	binary.BigEndian.PutUint32(oldLocalSPI, old.LocalSPI)
-	oldRemoteSPI := make([]byte, 4)
-	binary.BigEndian.PutUint32(oldRemoteSPI, old.RemoteSPI)
 	tsv4, tsv6 := FullRangeV4(), FullRangeV6()
 	inner := []RawPayload{
-		{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: ProtoESP, SPI: oldRemoteSPI, Type: N_REKEY_SA})},
+		// REKEY_SA identifies the old SA by the SPI this exchange's
+		// initiator expects in inbound ESP packets (RFC 7296 §1.3.3).
+		{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: ProtoESP, SPI: oldLocalSPI, Type: N_REKEY_SA})},
 		{Type: PayloadSA, Body: EncodeSA([]Proposal{espProposal(spi)})},
 		{Type: PayloadNonce, Body: EncodeNonce(nonce)},
 		{Type: PayloadTSi, Body: EncodeTS([]TrafficSelector{tsv4, tsv6})},

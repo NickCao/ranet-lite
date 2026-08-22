@@ -203,7 +203,7 @@ func TestSessionScheduledRekeyChild(t *testing.T) {
 			return
 		}
 		notify, err := DecodeNotify(notifyPayload.Body)
-		if err != nil || notify.Type != N_REKEY_SA || notify.Protocol != ProtoESP || len(notify.SPI) != 4 || binary.BigEndian.Uint32(notify.SPI) != oldRemoteSPI {
+		if err != nil || notify.Type != N_REKEY_SA || notify.Protocol != ProtoESP || len(notify.SPI) != 4 || binary.BigEndian.Uint32(notify.SPI) != oldLocalSPI {
 			t.Errorf("bad REKEY_SA notify: %#v, %v", notify, err)
 			return
 		}
