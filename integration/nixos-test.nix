@@ -1,9 +1,6 @@
 { pkgs, ranetLite }:
 
 let
-  # The NixOS test driver assigns VLAN addresses by alphabetical node order.
-  clientUnderlay = "192.168.1.1";
-  gatewayUnderlay = "192.168.1.2";
   gatewayTunnel = "fd00:99::1";
   clientTunnel = "fd00:88::2";
   publicKey = builtins.readFile ./org-pub.pem;
@@ -181,108 +178,110 @@ in
         };
       };
 
-    client = {
-      imports = [ common ];
+    client =
+      { nodes, ... }:
+      {
+        imports = [ common ];
 
-      boot.kernelModules = [ "tun" ];
-      environment.systemPackages = with pkgs; [
-        iperf3
-        iproute2
-      ];
-
-      systemd.network = {
-        netdevs."20-ranet0" = {
-          netdevConfig = {
-            Name = "ranet0";
-            Kind = "tun";
-          };
-          tunConfig = {
-            PacketInfo = false;
-            VNetHeader = true;
-          };
-        };
-        networks."40-ranet0" = {
-          matchConfig.Name = "ranet0";
-          linkConfig = {
-            MTUBytes = 1400;
-            RequiredForOnline = false;
-          };
-          networkConfig.ConfigureWithoutCarrier = true;
-          addresses = [ { Address = "${clientTunnel}/128"; } ];
-          routes = [ { Destination = "fd00:99::/64"; } ];
-        };
-      };
-
-      environment.etc = {
-        "ranet-lite/key.pem".source = ./org-key.pem;
-        "ranet-lite/registry.json".text = builtins.toJSON [
-          {
-            public_key = publicKey;
-            organization = "testorg";
-            nodes = [
-              {
-                common_name = "client";
-                endpoints = [
-                  {
-                    serial_number = "2";
-                    address_family = "ip4";
-                    address = clientUnderlay;
-                    port = 14000;
-                  }
-                ];
-                remarks = { };
-              }
-              {
-                common_name = "server";
-                endpoints = [
-                  {
-                    serial_number = "1";
-                    address_family = "ip4";
-                    address = gatewayUnderlay;
-                    port = 13000;
-                  }
-                ];
-                remarks = { };
-              }
-            ];
-          }
+        boot.kernelModules = [ "tun" ];
+        environment.systemPackages = with pkgs; [
+          iperf3
+          iproute2
         ];
-        "ranet-lite/config.yaml".text = ''
-          organization: testorg
-          common_name: client
-          port: 14000
-          endpoints:
-            - serial_number: "2"
-              address_family: ip4
-          private_key: /etc/ranet-lite/key.pem
-          registry: /etc/ranet-lite/registry.json
-          originate:
-            - "${clientTunnel}/128"
-          tun: ranet0
-          child_rekey_interval: 0
-          ike_rekey_interval: 0
-          peers:
-            - common_name: server
-              serial_number: "1"
-          babel:
-            hello_interval: 500ms
-            update_interval: 1s
-        '';
-      };
 
-      systemd.services.ranet-lite = {
-        description = "Ranet-lite integration-test client";
-        wantedBy = [ "multi-user.target" ];
-        wants = [ "network-online.target" ];
-        after = [ "network-online.target" ];
-        serviceConfig = {
-          ExecStart = "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug";
-          Restart = "on-failure";
-          AmbientCapabilities = [ "CAP_NET_ADMIN" ];
-          CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+        systemd.network = {
+          netdevs."20-ranet0" = {
+            netdevConfig = {
+              Name = "ranet0";
+              Kind = "tun";
+            };
+            tunConfig = {
+              PacketInfo = false;
+              VNetHeader = true;
+            };
+          };
+          networks."40-ranet0" = {
+            matchConfig.Name = "ranet0";
+            linkConfig = {
+              MTUBytes = 1400;
+              RequiredForOnline = false;
+            };
+            networkConfig.ConfigureWithoutCarrier = true;
+            addresses = [ { Address = "${clientTunnel}/128"; } ];
+            routes = [ { Destination = "fd00:99::/64"; } ];
+          };
+        };
+
+        environment.etc = {
+          "ranet-lite/key.pem".source = ./org-key.pem;
+          "ranet-lite/registry.json".text = builtins.toJSON [
+            {
+              public_key = publicKey;
+              organization = "testorg";
+              nodes = [
+                {
+                  common_name = "client";
+                  endpoints = [
+                    {
+                      serial_number = "2";
+                      address_family = "ip4";
+                      address = nodes.client.networking.primaryIPAddress;
+                      port = 14000;
+                    }
+                  ];
+                  remarks = { };
+                }
+                {
+                  common_name = "server";
+                  endpoints = [
+                    {
+                      serial_number = "1";
+                      address_family = "ip4";
+                      address = nodes.gateway.networking.primaryIPAddress;
+                      port = 13000;
+                    }
+                  ];
+                  remarks = { };
+                }
+              ];
+            }
+          ];
+          "ranet-lite/config.yaml".text = ''
+            organization: testorg
+            common_name: client
+            port: 14000
+            endpoints:
+              - serial_number: "2"
+                address_family: ip4
+            private_key: /etc/ranet-lite/key.pem
+            registry: /etc/ranet-lite/registry.json
+            originate:
+              - "${clientTunnel}/128"
+            tun: ranet0
+            child_rekey_interval: 0
+            ike_rekey_interval: 0
+            peers:
+              - common_name: server
+                serial_number: "1"
+            babel:
+              hello_interval: 500ms
+              update_interval: 1s
+          '';
+        };
+
+        systemd.services.ranet-lite = {
+          description = "Ranet-lite integration-test client";
+          wantedBy = [ "multi-user.target" ];
+          wants = [ "network-online.target" ];
+          after = [ "network-online.target" ];
+          serviceConfig = {
+            ExecStart = "${ranetLite}/bin/ranet-lite -config /etc/ranet-lite/config.yaml -log-level debug";
+            Restart = "on-failure";
+            AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+            CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+          };
         };
       };
-    };
   };
 
   testScript = ''
