@@ -292,6 +292,8 @@ in
         client.wait_for_unit("ranet-lite.service")
 
         client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
+        print(gateway.succeed("swanctl --rekey --ike ranet"))
+        client.wait_until_succeeds("ping -c 1 ${gatewayTunnel}", timeout=timeout)
 
         print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5"))
         print(client.succeed("iperf3 --client ${gatewayTunnel} --time 5 --reverse"))

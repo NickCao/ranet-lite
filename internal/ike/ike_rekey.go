@@ -20,10 +20,6 @@ func (s *Session) RekeyIKE() error {
 		spiI = randUint64Nonzero()
 	}
 	group := uint16(DH_CURVE25519)
-	dh, err := GenerateDH(group)
-	if err != nil {
-		return fmt.Errorf("ike: generate IKE SA rekey DH key: %w", err)
-	}
 	ni := make([]byte, 32)
 	if err := s.fillIKERekeyNonce(ni); err != nil {
 		return fmt.Errorf("ike: generate IKE SA rekey nonce: %w", err)
@@ -40,13 +36,53 @@ func (s *Session) RekeyIKE() error {
 	}()
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiI)
-	response, err := s.requestLocked(CREATE_CHILD_SA, []RawPayload{
-		{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms}})},
-		{Type: PayloadNonce, Body: EncodeNonce(ni)},
-		{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
-	})
-	if err != nil {
-		return fmt.Errorf("ike: IKE SA rekey request: %w", err)
+	var (
+		dh       *DHKeyPair
+		response []RawPayload
+		err      error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		dh, err = GenerateDH(group)
+		if err != nil {
+			return fmt.Errorf("ike: generate IKE SA rekey DH key: %w", err)
+		}
+		response, err = s.requestLocked(CREATE_CHILD_SA, []RawPayload{
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms}})},
+			{Type: PayloadNonce, Body: EncodeNonce(ni)},
+			{Type: PayloadKE, Body: EncodeKE(group, dh.PublicBytes())},
+		})
+		if err != nil {
+			return fmt.Errorf("ike: IKE SA rekey request: %w", err)
+		}
+
+		var retryGroup uint16
+		for i := range response {
+			if response[i].Type != PayloadN {
+				continue
+			}
+			notify, err := DecodeNotify(response[i].Body)
+			if err != nil {
+				return fmt.Errorf("ike: invalid IKE SA rekey notify: %w", err)
+			}
+			if notify.Type != N_INVALID_KE_PAYLOAD {
+				continue
+			}
+			if len(notify.Data) != 2 {
+				return fmt.Errorf("ike: invalid IKE SA rekey INVALID_KE_PAYLOAD data")
+			}
+			retryGroup = binary.BigEndian.Uint16(notify.Data)
+			break
+		}
+		if retryGroup == 0 {
+			break
+		}
+		if attempt != 0 || !supportedIKEGroup(retryGroup) {
+			return fmt.Errorf("ike: IKE SA rekey rejected: requested unsupported DH group %d", retryGroup)
+		}
+		// RFC 7296 §1.3 permits the responder to select another offered DH
+		// group with INVALID_KE_PAYLOAD. Retry as a new CREATE_CHILD_SA
+		// exchange, using the requested group in both SA and KE processing.
+		group = retryGroup
 	}
 
 	var sa, nonce, ke *RawPayload
@@ -202,21 +238,46 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	props, err := DecodeSA(sa.Body)
-	if err != nil || len(props) != 1 || props[0].Number != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	spiI := binary.BigEndian.Uint64(props[0].SPI)
-	if spiI == 0 {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	selected, suite, ok := selectIKERekeyProposal(props[0])
-	if !ok {
+	if err != nil || len(props) == 0 {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	group, peerPublic, err := DecodeKE(ke.Body)
-	if err != nil || group != suite.DHGroup || len(peerPublic) == 0 {
+	if err != nil || len(peerPublic) == 0 {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
+	var (
+		selected         []Transform
+		suite            SASuite
+		selectedProposal Proposal
+		preferredGroup   uint16
+	)
+	for _, proposal := range props {
+		if proposal.Number == 0 || proposal.Protocol != ProtoIKE || len(proposal.SPI) != 8 || binary.BigEndian.Uint64(proposal.SPI) == 0 {
+			continue
+		}
+		candidate, candidateSuite, candidatePreferred, ok := selectIKERekeyProposal(proposal, group)
+		if ok {
+			selected = candidate
+			suite = candidateSuite
+			selectedProposal = proposal
+			break
+		}
+		if candidatePreferred != 0 && (preferredGroup == 0 || ikeGroupPreference(candidatePreferred) < ikeGroupPreference(preferredGroup)) {
+			preferredGroup = candidatePreferred
+		}
+	}
+	if selected == nil {
+		if preferredGroup == 0 {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+		data := make([]byte, 2)
+		binary.BigEndian.PutUint16(data, preferredGroup)
+		// RFC 7296 §1.3 requires INVALID_KE_PAYLOAD, carrying the
+		// preferred group, when a proposal is acceptable but its KE payload
+		// uses a different group.
+		return s.responseNotifyData(ctx, msgID, CREATE_CHILD_SA, N_INVALID_KE_PAYLOAD, data)
+	}
+	spiI := binary.BigEndian.Uint64(selectedProposal.SPI)
 	dh, err := GenerateDH(group)
 	if err != nil {
 		return nil, fmt.Errorf("ike: generate peer IKE rekey DH key: %w", err)
@@ -251,7 +312,7 @@ func (s *Session) handleIKERekey(ctx *ikeContext, msgID uint32, inner []RawPaylo
 	s.stateMu.Unlock()
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, spiR)
-	response := Proposal{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: selected}
+	response := Proposal{Number: selectedProposal.Number, Protocol: ProtoIKE, SPI: spi, Transforms: selected}
 	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{
 		{Type: PayloadSA, Body: EncodeSA([]Proposal{response})},
 		{Type: PayloadNonce, Body: EncodeNonce(nr)},
@@ -289,10 +350,33 @@ func lowestNonceBelongsToFirst(firstI, firstR, secondI, secondR []byte) bool {
 	return first
 }
 
-func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {
+func supportedIKEGroup(group uint16) bool {
+	for _, transform := range ikeProposal().Transforms {
+		if transform.Type == TransDH && transform.ID == group {
+			return true
+		}
+	}
+	return false
+}
+
+func ikeGroupPreference(group uint16) int {
+	preference := 0
+	for _, transform := range ikeProposal().Transforms {
+		if transform.Type != TransDH {
+			continue
+		}
+		if transform.ID == group {
+			return preference
+		}
+		preference++
+	}
+	return preference
+}
+
+func selectIKERekeyProposal(proposal Proposal, keGroup uint16) ([]Transform, SASuite, uint16, bool) {
 	offered := ikeProposal().Transforms
 	selected := make([]Transform, 0, 3)
-	for _, typ := range []TransformType{TransEncr, TransPRF, TransDH} {
+	for _, typ := range []TransformType{TransEncr, TransPRF} {
 		found := false
 		for _, want := range offered {
 			if want.Type != typ {
@@ -310,12 +394,37 @@ func selectIKERekeyProposal(proposal Proposal) ([]Transform, SASuite, bool) {
 			}
 		}
 		if !found {
-			return nil, SASuite{}, false
+			return nil, SASuite{}, 0, false
 		}
 	}
+	var preferredDH, matchingDH Transform
+	for _, want := range offered {
+		if want.Type != TransDH {
+			continue
+		}
+		for _, got := range proposal.Transforms {
+			if got != want {
+				continue
+			}
+			if preferredDH.Type == 0 {
+				preferredDH = got
+			}
+			if got.ID == keGroup {
+				matchingDH = got
+			}
+			break
+		}
+	}
+	if preferredDH.Type == 0 {
+		return nil, SASuite{}, 0, false
+	}
+	if matchingDH.Type == 0 {
+		return nil, SASuite{}, preferredDH.ID, false
+	}
+	selected = append(selected, matchingDH)
 	suite, err := suiteFromProposal(Proposal{Number: 1, Protocol: ProtoIKE, Transforms: selected})
 	if err != nil {
-		return nil, SASuite{}, false
+		return nil, SASuite{}, 0, false
 	}
-	return selected, suite, true
+	return selected, suite, preferredDH.ID, true
 }

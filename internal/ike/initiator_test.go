@@ -386,6 +386,51 @@ func TestSessionRekeyIKE(t *testing.T) {
 			t.Errorf("bad IKE rekey KE or nonce: %d, %v", group, err)
 			return
 		}
+		invalidKEData := make([]byte, 2)
+		binary.BigEndian.PutUint16(invalidKEData, DH_ECP_256)
+		response, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
+			{Type: PayloadN, Body: EncodeNotify(Notify{Type: N_INVALID_KE_PAYLOAD, Data: invalidKEData})},
+		})
+		if err != nil {
+			t.Errorf("encrypt INVALID_KE_PAYLOAD response: %v", err)
+			return
+		}
+		if _, err := peer.WriteToUDP(withNonESPMarker(response), addr); err != nil {
+			t.Errorf("write INVALID_KE_PAYLOAD response: %v", err)
+			return
+		}
+
+		n, addr, err = peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Errorf("read retried rekey request: %v", err)
+			return
+		}
+		raw = append([]byte(nil), buf[4:n]...)
+		m, err = DecodeMessage(raw)
+		if err != nil {
+			t.Errorf("decode retried rekey request: %v", err)
+			return
+		}
+		inner, err = DecryptMessage(suite, old.skei, raw, m)
+		if err != nil {
+			t.Errorf("decrypt retried rekey request: %v", err)
+			return
+		}
+		sa, nonce, ke = findType(inner, PayloadSA), findType(inner, PayloadNonce), findType(inner, PayloadKE)
+		if m.Header.ExchangeType != CREATE_CHILD_SA || m.Header.MessageID != 3 || sa == nil || nonce == nil || ke == nil {
+			t.Errorf("incomplete retried IKE rekey request")
+			return
+		}
+		props, err = DecodeSA(sa.Body)
+		if err != nil || len(props) != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 {
+			t.Errorf("bad retried IKE rekey proposal: %#v, %v", props, err)
+			return
+		}
+		group, _, err = DecodeKE(ke.Body)
+		if err != nil || group != DH_ECP_256 || len(nonce.Body) == 0 || binary.BigEndian.Uint64(props[0].SPI) == 0 {
+			t.Errorf("bad retried IKE rekey KE or nonce: %d, %v", group, err)
+			return
+		}
 		responderDH, err := GenerateDH(group)
 		if err != nil {
 			t.Errorf("generate responder DH: %v", err)
@@ -394,8 +439,8 @@ func TestSessionRekeyIKE(t *testing.T) {
 		nr := []byte("responder nonce for IKE rekey")
 		spiR := make([]byte, 8)
 		binary.BigEndian.PutUint64(spiR, newSPIr)
-		response, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
-			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spiR, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransPRF, ID: PRF_HMAC_SHA2_256}, {Type: TransDH, ID: DH_CURVE25519}}}})},
+		response, err = EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, Flags: FlagResponse, MessageID: m.Header.MessageID}, nil, []RawPayload{
+			{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spiR, Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransPRF, ID: PRF_HMAC_SHA2_256}, {Type: TransDH, ID: group}}}})},
 			{Type: PayloadNonce, Body: EncodeNonce(nr)},
 			{Type: PayloadKE, Body: EncodeKE(group, responderDH.PublicBytes())},
 		})
@@ -425,7 +470,7 @@ func TestSessionRekeyIKE(t *testing.T) {
 			return
 		}
 		d := findType(inner, PayloadD)
-		if m.Header.SPIInitiator != oldSPIi || m.Header.SPIResponder != oldSPIr || m.Header.ExchangeType != INFORMATIONAL || m.Header.MessageID != 3 || d == nil {
+		if m.Header.SPIInitiator != oldSPIi || m.Header.SPIResponder != oldSPIr || m.Header.ExchangeType != INFORMATIONAL || m.Header.MessageID != 4 || d == nil {
 			t.Errorf("unexpected old IKE delete")
 			return
 		}
@@ -451,7 +496,7 @@ func TestSessionRekeyIKE(t *testing.T) {
 	}
 	<-peerDone
 	current, retained := s.contexts()
-	if current == old || current.spiR != newSPIr || retained != nil {
+	if current == old || current.spiR != newSPIr || current.suite.DHGroup != DH_ECP_256 || retained != nil {
 		t.Fatalf("IKE contexts not promoted and retired: current=%#v old=%#v", current, retained)
 	}
 	if got := s.currentChild(); got.EncrID != child.EncrID || got.EncrKeyBits != child.EncrKeyBits || got.LocalSPI != child.LocalSPI || got.RemoteSPI != child.RemoteSPI || len(got.InboundKey) != 0 || len(got.OutboundKey) != 0 {
@@ -490,7 +535,10 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- s.Run(context.Background()) }()
 
-	dh, err := GenerateDH(DH_CURVE25519)
+	// The proposal offers ranet's preferred Curve25519 first, while the KE
+	// payload uses another supported offered group. RFC 7296 §1.3 requires
+	// the responder to select the group actually used by KE.
+	dh, err := GenerateDH(DH_ECP_256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,9 +546,12 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	spi := make([]byte, 8)
 	binary.BigEndian.PutUint64(spi, newSPIi)
 	request, err := EncryptMessage(suite, old.sker, Header{SPIInitiator: oldSPIi, SPIResponder: oldSPIr, ExchangeType: CREATE_CHILD_SA, MessageID: 0}, nil, []RawPayload{
-		{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms}})},
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{
+			{Number: 1, Protocol: ProtoIKE, SPI: spi, Transforms: []Transform{{Type: TransEncr, ID: 12, KeyLengthBits: 256}, {Type: TransPRF, ID: PRF_HMAC_SHA2_256}, {Type: TransDH, ID: DH_ECP_256}}},
+			{Number: 2, Protocol: ProtoIKE, SPI: spi, Transforms: ikeProposal().Transforms},
+		})},
 		{Type: PayloadNonce, Body: EncodeNonce(ni)},
-		{Type: PayloadKE, Body: EncodeKE(DH_CURVE25519, dh.PublicBytes())},
+		{Type: PayloadKE, Body: EncodeKE(DH_ECP_256, dh.PublicBytes())},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -532,18 +583,19 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 		t.Fatalf("invalid peer rekey response payloads: %#v", inner)
 	}
 	props, err := DecodeSA(sa.Body)
-	if err != nil || len(props) != 1 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
+	if err != nil || len(props) != 1 || props[0].Number != 2 || props[0].Protocol != ProtoIKE || len(props[0].SPI) != 8 || len(props[0].Transforms) != 3 {
 		t.Fatalf("invalid peer rekey response proposal: %#v, %v", props, err)
 	}
 	newSPIr := binary.BigEndian.Uint64(props[0].SPI)
 	selectedProposal := props[0]
+	selectedProposal.Number = 1
 	selectedProposal.SPI = nil
 	newSuite, err := suiteFromProposal(selectedProposal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	group, public, err := DecodeKE(ke.Body)
-	if err != nil || group != DH_CURVE25519 || newSPIr == 0 || len(nonce.Body) == 0 {
+	if err != nil || group != DH_ECP_256 || newSPIr == 0 || len(nonce.Body) == 0 {
 		t.Fatalf("invalid peer rekey response KE: group=%d spi=%016x err=%v", group, newSPIr, err)
 	}
 	shared, err := dh.SharedSecret(public)
@@ -609,6 +661,44 @@ func TestSessionHandlesPeerIKERekey(t *testing.T) {
 	_ = mux.Close()
 	if err := <-runDone; err == nil {
 		t.Fatal("Run returned nil after mux close")
+	}
+}
+
+func TestPeerIKERekeyInvalidKERequestsPreferredGroup(t *testing.T) {
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ctx := &ikeContext{suite: suite, spiI: spiI, spiR: spiR, skei: make([]byte, 20), sker: make([]byte, 20)}
+	s := &Session{current: ctx}
+	newSPI := make([]byte, 8)
+	binary.BigEndian.PutUint64(newSPI, 0x2122232425262728)
+
+	raw, err := s.handleIKERekey(ctx, 0, []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{Number: 1, Protocol: ProtoIKE, SPI: newSPI, Transforms: ikeProposal().Transforms}})},
+		{Type: PayloadNonce, Body: EncodeNonce([]byte("peer rekey nonce"))},
+		{Type: PayloadKE, Body: EncodeKE(14, []byte{1})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := DecodeMessage(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ctx.skei, raw, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifyPayload := findType(inner, PayloadN)
+	if notifyPayload == nil {
+		t.Fatalf("IKE rekey response has no notify: %#v", inner)
+	}
+	notify, err := DecodeNotify(notifyPayload.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notify.Type != N_INVALID_KE_PAYLOAD || len(notify.Data) != 2 || binary.BigEndian.Uint16(notify.Data) != DH_CURVE25519 {
+		t.Fatalf("IKE rekey notify = %#v, want INVALID_KE_PAYLOAD for group %d", notify, DH_CURVE25519)
 	}
 }
 

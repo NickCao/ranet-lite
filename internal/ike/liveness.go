@@ -496,7 +496,7 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 	if hdr.ExchangeType == CREATE_CHILD_SA {
 		if sa := findType(inner, PayloadSA); sa != nil {
 			props, err := DecodeSA(sa.Body)
-			if err == nil && len(props) == 1 && props[0].Protocol == ProtoIKE {
+			if err == nil && len(props) > 0 && props[0].Protocol == ProtoIKE {
 				return s.handleIKERekey(ctx, hdr.MessageID, inner)
 			}
 		}
