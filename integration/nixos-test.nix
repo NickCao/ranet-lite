@@ -11,6 +11,7 @@ let
   common = {
     virtualisation.vlans = [ 1 ];
     networking = {
+      useNetworkd = true;
       useDHCP = false;
       firewall.enable = false;
     };
@@ -38,26 +39,31 @@ in
           "swanctl/pubkey/org-pub.pem".source = ./org-pub.pem;
         };
 
-        systemd.services.ranet-link = {
-          description = "Ranet integration-test XFRM interface";
-          wantedBy = [ "multi-user.target" ];
-          before = [
-            "bird.service"
-            "iperf3.service"
-            "strongswan-swanctl.service"
-          ];
-          path = [ pkgs.iproute2 ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
+        systemd.network = {
+          netdevs."20-swan0" = {
+            netdevConfig = {
+              Name = "swan0";
+              Kind = "xfrm";
+            };
+            xfrmConfig.InterfaceId = 1;
           };
-          script = ''
-            ip link add swan0 type xfrm dev eth1 if_id 1
-            ip link set swan0 up multicast on
-            ip -6 address replace fe80::1/64 dev swan0
-            ip -6 address replace ${gatewayTunnel}/64 dev swan0
-          '';
-          preStop = "ip link delete swan0";
+          networks = {
+            # The test network module already defines 40-eth1; extend it to
+            # create swan0 with eth1 as its underlying device.
+            "40-eth1".networkConfig.Xfrm = "swan0";
+            "40-swan0" = {
+              matchConfig.Name = "swan0";
+              linkConfig = {
+                Multicast = true;
+                RequiredForOnline = false;
+              };
+              networkConfig.ConfigureWithoutCarrier = true;
+              addresses = [
+                { Address = "fe80::1/64"; }
+                { Address = "${gatewayTunnel}/64"; }
+              ];
+            };
+          };
         };
 
         services.strongswan-swanctl = {
@@ -114,8 +120,8 @@ in
           };
         };
         systemd.services.strongswan-swanctl = {
-          requires = [ "ranet-link.service" ];
-          after = [ "ranet-link.service" ];
+          requires = [ "network-online.target" ];
+          after = [ "network-online.target" ];
         };
 
         services.bird = {
@@ -159,15 +165,15 @@ in
           '';
         };
         systemd.services.bird = {
-          requires = [ "ranet-link.service" ];
-          after = [ "ranet-link.service" ];
+          requires = [ "network-online.target" ];
+          after = [ "network-online.target" ];
         };
 
         systemd.services.iperf3 = {
           description = "iperf3 server for the ranet integration test";
           wantedBy = [ "multi-user.target" ];
-          requires = [ "ranet-link.service" ];
-          after = [ "ranet-link.service" ];
+          requires = [ "network-online.target" ];
+          after = [ "network-online.target" ];
           serviceConfig = {
             ExecStart = "${pkgs.iperf3}/bin/iperf3 --server --bind ${gatewayTunnel}";
             Restart = "on-failure";
@@ -183,6 +189,29 @@ in
         iperf3
         iproute2
       ];
+
+      systemd.network = {
+        netdevs."20-ranet0" = {
+          netdevConfig = {
+            Name = "ranet0";
+            Kind = "tun";
+          };
+          tunConfig = {
+            PacketInfo = false;
+            VNetHeader = true;
+          };
+        };
+        networks."40-ranet0" = {
+          matchConfig.Name = "ranet0";
+          linkConfig = {
+            MTUBytes = 1400;
+            RequiredForOnline = false;
+          };
+          networkConfig.ConfigureWithoutCarrier = true;
+          addresses = [ { Address = "${clientTunnel}/128"; } ];
+          routes = [ { Destination = "fd00:99::/64"; } ];
+        };
+      };
 
       environment.etc = {
         "ranet-lite/key.pem".source = ./org-key.pem;
@@ -276,17 +305,11 @@ in
 
     start_all()
 
-    gateway.wait_for_unit("ranet-link.service")
+    gateway.wait_for_unit("systemd-networkd-wait-online.service")
     gateway.wait_for_unit("strongswan-swanctl.service")
     gateway.wait_for_unit("bird.service")
     gateway.wait_for_unit("iperf3.service")
     client.wait_for_unit("ranet-lite.service")
-
-    client.wait_until_succeeds("ip link show ranet0")
-    client.succeed("ip link set ranet0 up")
-    client.succeed("ip -6 address replace ${clientTunnel}/128 dev ranet0")
-    client.succeed("ip -6 route replace fd00:99::/64 dev ranet0")
-    client.succeed("ip -6 route get ${gatewayTunnel} | grep -F 'dev ranet0'")
 
     try:
         client.wait_until_succeeds(
