@@ -1,0 +1,7 @@
+[Unit]
+Description=Ranet integration gateway
+Requires=ranet-link.service strongswan.service bird.service ranet-ready.service
+After=ranet-link.service strongswan.service bird.service ranet-ready.service
+
+[Install]
+WantedBy=multi-user.target

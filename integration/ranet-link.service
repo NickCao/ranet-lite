@@ -1,0 +1,14 @@
+[Unit]
+Description=Configure the integration-test tunnel link
+Before=strongswan.service bird.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip link add swan0 type xfrm dev eth0 if_id 1
+ExecStart=/usr/sbin/ip link set swan0 up multicast on
+ExecStart=/usr/sbin/ip -6 address replace fe80::1/64 dev swan0
+ExecStop=/usr/sbin/ip link delete swan0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

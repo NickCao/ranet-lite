@@ -175,9 +175,10 @@ go test ./... -race
 None of the unit tests require root or any privileged resource. Protocol-
 level interoperability with strongSwan is covered by an opt-in
 [testcontainers-go](https://github.com/testcontainers/testcontainers-go)
-test. It builds a disposable Debian container, installs Debian's strongSwan
-packages, and verifies a real Ed25519-authenticated IKEv2 and Child SA
-negotiation:
+test. It boots systemd in a disposable Debian container with `charon-systemd`,
+`swanctl`, and BIRD. The test verifies a real Ed25519-authenticated IKEv2 and
+Child SA negotiation, then exchanges Babel over the negotiated ESP tunnel and
+checks that ranet-lite learns a route originated by BIRD:
 
 ```sh
 DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock" \
@@ -188,8 +189,8 @@ For local Podman, start the user socket first (`systemctl --user start
 podman.socket`) and set `DOCKER_HOST` as above. The test itself does not pin a
 container engine, so GitHub Actions can use its default Docker service without
 special configuration. testcontainers-go automatically removes the test
-container afterward. strongSwan's container log is streamed into verbose test
-output on every run.
+container afterward. The systemd, strongSwan, and BIRD logs are streamed live
+and also included as a complete snapshot in verbose test output on every run.
 
 ## License
 

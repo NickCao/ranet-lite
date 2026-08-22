@@ -1,0 +1,11 @@
+[Unit]
+Description=Verify the ranet integration gateway
+Requires=strongswan.service bird.service
+After=strongswan.service bird.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/swanctl --list-conns
+ExecStart=/usr/sbin/birdc show protocols all
+ExecStart=/usr/sbin/birdc show route export ranet all
+RemainAfterExit=yes
