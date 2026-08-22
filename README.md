@@ -172,25 +172,22 @@ either; only synthetic fixtures belong in version control (see
 go test ./... -race
 ```
 
-None of the unit tests require root or any privileged resource. Protocol-
-level interoperability with strongSwan is covered by an opt-in
-[testcontainers-go](https://github.com/testcontainers/testcontainers-go)
-test. It boots systemd in a disposable Debian container with `charon-systemd`,
-`swanctl`, and BIRD. The test verifies a real Ed25519-authenticated IKEv2 and
-Child SA negotiation, then exchanges Babel over the negotiated ESP tunnel and
-checks that ranet-lite learns a route originated by BIRD:
+None of the unit tests require root or any privileged resource. Protocol-level
+interoperability is covered by the NixOS VM test exposed by `flake.nix`. It
+boots separate client and gateway VMs; the client runs the packaged,
+user-facing `ranet-lite` binary with a real TUN device, while the gateway runs
+`charon-systemd`/`swanctl`, BIRD, and iperf3. The test verifies an
+Ed25519-authenticated IKEv2 and Child SA negotiation across asymmetric local
+and remote UDP ports, checks Babel route exchange in both directions, and
+measures TCP bandwidth through the negotiated ESP tunnel:
 
 ```sh
-DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock" \
-  go test -tags=integration ./integration -v
+nix build .#checks.x86_64-linux.integration -L
 ```
 
-For local Podman, start the user socket first (`systemctl --user start
-podman.socket`) and set `DOCKER_HOST` as above. The test itself does not pin a
-container engine, so GitHub Actions can use its default Docker service without
-special configuration. testcontainers-go automatically removes the test
-container afterward. The systemd, strongSwan, and BIRD logs are streamed live
-and also included as a complete snapshot in verbose test output on every run.
+The VM console, systemd, strongSwan, BIRD, ranet-lite, and iperf3 output is
+streamed by the Nix test driver. A failed convergence check also prints both
+machines' journals, routes, XFRM state and policies, and BIRD protocol state.
 
 ## License
 
