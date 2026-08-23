@@ -121,9 +121,9 @@ func TestHubFailureIsTerminal(t *testing.T) {
 }
 
 func TestRecvESPBatchDrainsToDestinationCapacity(t *testing.T) {
-	m := &Mux{espCh: make(chan [][]byte, 2), done: make(chan struct{})}
-	m.espCh <- [][]byte{[]byte("one"), []byte("two")}
-	m.espCh <- [][]byte{[]byte("three")}
+	m := &Mux{espCh: make(chan espDatagramBatch, 2), done: make(chan struct{})}
+	m.espCh <- espDatagramBatch{packets: [][]byte{[]byte("one"), []byte("two")}}
+	m.espCh <- espDatagramBatch{packets: [][]byte{[]byte("three")}}
 
 	batch, err := m.RecvESPBatch(make([][]byte, 0, 2))
 	if err != nil {
@@ -138,6 +138,60 @@ func TestRecvESPBatchDrainsToDestinationCapacity(t *testing.T) {
 	}
 	if string(last) != "three" {
 		t.Fatalf("remaining packet = %q, want three", last)
+	}
+}
+
+func TestConcurrentESPReceiveCarriesDispatchOrder(t *testing.T) {
+	m := &Mux{espCh: make(chan espDatagramBatch, 2), done: make(chan struct{})}
+	if !m.dispatchESP([][]byte{[]byte("first")}) || !m.dispatchESP([][]byte{[]byte("second")}) {
+		t.Fatal("dispatch unexpectedly dropped a batch")
+	}
+
+	type received struct {
+		ticket  uint64
+		packets [][]byte
+		err     error
+	}
+	results := make(chan received, 2)
+	for range 2 {
+		go func() {
+			ticket, packets, err := m.RecvESPBatchConcurrent()
+			results <- received{ticket: ticket, packets: packets, err: err}
+		}()
+	}
+	byTicket := make(map[uint64]string, 2)
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		byTicket[got.ticket] = string(got.packets[0])
+	}
+	if byTicket[0] != "first" || byTicket[1] != "second" {
+		t.Fatalf("received tickets = %v, want map[0:first 1:second]", byTicket)
+	}
+}
+
+func TestDroppedESPBatchDoesNotLeaveTicketGap(t *testing.T) {
+	m := &Mux{espCh: make(chan espDatagramBatch, 1), done: make(chan struct{})}
+	if !m.dispatchESP([][]byte{[]byte("accepted")}) {
+		t.Fatal("first dispatch was dropped")
+	}
+	if m.dispatchESP([][]byte{[]byte("dropped")}) {
+		t.Fatal("dispatch to a full queue succeeded")
+	}
+	if _, _, err := m.RecvESPBatchConcurrent(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.dispatchESP([][]byte{[]byte("next")}) {
+		t.Fatal("dispatch after draining was dropped")
+	}
+	ticket, _, err := m.RecvESPBatchConcurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ticket != 1 {
+		t.Fatalf("ticket after a dropped batch = %d, want 1", ticket)
 	}
 }
 

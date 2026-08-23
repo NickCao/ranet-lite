@@ -58,6 +58,13 @@ separate routing daemon (e.g. BIRD) that peers with the embedded Babel
 speaker over the device for fully automatic route installation — is up to
 whoever runs it.
 
+On Linux, ranet-lite opens one multiqueue TUN lane per Go execution context
+and keeps inner flows on a stable lane. When more than one execution context
+is available, an existing named TUN must therefore be created with
+`IFF_MULTI_QUEUE` (for a systemd-networkd `.netdev`, set `MultiQueue=yes` in
+its `[Tun]` section). Single-core processes can also attach to a legacy
+single-queue TUN and retain the direct packet path.
+
 ## Deliberate protocol deviations
 
 ranet-lite uses a private IKEv2 transport profile tailored to a ranet
@@ -172,8 +179,9 @@ originate:
 # The existing strongSwan netns test rig can exercise short rekey lifetimes:
 # go run ./cmd/iketest -child-rekey=5s -ike-rekey=15s -run=45
 
-# Optional fixed TUN name. It attaches to an existing compatible device or
-# creates it when absent. Omit to create an automatically named ranet%d device.
+# Optional fixed TUN name. It attaches to an existing compatible device
+# (which must be multiqueue on multicore) or creates it when absent. Omit to
+# create an automatically named ranet%d device.
 # tun: ranet0
 
 # One or more existing mesh nodes to dial as IKEv2/babel peers.

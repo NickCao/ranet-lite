@@ -189,6 +189,7 @@ in
               Kind = "tun";
             };
             tunConfig = {
+              MultiQueue = true;
               PacketInfo = false;
               VNetHeader = true;
             };

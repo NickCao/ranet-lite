@@ -14,6 +14,7 @@
 package netstack
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net/netip"
@@ -55,9 +56,19 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	dev                tun.Device
-	outboundReadMu     sync.Mutex
+	devs               []tun.Device
 	outboundBufferSize int
+	inboundWriters     []chan inboundWriteBatch
+	closed             chan struct{}
+	closeOnce          sync.Once
+	deliveryMu         sync.Mutex
+	deliveryWG         sync.WaitGroup
+	closing            bool
+	writerWG           sync.WaitGroup
+}
+
+type inboundWriteBatch struct {
+	bufs [][]byte
 }
 
 // New creates an automatically named TUN device.
@@ -72,40 +83,54 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 	if name == "" {
 		name = "ranet%d"
 	}
-	dev, err := tun.CreateTUN(name, mtu)
+	queueCount := max(1, runtime.GOMAXPROCS(0))
+	devs, actualName, err := createTUNQueues(name, mtu, queueCount)
+	if err != nil && queueCount == 1 {
+		// A pre-existing single-queue TUN rejects an IFF_MULTI_QUEUE attach.
+		// Preserve the single-core compatibility path while new interfaces and
+		// multicore processes use the scalable multiqueue setup.
+		var dev tun.Device
+		dev, err = tun.CreateTUN(name, mtu)
+		if err == nil {
+			actualName, err = dev.Name()
+			if err == nil {
+				devs = []tun.Device{dev}
+			} else {
+				_ = dev.Close()
+			}
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("netstack: create tun device: %w", err)
-	}
-	actualName, err := dev.Name()
-	if err != nil {
-		dev.Close()
-		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
 	m := &Mesh{
 		Routes:             NewRouteTable(),
 		Name:               actualName,
-		dev:                dev,
+		devs:               devs,
 		outboundBufferSize: max(mtu, outboundPacketBufferSize),
+		closed:             make(chan struct{}),
 	}
-	// One long-lived worker per available Go execution context lets packet
-	// batches encrypt concurrently without per-packet goroutines or scheduler
-	// queues. On single-core nodes this naturally remains the direct serial
-	// path measured to perform best.
-	for range max(1, runtime.GOMAXPROCS(0)) {
-		go m.outboundWorker()
+	m.startInboundWriters()
+	// One long-lived worker owns each multiqueue TUN descriptor. This removes
+	// the single device read lock while retaining a direct serial path on
+	// single-core nodes.
+	for _, dev := range m.devs {
+		go m.outboundWorker(dev)
 	}
 	return m, nil
 }
 
+// QueueCount reports the number of independent TUN I/O lanes.
+func (m *Mesh) QueueCount() int { return len(m.devs) }
+
 // outboundWorker owns a complete packet batch from TUN read through UDP send.
-// The read lock extends the TUN backend's own serialized read through route
-// lookup and sequence-range reservation. It is released before AEAD work, so
-// another worker can reserve the next range and encrypt it concurrently. Each
-// peer's final transmission gate then sends completed ranges in reservation
-// order, keeping ESP sequence numbers monotonic even when a later worker
-// finishes first.
-func (m *Mesh) outboundWorker() {
-	batch := m.dev.BatchSize()
+// Every worker reads a different kernel TUN queue, then owns a complete packet
+// batch through route lookup and encryption. A peer's reservation lock defines
+// the accepted cross-queue order; its final transmission gate sends completed
+// ranges in that order, keeping ESP sequence numbers monotonic even when a
+// later worker finishes first.
+func (m *Mesh) outboundWorker(dev tun.Device) {
+	batch := dev.BatchSize()
 	bufs := make([][]byte, batch)
 	sizes := make([]int, batch)
 	peers := make([]*Peer, batch)
@@ -118,10 +143,8 @@ func (m *Mesh) outboundWorker() {
 	peerOrder := make([]*Peer, 0, batch)
 
 	for {
-		m.outboundReadMu.Lock()
-		n, err := m.dev.Read(bufs, sizes, 0)
+		n, err := dev.Read(bufs, sizes, 0)
 		if err != nil {
-			m.outboundReadMu.Unlock()
 			return // device closed
 		}
 		clear(counts)
@@ -143,7 +166,6 @@ func (m *Mesh) outboundWorker() {
 		for _, peer := range peerOrder {
 			batches[peer] = peer.reserveBatch(counts[peer])
 		}
-		m.outboundReadMu.Unlock()
 
 		for i := 0; i < n; i++ {
 			if peer := peers[i]; peer != nil {
@@ -201,14 +223,82 @@ func (m *Mesh) DeliverInbound(raw []byte) {
 }
 
 // DeliverInboundBatch injects a group of already-decapsulated tunnel-mode IP
-// packets directly in one write batch. The calling receive worker retains
-// ownership through this TUN write; there is no channel handoff or separate
-// emitter. Buffers are copied to leave the headroom and tail capacity required
-// by the TUN backend's virtio/GRO implementation.
+// packets. On a multiqueue TUN, packets are assigned by their inner flow to a
+// persistent writer lane. That preserves each flow's packet order and lets the
+// kernel process unrelated streams in parallel. Buffers are copied to leave
+// the headroom and tail capacity required by the TUN backend's virtio/GRO
+// implementation.
 func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	if len(raw) == 0 {
 		return
 	}
+	m.deliveryMu.Lock()
+	if m.closing {
+		m.deliveryMu.Unlock()
+		return
+	}
+	m.deliveryWG.Add(1)
+	m.deliveryMu.Unlock()
+	defer m.deliveryWG.Done()
+	if len(m.devs) == 1 {
+		m.writeInbound(0, copyInboundPackets(raw))
+		return
+	}
+
+	groups := make([][][]byte, len(m.devs))
+	for _, packet := range raw {
+		lane := int(innerFlowHash(packet) % uint64(len(m.devs)))
+		groups[lane] = append(groups[lane], packet)
+	}
+	for lane, packets := range groups {
+		if len(packets) == 0 {
+			continue
+		}
+		batch := inboundWriteBatch{bufs: copyInboundPackets(packets)}
+		select {
+		case m.inboundWriters[lane] <- batch:
+		case <-m.closed:
+			releaseInboundPackets(batch.bufs)
+		}
+	}
+}
+
+func (m *Mesh) startInboundWriters() {
+	if len(m.devs) <= 1 {
+		return
+	}
+	m.inboundWriters = make([]chan inboundWriteBatch, len(m.devs))
+	for lane := range m.devs {
+		queue := make(chan inboundWriteBatch, 2)
+		m.inboundWriters[lane] = queue
+		m.writerWG.Add(1)
+		go func() {
+			defer m.writerWG.Done()
+			for {
+				select {
+				case batch := <-queue:
+					m.writeInbound(lane, batch.bufs)
+				case <-m.closed:
+					// Deliveries that began before Close may still choose the
+					// buffered send arm after closed becomes readable. Wait for
+					// those sends before the final drain so no pooled buffer is
+					// stranded in an abandoned queue.
+					m.deliveryWG.Wait()
+					for {
+						select {
+						case batch := <-queue:
+							releaseInboundPackets(batch.bufs)
+						default:
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+}
+
+func copyInboundPackets(raw [][]byte) [][]byte {
 	bufs := make([][]byte, len(raw))
 	for i := range raw {
 		buf := inboundPacketPool.Get().([]byte)
@@ -220,9 +310,10 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 		bufs[i] = buf
 		copy(bufs[i][writeOffset:], raw[i])
 	}
-	if _, err := m.dev.Write(bufs, writeOffset); err != nil {
-		log.Printf("netstack: write to tun device: %v", err)
-	}
+	return bufs
+}
+
+func releaseInboundPackets(bufs [][]byte) {
 	for _, buf := range bufs {
 		if cap(buf) == inboundPacketBufferSize {
 			inboundPacketPool.Put(buf[:inboundPacketBufferSize])
@@ -230,6 +321,75 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	}
 }
 
+func (m *Mesh) writeInbound(lane int, bufs [][]byte) {
+	if _, err := m.devs[lane].Write(bufs, writeOffset); err != nil {
+		select {
+		case <-m.closed:
+		default:
+			log.Printf("netstack: write to tun device queue %d: %v", lane, err)
+		}
+	}
+	releaseInboundPackets(bufs)
+}
+
+// innerFlowHash assigns both directions of an inner TCP/UDP flow to the same
+// lane. The commutative endpoint mix is useful for request/response workloads,
+// while the final avalanche avoids the sequential-port clustering produced by
+// simply taking low hash bits.
+func innerFlowHash(packet []byte) uint64 {
+	var src, dst []byte
+	var protocol byte
+	var payload []byte
+	fragmented := false
+	if len(packet) >= 20 && packet[0]>>4 == 4 {
+		headerLength := int(packet[0]&0x0f) * 4
+		if headerLength < 20 || headerLength > len(packet) {
+			return hashBytes(packet)
+		}
+		protocol, src, dst = packet[9], packet[12:16], packet[16:20]
+		payload = packet[headerLength:]
+		fragmented = binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0
+	} else if len(packet) >= 40 && packet[0]>>4 == 6 {
+		protocol, src, dst = packet[6], packet[8:24], packet[24:40]
+		payload = packet[40:]
+	} else {
+		return hashBytes(packet)
+	}
+
+	srcHash, dstHash := hashBytes(src), hashBytes(dst)
+	if !fragmented && len(payload) >= 4 && (protocol == 6 || protocol == 17) {
+		srcPort := binary.BigEndian.Uint16(payload[:2])
+		dstPort := binary.BigEndian.Uint16(payload[2:4])
+		srcHash ^= uint64(srcPort) * 0x9e3779b185ebca87
+		dstHash ^= uint64(dstPort) * 0x9e3779b185ebca87
+	}
+	h := srcHash ^ dstHash ^ uint64(protocol)*0x517cc1b727220a95
+	h ^= h >> 30
+	h *= 0xbf58476d1ce4e5b9
+	h ^= h >> 27
+	h *= 0x94d049bb133111eb
+	return h ^ h>>31
+}
+
+func hashBytes(raw []byte) uint64 {
+	h := uint64(14695981039346656037)
+	for _, b := range raw {
+		h ^= uint64(b)
+		h *= 1099511628211
+	}
+	return h
+}
+
 func (m *Mesh) Close() {
-	m.dev.Close()
+	m.closeOnce.Do(func() {
+		m.deliveryMu.Lock()
+		m.closing = true
+		close(m.closed)
+		m.deliveryMu.Unlock()
+		for _, dev := range m.devs {
+			_ = dev.Close()
+		}
+		m.deliveryWG.Wait()
+		m.writerWG.Wait()
+	})
 }

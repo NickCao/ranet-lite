@@ -49,29 +49,6 @@ const reconnectDelay = 10 * time.Second
 // peer can use every core without creating a goroutine or channel per packet.
 var inboundWorkers = max(1, runtime.GOMAXPROCS(0))
 
-// inboundBatchOrder assigns receive-order tickets under the same lock that
-// reads from the transport. Workers authenticate independently; the dedicated
-// emitter later consumes completed batches in ticket order.
-type inboundBatchOrder struct {
-	receiveMu sync.Mutex
-	reserved  uint64
-}
-
-func newInboundBatchOrder() *inboundBatchOrder {
-	return new(inboundBatchOrder)
-}
-
-func (o *inboundBatchOrder) receive(receive func() error) (uint64, error) {
-	o.receiveMu.Lock()
-	defer o.receiveMu.Unlock()
-	if err := receive(); err != nil {
-		return 0, err
-	}
-	ticket := o.reserved
-	o.reserved++
-	return ticket, nil
-}
-
 type inboundDecrypted struct {
 	authenticated *esp.AuthenticatedPacket
 	err           error
@@ -152,9 +129,9 @@ func main() {
 	}
 	defer mesh.Close()
 	if cfg.TUN == "" {
-		log.Printf("tun device %s created; assign it an address and add routes yourself before traffic will flow", mesh.Name)
+		log.Printf("tun device %s created with %d queues; assign it an address and add routes yourself before traffic will flow", mesh.Name, mesh.QueueCount())
 	} else {
-		log.Printf("using tun device %s", mesh.Name)
+		log.Printf("using tun device %s with %d queues", mesh.Name, mesh.QueueCount())
 	}
 
 	speaker, err := babel.New(babel.Config{
@@ -532,7 +509,6 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	}
 
 	runESP := func() error {
-		order := newInboundBatchOrder()
 		queueSize := max(2, 2*inboundWorkers)
 		freeBatches := make(chan *inboundBatch, queueSize)
 		completed := make(chan *inboundBatch, queueSize)
@@ -556,14 +532,9 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}()
 
 		worker := func() error {
-			var packets [][]byte
 			for {
 				batch := <-freeBatches
-				packets = packets[:0]
-				ticket, err := order.receive(func() (err error) {
-					packets, err = sess.Mux().RecvESPBatch(packets)
-					return err
-				})
+				ticket, packets, err := sess.Mux().RecvESPBatchConcurrent()
 				if err != nil {
 					freeBatches <- batch
 					return err

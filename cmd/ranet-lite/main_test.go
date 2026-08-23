@@ -14,15 +14,7 @@ import (
 )
 
 func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
-	order := newInboundBatchOrder()
-	first, err := order.receive(func() error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := order.receive(func() error { return nil })
-	if err != nil {
-		t.Fatal(err)
-	}
+	const first, second = 0, 1
 
 	firstResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
 	secondResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}

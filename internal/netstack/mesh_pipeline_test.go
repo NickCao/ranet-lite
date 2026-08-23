@@ -174,7 +174,8 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 		events: make(chan tun.Event),
 	}
 	m := &Mesh{
-		dev: dev,
+		devs:   []tun.Device{dev},
+		closed: make(chan struct{}),
 	}
 
 	want := [][]byte{{1, 2, 3}, {4, 5, 6, 7}}
@@ -198,5 +199,78 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for inbound TUN write")
+	}
+}
+
+func ipv6TCPPacket(srcPort, dstPort uint16, marker byte) []byte {
+	packet := make([]byte, 61)
+	packet[0] = 0x60
+	packet[4], packet[5] = 0, 21
+	packet[6] = 6
+	copy(packet[8:24], []byte{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+	copy(packet[24:40], []byte{0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2})
+	packet[40], packet[41] = byte(srcPort>>8), byte(srcPort)
+	packet[42], packet[43] = byte(dstPort>>8), byte(dstPort)
+	packet[60] = marker
+	return packet
+}
+
+func TestDeliverInboundBatchUsesFlowAffineQueues(t *testing.T) {
+	const queueCount = 8
+	devices := make([]tun.Device, queueCount)
+	recorders := make([]*recordingDevice, queueCount)
+	for i := range devices {
+		recorders[i] = &recordingDevice{
+			writes: make(chan recordedWrite, 1),
+			events: make(chan tun.Event),
+		}
+		devices[i] = recorders[i]
+	}
+	m := &Mesh{devs: devices, closed: make(chan struct{})}
+	m.startInboundWriters()
+	t.Cleanup(m.Close)
+
+	packets := make([][]byte, 0, 32)
+	want := make([][][]byte, queueCount)
+	for stream := 0; stream < 16; stream++ {
+		for sequence := 0; sequence < 2; sequence++ {
+			packet := ipv6TCPPacket(uint16(40000+stream), 5201, byte(sequence))
+			packets = append(packets, packet)
+			lane := int(innerFlowHash(packet) % queueCount)
+			want[lane] = append(want[lane], packet)
+		}
+	}
+	m.DeliverInboundBatch(packets)
+
+	active := 0
+	for lane, expected := range want {
+		if len(expected) == 0 {
+			continue
+		}
+		active++
+		select {
+		case got := <-recorders[lane].writes:
+			if len(got.packets) != len(expected) {
+				t.Fatalf("queue %d wrote %d packets, want %d", lane, len(got.packets), len(expected))
+			}
+			for i := range expected {
+				if !bytes.Equal(got.packets[i], expected[i]) {
+					t.Fatalf("queue %d packet %d did not preserve flow order", lane, i)
+				}
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for queue %d", lane)
+		}
+	}
+	if active < queueCount/2 {
+		t.Fatalf("16 TCP streams used only %d/%d queues", active, queueCount)
+	}
+
+	forward := ipv6TCPPacket(40000, 5201, 0)
+	reverse := ipv6TCPPacket(5201, 40000, 0)
+	copy(reverse[8:24], forward[24:40])
+	copy(reverse[24:40], forward[8:24])
+	if innerFlowHash(forward)%queueCount != innerFlowHash(reverse)%queueCount {
+		t.Fatal("opposite directions of one flow mapped to different queues")
 	}
 }

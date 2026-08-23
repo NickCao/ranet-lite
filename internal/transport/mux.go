@@ -50,6 +50,11 @@ type ikeDatagram struct {
 	endpoint Endpoint
 }
 
+type espDatagramBatch struct {
+	ticket  uint64
+	packets [][]byte
+}
+
 // NewHub binds localAddr. A specific IP is not supported by conn.Bind, so only
 // its port is used.
 func NewHub(localAddr string) (*Hub, error) {
@@ -78,7 +83,7 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan [][]byte, espChanSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan espDatagramBatch, espChanSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -177,9 +182,7 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 			}
 		}
 		for m, packets := range espBatches {
-			select {
-			case m.espCh <- packets:
-			default:
+			if !m.dispatchESP(packets) {
 				log.Printf("transport: espCh full, dropping %d ESP packets", len(packets))
 			}
 		}
@@ -188,18 +191,38 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 
 // Mux is one peer's logical IKE and ESP channel on a Hub.
 type Mux struct {
-	hub        *Hub
-	endpointMu sync.RWMutex
-	endpoint   conn.Endpoint
-	ikeCh      chan ikeDatagram
-	espRecvMu  sync.Mutex
-	espCh      chan [][]byte
-	espPending [][]byte
-	done       chan struct{}
-	doneOnce   sync.Once
-	doneErr    atomic.Value
-	closed     atomic.Bool
-	ownHub     bool
+	hub           *Hub
+	endpointMu    sync.RWMutex
+	endpoint      conn.Endpoint
+	ikeCh         chan ikeDatagram
+	espRecvMu     sync.Mutex
+	espDispatchMu sync.Mutex
+	espTicket     uint64
+	espCh         chan espDatagramBatch
+	espPending    [][]byte
+	done          chan struct{}
+	doneOnce      sync.Once
+	doneErr       atomic.Value
+	closed        atomic.Bool
+	ownHub        bool
+}
+
+// dispatchESP assigns a receive-order ticket at the socket demultiplexer.
+// Both the ticket and channel insertion happen under one lock because a Hub
+// may have separate IPv4 and IPv6 receive loops. A dropped batch does not
+// consume a ticket, so the ordered decrypt emitter can never wait forever on
+// a hole caused by backpressure.
+func (m *Mux) dispatchESP(packets [][]byte) bool {
+	m.espDispatchMu.Lock()
+	defer m.espDispatchMu.Unlock()
+	batch := espDatagramBatch{ticket: m.espTicket, packets: packets}
+	select {
+	case m.espCh <- batch:
+		m.espTicket++
+		return true
+	default:
+		return false
+	}
 }
 
 // Dial preserves the one-peer convenience path. The returned mux owns its
@@ -381,7 +404,8 @@ func (m *Mux) RecvESP() ([]byte, error) {
 	defer m.espRecvMu.Unlock()
 	if len(m.espPending) == 0 {
 		select {
-		case m.espPending = <-m.espCh:
+		case batch := <-m.espCh:
+			m.espPending = batch.packets
 		case <-m.done:
 			return nil, m.doneError()
 		}
@@ -389,6 +413,20 @@ func (m *Mux) RecvESP() ([]byte, error) {
 	b := m.espPending[0]
 	m.espPending = m.espPending[1:]
 	return b, nil
+}
+
+// RecvESPBatchConcurrent returns one complete socket-demultiplexed batch and
+// its receive-order ticket. It is safe for multiple data-plane workers to call
+// concurrently: the transport channel distributes batches, while the ticket
+// lets their independently decrypted results be emitted in original order.
+// It must not be mixed with RecvESP, RecvESPBatch, or RecvESPUntil on one Mux.
+func (m *Mux) RecvESPBatchConcurrent() (uint64, [][]byte, error) {
+	select {
+	case batch := <-m.espCh:
+		return batch.ticket, batch.packets, nil
+	case <-m.done:
+		return 0, nil, m.doneError()
+	}
 }
 
 // RecvESPBatch blocks for one ESP packet, then drains immediately available
@@ -407,13 +445,15 @@ func (m *Mux) RecvESPBatch(dst [][]byte) ([][]byte, error) {
 		if len(m.espPending) == 0 {
 			if len(dst) == 0 {
 				select {
-				case m.espPending = <-m.espCh:
+				case batch := <-m.espCh:
+					m.espPending = batch.packets
 				case <-m.done:
 					return nil, m.doneError()
 				}
 			} else {
 				select {
-				case m.espPending = <-m.espCh:
+				case batch := <-m.espCh:
+					m.espPending = batch.packets
 				case <-m.done:
 					return dst, nil
 				default:
@@ -433,7 +473,8 @@ func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 	defer m.espRecvMu.Unlock()
 	if len(m.espPending) == 0 {
 		select {
-		case m.espPending = <-m.espCh:
+		case batch := <-m.espCh:
+			m.espPending = batch.packets
 		case <-m.done:
 			return nil, m.doneError()
 		case <-time.After(time.Until(deadline)):
