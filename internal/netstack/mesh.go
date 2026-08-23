@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"runtime"
 	"sync"
 
 	"github.com/NickCao/ranet-lite/esp"
@@ -24,18 +25,6 @@ import (
 )
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
-
-// ESP sequence numbers are allocated by encryptFn, while emitter deliberately
-// restores the TUN's packet order. Multiple encryption workers could therefore
-// assign sequence numbers in worker-scheduling order but send them in TUN
-// order, pushing valid packets outside the receiver's anti-replay window. One
-// worker keeps those orders identical; profiling also shows AEAD is not the
-// outbound bottleneck on a single core.
-const outboundWorkers = 1
-
-// outboundContainerBufSize bounds how many Device.Read batches can wait for
-// ordered emission while their individual packets are encrypted.
-const outboundContainerBufSize = 64
 
 const (
 	outboundPacketBufferSize = 2048
@@ -46,10 +35,7 @@ const (
 )
 
 var (
-	outboundPacketPool    = sync.Pool{New: func() any { return make([]byte, outboundPacketBufferSize) }}
-	outboundElementPool   = sync.Pool{New: func() any { return new(outboundElement) }}
-	outboundContainerPool = sync.Pool{New: func() any { return new(outboundElementsContainer) }}
-	inboundPacketPool     = sync.Pool{New: func() any { return make([]byte, inboundPacketBufferSize) }}
+	inboundPacketPool = sync.Pool{New: func() any { return make([]byte, inboundPacketBufferSize) }}
 )
 
 // writeOffset is how much leading space Device.Write needs in each buffer
@@ -61,13 +47,9 @@ var (
 // too-small offset is an out-of-range slice.
 const writeOffset = 16
 
-// chanBufSize sizes the internal channels absorbing bursts between
-// pipeline stages. outboundLoop and inboundLoop both block on these
-// channels rather than dropping, so too small a buffer doesn't lose a
-// packet directly — it stalls the read loop feeding it, which in turn
-// lets the kernel's own fixed-size queue (the tun device's qdisc, 500
-// slots by default) back up and drop instead. Matches transport.
-// espChanSize for the same underlying reason.
+// chanBufSize lets decrypted bursts accumulate for batched TUN writes. The
+// outbound path deliberately has no work channels: each worker owns a complete
+// read/reserve/encrypt/send operation.
 const chanBufSize = 4096
 
 type Mesh struct {
@@ -78,11 +60,11 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	dev        tun.Device
-	inbound    chan [][]byte
-	encryption chan *outboundElement           // shared across all outboundWorkers
-	order      chan *outboundElementsContainer // one per Device.Read batch, in read order
-	done       chan struct{}
+	dev                tun.Device
+	inbound            chan [][]byte
+	outboundReadMu     sync.Mutex
+	outboundBufferSize int
+	done               chan struct{}
 }
 
 // New creates an automatically named TUN device.
@@ -107,155 +89,83 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
 	}
 	m := &Mesh{
-		Routes:     NewRouteTable(),
-		Name:       actualName,
-		dev:        dev,
-		inbound:    make(chan [][]byte, chanBufSize),
-		encryption: make(chan *outboundElement, chanBufSize),
-		order:      make(chan *outboundElementsContainer, outboundContainerBufSize),
-		done:       make(chan struct{}),
+		Routes:             NewRouteTable(),
+		Name:               actualName,
+		dev:                dev,
+		inbound:            make(chan [][]byte, chanBufSize),
+		outboundBufferSize: max(mtu, outboundPacketBufferSize),
+		done:               make(chan struct{}),
 	}
-	for i := 0; i < outboundWorkers; i++ {
-		go m.encryptionWorker()
+	// One long-lived worker per available Go execution context lets packet
+	// batches encrypt concurrently without per-packet goroutines or scheduler
+	// queues. On single-core nodes this naturally remains the direct serial
+	// path measured to perform best.
+	for range max(1, runtime.GOMAXPROCS(0)) {
+		go m.outboundWorker()
 	}
-	go m.outboundLoop()
-	go m.emitter()
 	go m.inboundLoop()
 	return m, nil
 }
 
-// outboundElement is one packet within an outboundElementsContainer, from
-// the point its destination peer is resolved through to encryption and
-// finally transmission.
-type outboundElement struct {
-	peer   *Peer // nil: malformed packet or no route, drop
-	raw    []byte
-	nh     byte
-	sealed []byte
-	ok     bool // set once encryption succeeds
-	batch  *outboundElementsContainer
-}
-
-// outboundElementsContainer groups one Device.Read for ordered emission. Its
-// WaitGroup lets workers encrypt packets from the same read in parallel while
-// the emitter still drains complete containers in read order.
-type outboundElementsContainer struct {
-	sync.WaitGroup
-	elems []*outboundElement
-}
-
-// outboundLoop reads packets from the TUN device in batches -- one
-// outboundElementsContainer per Device.Read call -- and hands each
-// container to the ordered emitter, then queues each packet separately to the
-// shared encryption workers. Packet-granularity work lets one large TUN GSO
-// read use every worker; the emitter's container WaitGroup preserves wire
-// order. Route lookups happen synchronously in read order, so workers only
-// touch crypto.
-func (m *Mesh) outboundLoop() {
+// outboundWorker owns a complete packet batch from TUN read through UDP send.
+// The read lock extends the TUN backend's own serialized read through route
+// lookup and sequence-range reservation. It is released before AEAD work, so
+// another worker can reserve the next range and encrypt it concurrently. Each
+// peer's final transmission gate then sends completed ranges in reservation
+// order, keeping ESP sequence numbers monotonic even when a later worker
+// finishes first.
+func (m *Mesh) outboundWorker() {
 	batch := m.dev.BatchSize()
 	bufs := make([][]byte, batch)
 	sizes := make([]int, batch)
+	peers := make([]*Peer, batch)
+	headers := make([]byte, batch)
 	for i := range bufs {
-		bufs[i] = make([]byte, 65536)
+		bufs[i] = make([]byte, m.outboundBufferSize)
 	}
-	defer func() {
-		close(m.order)
-		close(m.encryption)
-	}()
+	counts := make(map[*Peer]int)
+	batches := make(map[*Peer]*peerBatch)
+	peerOrder := make([]*Peer, 0, batch)
 
 	for {
+		m.outboundReadMu.Lock()
 		n, err := m.dev.Read(bufs, sizes, 0)
 		if err != nil {
+			m.outboundReadMu.Unlock()
 			return // device closed
 		}
-		c := outboundContainerPool.Get().(*outboundElementsContainer)
-		if cap(c.elems) < n {
-			c.elems = make([]*outboundElement, 0, n)
-		} else {
-			c.elems = c.elems[:0]
-		}
+		clear(counts)
+		clear(batches)
+		peerOrder = peerOrder[:0]
 		for i := 0; i < n; i++ {
-			raw := outboundPacketPool.Get().([]byte)
-			if cap(raw) < sizes[i] {
-				raw = make([]byte, sizes[i])
-			} else {
-				raw = raw[:sizes[i]]
-			}
-			copy(raw, bufs[i][:sizes[i]])
-			e := outboundElementPool.Get().(*outboundElement)
-			*e = outboundElement{raw: raw, batch: c}
+			peers[i] = nil
+			raw := bufs[i][:sizes[i]]
 			if src, dst, nh, ok := addrsOf(raw); ok {
 				if peer, ok := m.Routes.Lookup(src, dst); ok {
-					e.peer, e.nh = peer, nh
+					peers[i], headers[i] = peer, nh
+					if counts[peer] == 0 {
+						peerOrder = append(peerOrder, peer)
+					}
+					counts[peer]++
 				}
 			}
-			c.elems = append(c.elems, e)
 		}
-		c.Add(len(c.elems))
-		select {
-		case m.order <- c:
-		case <-m.done:
-			return
+		for _, peer := range peerOrder {
+			batches[peer] = peer.reserveBatch(counts[peer])
 		}
-		// Once the container is visible to the emitter, every element must
-		// be submitted so its WaitGroup can always complete during shutdown.
-		for _, e := range c.elems {
-			m.encryption <- e
-		}
-	}
-}
+		m.outboundReadMu.Unlock()
 
-// encryptionWorker is one of outboundWorkers long-lived goroutines
-// draining the shared encryption queue -- see outboundLoop's doc comment.
-func (m *Mesh) encryptionWorker() {
-	for e := range m.encryption {
-		if e.peer != nil {
-			sealed, err := e.peer.encryptFn(e.raw, e.nh)
-			if err == nil {
-				e.sealed, e.ok = sealed, true
+		for i := 0; i < n; i++ {
+			if peer := peers[i]; peer != nil {
+				batches[peer].seal(bufs[i][:sizes[i]], headers[i])
 			}
 		}
-		e.batch.Done()
-	}
-}
-
-// emitter drains containers in the order outboundLoop read them, waiting for
-// every packet in each container to finish encryption.
-func (m *Mesh) emitter() {
-	for c := range m.order {
-		c.Wait()
-		for i := 0; i < len(c.elems); {
-			e := c.elems[i]
-			if !e.ok {
-				releaseOutboundElement(e)
-				i++
-				continue
-			}
-
-			peer := e.peer
-			start := i
-			sealed := make([][]byte, 0, len(c.elems)-i)
-			for i < len(c.elems) && c.elems[i].ok && c.elems[i].peer == peer {
-				e = c.elems[i]
-				sealed = append(sealed, e.sealed)
-				i++
-			}
-			_ = peer.transmitBatchFn(sealed)
-			for _, e := range c.elems[start:i] {
-				releaseOutboundElement(e)
+		for _, peer := range peerOrder {
+			if err := batches[peer].transmit(); err != nil {
+				log.Printf("netstack: send batch through peer %s: %v", peer.ID, err)
 			}
 		}
-		c.elems = c.elems[:0]
-		outboundContainerPool.Put(c)
 	}
-}
-
-func releaseOutboundElement(e *outboundElement) {
-	if cap(e.raw) == outboundPacketBufferSize {
-		outboundPacketPool.Put(e.raw[:outboundPacketBufferSize])
-	}
-	*e = outboundElement{}
-	outboundElementPool.Put(e)
 }
 
 // addrsOf extracts both the source and destination address from a raw IP

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,65 +45,65 @@ func (d *recordingDevice) Events() <-chan tun.Event { return d.events }
 func (d *recordingDevice) Close() error             { return nil }
 func (d *recordingDevice) BatchSize() int           { return 128 }
 
-func TestEncryptionWorkersParallelizeOneContainerAndEmitInOrder(t *testing.T) {
-	started := make(chan struct{}, 2)
-	release := make(chan struct{})
-	transmitted := make(chan [][]byte, 1)
-	peer := NewPeerBatched("peer", func(raw []byte, _ byte) ([]byte, error) {
-		started <- struct{}{}
-		<-release
-		return raw, nil
+func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
+	started := make(chan byte, 2)
+	releaseFirst := make(chan struct{})
+	transmitted := make(chan byte, 2)
+	nextSequence := byte(1)
+	peer := NewPeerReserved("peer", func(count int) (BatchSealer, error) {
+		first := nextSequence
+		nextSequence += byte(count)
+		next := first
+		return func(raw []byte, _ byte) ([]byte, error) {
+			started <- raw[0]
+			if raw[0] == 1 {
+				<-releaseFirst
+			}
+			sealed := []byte{next, raw[0]}
+			next++
+			return sealed, nil
+		}, nil
 	}, func(sealed [][]byte) error {
-		batch := make([][]byte, len(sealed))
-		for i := range sealed {
-			batch[i] = append([]byte(nil), sealed[i]...)
-		}
-		transmitted <- batch
+		transmitted <- sealed[0][0]
 		return nil
 	})
 
-	m := &Mesh{
-		encryption: make(chan *outboundElement, 2),
-		order:      make(chan *outboundElementsContainer, 1),
+	first := peer.reserveBatch(1)
+	second := peer.reserveBatch(1)
+	var wg sync.WaitGroup
+	for i, b := range []*peerBatch{first, second} {
+		wg.Add(1)
+		go func(raw byte, b *peerBatch) {
+			defer wg.Done()
+			b.seal([]byte{raw}, 0)
+			if err := b.transmit(); err != nil {
+				t.Errorf("transmit batch %d: %v", raw, err)
+			}
+		}(byte(i+1), b)
 	}
-	c := &outboundElementsContainer{}
-	c.elems = []*outboundElement{
-		{peer: peer, raw: []byte{1}, batch: c},
-		{peer: peer, raw: []byte{2}, batch: c},
-	}
-	c.Add(len(c.elems))
-	m.order <- c
-	m.encryption <- c.elems[0]
-	m.encryption <- c.elems[1]
-	close(m.encryption)
-	close(m.order)
-
-	emitterDone := make(chan struct{})
-	go func() {
-		m.emitter()
-		close(emitterDone)
-	}()
-	go m.encryptionWorker()
-	go m.encryptionWorker()
 
 	for i := 0; i < 2; i++ {
 		select {
 		case <-started:
 		case <-time.After(time.Second):
-			t.Fatal("packets from one container did not start concurrently")
+			t.Fatal("reserved batches did not encrypt concurrently")
 		}
 	}
-	close(release)
-
-	var got [][]byte
 	select {
-	case got = <-transmitted:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for ordered transmission")
+	case seq := <-transmitted:
+		t.Fatalf("later sequence %d transmitted while the first batch was encrypting", seq)
+	default:
 	}
-	<-emitterDone
-	if len(got) != 2 || !bytes.Equal(got[0], []byte{1}) || !bytes.Equal(got[1], []byte{2}) {
-		t.Fatalf("transmission order = %v, want [[1] [2]]", got)
+	close(releaseFirst)
+	wg.Wait()
+	close(transmitted)
+
+	var got []byte
+	for seq := range transmitted {
+		got = append(got, seq)
+	}
+	if !bytes.Equal(got, []byte{1, 2}) {
+		t.Fatalf("transmission sequence order = %v, want [1 2]", got)
 	}
 }
 

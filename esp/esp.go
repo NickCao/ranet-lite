@@ -27,12 +27,9 @@ const (
 )
 
 // OutboundSA encrypts packets for the direction this client originates.
-// Seal is called concurrently by design — every peer's babel timers and
-// the mesh's outbound dispatch (see netstack.Mesh.outboundLoop) all seal
-// packets through the same OutboundSA from separate goroutines — so
-// sequence/IV assignment must be atomic, or two packets can collide on
-// the same seq/IV, which for AES-GCM breaks confidentiality and
-// authentication outright.
+// Sequence/IV assignment is atomic because Babel and the mesh may reserve
+// packets from separate goroutines. Reusing a sequence/IV with AES-GCM would
+// break confidentiality and authentication outright.
 type OutboundSA struct {
 	aead   cipher.AEAD
 	params aeadParams
@@ -42,6 +39,17 @@ type OutboundSA struct {
 	seq       atomic.Uint64 // next sequence number to use; 0 is never sent (RFC 4303 §2.2)
 	rekeyOnce sync.Once
 	onRekey   func()
+}
+
+// SequenceRange is an ordered run of sequence numbers reserved from one SA.
+// A range belongs to one worker: successive Seal calls consume its sequence
+// numbers in order, while separate ranges can perform their AEAD work in
+// parallel. Values can only be created by OutboundSA.ReserveSequenceRange, so
+// callers cannot accidentally choose or reuse a nonce.
+type SequenceRange struct {
+	sa   *OutboundSA
+	next uint64
+	end  uint64
 }
 
 // SetRekeyCallback installs a one-shot notification fired when the outbound
@@ -106,18 +114,61 @@ func NewInbound(child ChildSA, options ...InboundOption) (*InboundSA, error) {
 
 // Seal wraps one tunnel-mode IP packet (nextHeader identifies its version,
 // NextHeaderIPv4/IPv6) into a full ESP packet ready for UDP encapsulation.
-// The only part of this that needs to be serialized is sequence/IV
-// allocation (see nextSeq) — the padding and AEAD work below touch no
-// shared state, so concurrent callers each encrypt in parallel once
-// they've been handed a unique seq. Go's AEAD implementations (AES-GCM,
-// ChaCha20-Poly1305) are safe for concurrent Seal calls on the same
-// instance as long as each call uses a distinct nonce, which nextSeq
-// guarantees.
+// It is the single-packet convenience path; the data plane reserves ranges so
+// whole TUN batches can encrypt concurrently without allocating their ESP
+// sequence numbers in scheduler-dependent order.
 func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error) {
-	seq, err := o.nextSeq()
+	seq, _, err := o.reserveSequenceNumbers(1)
 	if err != nil {
 		return nil, err
 	}
+	return o.sealWithSequence(innerIPPacket, nextHeader, seq)
+}
+
+// ReserveSequenceRange atomically reserves count consecutive ESP sequence
+// numbers. Reserving is cheap and may be serialized with packet intake; the
+// returned range performs the expensive AEAD operations later and in parallel
+// with other ranges.
+func (o *OutboundSA) ReserveSequenceRange(count int) (*SequenceRange, error) {
+	first, end, err := o.reserveSequenceNumbers(count)
+	if err != nil {
+		return nil, err
+	}
+	return &SequenceRange{sa: o, next: first, end: end}, nil
+}
+
+func (o *OutboundSA) reserveSequenceNumbers(count int) (uint64, uint64, error) {
+	if count <= 0 {
+		return 0, 0, fmt.Errorf("esp: sequence range must contain at least one packet")
+	}
+	n := uint64(count)
+	end := o.seq.Add(n)
+	first := end - n + 1
+	if end >= ProactiveRekeySequence && first <= 0xffffffff && o.onRekey != nil {
+		o.rekeyOnce.Do(o.onRekey)
+	}
+	if end > 0xffffffff {
+		// No ESN: do not return even the in-range prefix of a reservation that
+		// crosses the boundary. The caller must move the whole batch to a fresh
+		// SA rather than partially transmitting it.
+		return 0, 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
+	}
+	return first, end, nil
+}
+
+// Seal consumes the next sequence number in this range and encrypts one
+// tunnel-mode packet. A SequenceRange is deliberately single-worker; parallel
+// callers should reserve separate ranges from the OutboundSA.
+func (r *SequenceRange) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error) {
+	if r == nil || r.sa == nil || r.next > r.end {
+		return nil, fmt.Errorf("esp: reserved sequence range exhausted")
+	}
+	seq := r.next
+	r.next++
+	return r.sa.sealWithSequence(innerIPPacket, nextHeader, seq)
+}
+
+func (o *OutboundSA) sealWithSequence(innerIPPacket []byte, nextHeader byte, seq uint64) ([]byte, error) {
 
 	trailerLen := 2 // pad length + next header octets
 	total := len(innerIPPacket) + trailerLen
@@ -146,21 +197,6 @@ func (o *OutboundSA) Seal(innerIPPacket []byte, nextHeader byte) ([]byte, error)
 	copy(nonce[len(o.salt):], out[headerLen:framingLen])
 	aad := out[:headerLen]
 	return o.aead.Seal(out[:framingLen], nonce, plain, aad), nil
-}
-
-// nextSeq atomically allocates the next sequence number, the only state
-// Seal needs to serialize.
-func (o *OutboundSA) nextSeq() (uint64, error) {
-	seq := o.seq.Add(1)
-	if seq >= ProactiveRekeySequence && seq <= 0xffffffff && o.onRekey != nil {
-		o.rekeyOnce.Do(o.onRekey)
-	}
-	if seq > 0xffffffff {
-		// No ESN: once the 32-bit sequence space is exhausted this SA is
-		// unusable and the session must be re-established or rekeyed.
-		return 0, fmt.Errorf("esp: sequence number space exhausted, SA must be re-established")
-	}
-	return seq, nil
 }
 
 // Open validates and decrypts one ESP packet addressed to this SA's SPI,

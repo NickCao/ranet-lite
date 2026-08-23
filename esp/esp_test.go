@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -80,6 +81,41 @@ func TestProactivePacketCountRekey(t *testing.T) {
 	}
 	if got := called.Load(); got != 1 {
 		t.Fatalf("rekey callback called %d times, want once", got)
+	}
+}
+
+func TestReservedSequenceRangesRemainContiguousWhenSealedOutOfOrder(t *testing.T) {
+	out, err := NewOutbound(testChild(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := out.ReserveSequenceRange(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := out.ReserveSequenceRange(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Complete the later worker first. Reservation order, rather than
+	// goroutine scheduling or AEAD completion order, determines sequences.
+	var got []uint32
+	for _, r := range []*SequenceRange{second, first} {
+		for range 2 {
+			packet, err := r.Seal(nil, NextHeaderIPv4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, binary.BigEndian.Uint32(packet[4:8]))
+		}
+	}
+	want := []uint32{3, 4, 1, 2}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sealed sequences = %v, want %v", got, want)
+	}
+	if _, err := first.Seal(nil, NextHeaderIPv4); err == nil {
+		t.Fatal("exhausted sequence range accepted another packet")
 	}
 }
 

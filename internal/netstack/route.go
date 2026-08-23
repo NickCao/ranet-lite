@@ -12,8 +12,20 @@ import (
 type Peer struct {
 	ID              string
 	encryptFn       func(raw []byte, nextHeader byte) ([]byte, error)
+	reserveFn       func(count int) (BatchSealer, error)
 	transmitBatchFn func(sealed [][]byte) error
+
+	reserveMu sync.Mutex
+	reserved  uint64
+	sendMu    sync.Mutex
+	sendCond  *sync.Cond
+	nextSend  uint64
 }
+
+// BatchSealer consumes a sequence range previously reserved from one outbound
+// SA. Calls are made serially by its owning worker; different BatchSealers may
+// encrypt concurrently.
+type BatchSealer func(raw []byte, nextHeader byte) ([]byte, error)
 
 func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitFn func(sealed []byte) error) *Peer {
 	return NewPeerBatched(id, encryptFn, func(sealed [][]byte) error {
@@ -26,24 +38,120 @@ func NewPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, err
 	})
 }
 
-// NewPeerBatched preserves completed TUN batches through the transport handoff.
+// NewPeerBatched constructs a compatibility peer for an encryptor that cannot
+// reserve sequence ranges. Its complete encrypt-and-send operation is ordered,
+// so it is safe but intentionally cannot encrypt multiple batches in parallel.
 func NewPeerBatched(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
-	return &Peer{ID: id, encryptFn: encryptFn, transmitBatchFn: transmitBatchFn}
+	return newPeer(id, encryptFn, nil, transmitBatchFn)
 }
 
-// SendRaw transmits a hand-built tunnel-mode IP packet directly through
-// this peer, bypassing the mesh's route table and its order-preserving
-// pipeline. Used by protocols that address a specific peer directly
-// rather than by destination IP — e.g. internal/babel, which multicasts
-// through each peer's own ESP tunnel rather than routing by the
-// (link-local, often peer-agnostic) destination address. Low volume, and
-// already strictly sequential relative to itself, so no ordering concern.
+// NewPeerReserved constructs a peer whose expensive encryption can run in
+// parallel. reserveFn is called in packet-intake order and must return a sealer
+// owning count consecutive sequence numbers from the current outbound SA.
+func NewPeerReserved(id string, reserveFn func(count int) (BatchSealer, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
+	return newPeer(id, nil, reserveFn, transmitBatchFn)
+}
+
+func newPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), reserveFn func(count int) (BatchSealer, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
+	p := &Peer{ID: id, encryptFn: encryptFn, reserveFn: reserveFn, transmitBatchFn: transmitBatchFn}
+	p.sendCond = sync.NewCond(&p.sendMu)
+	return p
+}
+
+// SendRaw transmits a hand-built tunnel-mode IP packet directly through this
+// peer. Babel uses this path; reserving and transmitting through the same Peer
+// as routed traffic keeps its ESP packet ordered with concurrently encrypted
+// TUN batches.
 func (p *Peer) SendRaw(raw []byte, nextHeader byte) error {
-	sealed, err := p.encryptFn(raw, nextHeader)
-	if err != nil {
-		return err
+	b := p.reserveBatch(1)
+	b.seal(raw, nextHeader)
+	return b.transmit()
+}
+
+type peerBatch struct {
+	peer     *Peer
+	ticket   uint64
+	reserved bool
+	sealer   BatchSealer
+	sealed   [][]byte
+	raw      [][]byte
+	headers  []byte
+	err      error
+}
+
+// reserveBatch assigns both the peer's transmission ticket and, when
+// supported, its ESP sequence range under one lock. Consequently ticket order,
+// sequence-range order, and the TUN intake order established by Mesh agree.
+func (p *Peer) reserveBatch(count int) *peerBatch {
+	p.reserveMu.Lock()
+	ticket := p.reserved
+	p.reserved++
+	b := &peerBatch{peer: p, ticket: ticket, reserved: p.reserveFn != nil}
+	if p.reserveFn != nil {
+		b.sealer, b.err = p.reserveFn(count)
 	}
-	return p.transmitBatchFn([][]byte{sealed})
+	p.reserveMu.Unlock()
+	if b.reserved {
+		b.sealed = make([][]byte, 0, count)
+	} else {
+		b.raw = make([][]byte, 0, count)
+		b.headers = make([]byte, 0, count)
+	}
+	return b
+}
+
+// seal performs AEAD immediately for a range-reserving peer. Compatibility
+// peers retain the plaintext until their ordered transmission turn, because
+// their encryptFn allocates sequence numbers as part of encryption.
+func (b *peerBatch) seal(raw []byte, nextHeader byte) {
+	if b.reserved {
+		if b.err != nil {
+			return
+		}
+		sealed, err := b.sealer(raw, nextHeader)
+		if err != nil {
+			b.err = err
+			return
+		}
+		b.sealed = append(b.sealed, sealed)
+		return
+	}
+	b.raw = append(b.raw, raw)
+	b.headers = append(b.headers, nextHeader)
+}
+
+// transmit waits only at the final ordered-send boundary. Range-reserving
+// peers have already encrypted in parallel. The compatibility path encrypts
+// here so its scheduler-dependent sequence allocation cannot overtake an
+// earlier batch.
+func (b *peerBatch) transmit() error {
+	p := b.peer
+	p.sendMu.Lock()
+	for b.ticket != p.nextSend {
+		p.sendCond.Wait()
+	}
+	defer func() {
+		p.nextSend++
+		p.sendCond.Broadcast()
+		p.sendMu.Unlock()
+	}()
+
+	if !b.reserved && b.err == nil {
+		for i, raw := range b.raw {
+			sealed, err := p.encryptFn(raw, b.headers[i])
+			if err != nil {
+				b.err = err
+				continue
+			}
+			b.sealed = append(b.sealed, sealed)
+		}
+	}
+	if len(b.sealed) != 0 {
+		if err := p.transmitBatchFn(b.sealed); err != nil && b.err == nil {
+			b.err = err
+		}
+	}
+	return b.err
 }
 
 type routeKey struct {

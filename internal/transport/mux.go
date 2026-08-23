@@ -20,8 +20,9 @@ const (
 	readBufferSize  = 65536
 	espSendBatch    = 128
 	espChanSize     = 4096
-	espOutBatchSize = 64
 )
+
+var espPackedPool = sync.Pool{New: func() any { return new([]byte) }}
 
 // Hub owns one local UDP port and routes incoming packets to registered Muxes.
 type Hub struct {
@@ -73,7 +74,7 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan []byte, espChanSize), espOut: make(chan [][]byte, espOutBatchSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan []byte, espChanSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -81,7 +82,6 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	}
 	h.muxes[m] = struct{}{}
 	h.mu.Unlock()
-	go m.sendESPLoop()
 	return m, nil
 }
 
@@ -175,7 +175,6 @@ type Mux struct {
 	endpoint   conn.Endpoint
 	ikeCh      chan ikeDatagram
 	espCh      chan []byte
-	espOut     chan [][]byte
 	done       chan struct{}
 	doneOnce   sync.Once
 	doneErr    atomic.Value
@@ -276,52 +275,41 @@ func (m *Mux) SendIKETo(b []byte, endpoint Endpoint) error {
 	return m.hub.bind.Send([][]byte{out}, endpoint)
 }
 func (m *Mux) SendESP(b []byte) error { return m.SendESPBatch([][]byte{b}) }
+
+// SendESPBatch writes directly to the shared UDP bind. The calling data-plane
+// worker retains ownership all the way through sendmmsg/UDP GSO, avoiding a
+// channel handoff and making completion the peer's ordered-send boundary.
 func (m *Mux) SendESPBatch(bufs [][]byte) error {
 	if len(bufs) == 0 {
 		return nil
 	}
 	select {
-	case m.espOut <- bufs:
-		return nil
 	case <-m.done:
 		return m.doneError()
+	default:
 	}
-}
 
-func (m *Mux) sendESPLoop() {
-	bufs := make([][]byte, 0, espSendBatch)
-	var packed []byte
-	var pendingBatch [][]byte
-	for {
-	drain:
-		for len(bufs) < espSendBatch {
-			if len(pendingBatch) == 0 {
-				if len(bufs) == 0 {
-					select {
-					case <-m.done:
-						return
-					case pendingBatch = <-m.espOut:
-					}
-				} else {
-					select {
-					case pendingBatch = <-m.espOut:
-					default:
-						break drain
-					}
-				}
-			}
-			n := min(espSendBatch-len(bufs), len(pendingBatch))
-			bufs = append(bufs, pendingBatch[:n]...)
-			pendingBatch = pendingBatch[n:]
+	packedPtr := espPackedPool.Get().(*[]byte)
+	packed := (*packedPtr)[:0]
+	defer func() {
+		*packedPtr = packed[:0]
+		espPackedPool.Put(packedPtr)
+	}()
+	endpoint := m.currentEndpoint()
+	var storage [espSendBatch][]byte
+	for len(bufs) != 0 {
+		n := min(len(bufs), len(storage))
+		batch := storage[:n]
+		copy(batch, bufs[:n])
+		if n > 1 {
+			packed = packForGSO(packed, batch)
 		}
-		if len(bufs) > 1 {
-			packed = packForGSO(packed, bufs)
+		if err := m.hub.bind.Send(batch, endpoint); err != nil {
+			return fmt.Errorf("transport: send ESP batch: %w", err)
 		}
-		if err := m.hub.bind.Send(bufs, m.currentEndpoint()); err != nil {
-			log.Printf("transport: batch send of %d packets: %v", len(bufs), err)
-		}
-		bufs = bufs[:0]
+		bufs = bufs[n:]
 	}
+	return nil
 }
 
 func packForGSO(dst []byte, bufs [][]byte) []byte {

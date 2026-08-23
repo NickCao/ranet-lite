@@ -419,20 +419,21 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		return fmt.Errorf("retiring inbound ESP SPI %08x was not installed", localSPI)
 	})
-	peer := netstack.NewPeerBatched(sessionName, func(raw []byte, nextHeader byte) ([]byte, error) {
+	peer := netstack.NewPeerReserved(sessionName, func(count int) (netstack.BatchSealer, error) {
 		saMu.RLock()
 		sa := out
 		saMu.RUnlock()
 		if sa == nil {
 			return nil, fmt.Errorf("peer has no active Child SA")
 		}
-		sealed, err := sa.Seal(raw, nextHeader)
+		sequenceRange, err := sa.ReserveSequenceRange(count)
 		if err != nil {
 			// A non-ESN SA cannot safely keep transmitting after sequence
 			// exhaustion. Tear it down so runPeer establishes fresh SAs.
 			sess.Mux().Close()
+			return nil, err
 		}
-		return sealed, err
+		return sequenceRange.Seal, nil
 	}, sess.Mux().SendESPBatch)
 	peerHandle := speaker.AddPeer(peer)
 	defer peerHandle.Close()
