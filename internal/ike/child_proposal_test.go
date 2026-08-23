@@ -79,8 +79,8 @@ func TestDecodeChildExchangePayloadsRejectsDuplicatesAndCriticalUnknowns(t *test
 	}
 }
 
-func TestDecodeChildRekeyResponseHandlesNotifyOnlyError(t *testing.T) {
-	_, err := decodeChildRekeyResponse([]RawPayload{{
+func TestDecodeChildNegotiationResponseHandlesNotifyOnlyError(t *testing.T) {
+	_, err := decodeChildNegotiationResponse([]RawPayload{{
 		Type: PayloadN,
 		Body: EncodeNotify(Notify{Type: N_TEMPORARY_FAILURE}),
 	}})

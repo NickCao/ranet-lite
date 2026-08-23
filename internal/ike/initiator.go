@@ -266,6 +266,28 @@ func (s *Session) retireChild(remoteSPI uint32) error {
 	return nil
 }
 
+func (s *Session) forgetChild(child ChildSA) error {
+	s.childMu.Lock()
+	defer s.childMu.Unlock()
+	if s.Child.LocalSPI == 0 {
+		return nil
+	}
+	if s.Child.LocalSPI != child.LocalSPI || s.Child.RemoteSPI != child.RemoteSPI {
+		return fmt.Errorf("ike: Child SA changed while handling CHILD_SA_NOT_FOUND")
+	}
+	s.handlerMu.RLock()
+	fn := s.onRetire
+	s.handlerMu.RUnlock()
+	if fn != nil {
+		if err := fn(child.LocalSPI); err != nil {
+			return err
+		}
+	}
+	s.mux.UnregisterESP(child.LocalSPI)
+	s.Child = ChildSA{}
+	return nil
+}
+
 // deleteChildren closes every locally known Child SA designated by the peer's
 // inbound SPIs and returns our paired inbound SPIs for the Delete response
 // (RFC 7296 §1.4.1). Unknown SPIs are ignored.

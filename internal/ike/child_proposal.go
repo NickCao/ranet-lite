@@ -181,17 +181,25 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 // from a peer's offer. RFC 7296 §3.3.6 requires skipping an unacceptable
 // transform while continuing with other transforms of the same type.
 func selectChildRekeyProposal(body []byte, expected ChildSA) (Proposal, Transform, uint32, error) {
+	return selectChildRequestProposal(body, &expected)
+}
+
+func selectChildRequestProposal(body []byte, expected *ChildSA) (Proposal, Transform, uint32, error) {
 	props, err := DecodeSA(body)
 	if err != nil {
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal")
 	}
-	wantBits := expected.EncrKeyBits
-	if expected.EncrID == ENCR_CHACHA20_POLY1305 {
-		wantBits = 0
-	}
-	want, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
-	if err != nil {
-		return Proposal{}, Transform{}, 0, err
+	var want *Transform
+	if expected != nil {
+		wantBits := expected.EncrKeyBits
+		if expected.EncrID == ENCR_CHACHA20_POLY1305 {
+			wantBits = 0
+		}
+		canonical, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
+		if err != nil {
+			return Proposal{}, Transform{}, 0, err
+		}
+		want = &canonical
 	}
 	for _, p := range props {
 		if p.Number == 0 || p.Protocol != ProtoESP || len(p.SPI) != 4 || binary.BigEndian.Uint32(p.SPI) == 0 {
@@ -203,7 +211,7 @@ func selectChildRekeyProposal(body []byte, expected ChildSA) (Proposal, Transfor
 			switch transform.Type {
 			case TransEncr:
 				candidate, err := canonicalEncryptionTransform(transform)
-				if err == nil && !haveEncryption && candidate.ID == want.ID && candidate.KeyLengthBits == want.KeyLengthBits {
+				if err == nil && !haveEncryption && childEncryptionAccepted(candidate, want) {
 					encryption = candidate
 					haveEncryption = true
 				}
@@ -220,4 +228,20 @@ func selectChildRekeyProposal(body []byte, expected ChildSA) (Proposal, Transfor
 		}
 	}
 	return Proposal{}, Transform{}, 0, fmt.Errorf("ike: no acceptable Child SA proposal")
+}
+
+func childEncryptionAccepted(candidate Transform, expected *Transform) bool {
+	if expected != nil {
+		return candidate.ID == expected.ID && candidate.KeyLengthBits == expected.KeyLengthBits
+	}
+	for _, offered := range espProposal(nil).Transforms {
+		if offered.Type != TransEncr {
+			continue
+		}
+		supported, err := canonicalEncryptionTransform(offered)
+		if err == nil && candidate.ID == supported.ID && candidate.KeyLengthBits == supported.KeyLengthBits {
+			return true
+		}
+	}
+	return false
 }

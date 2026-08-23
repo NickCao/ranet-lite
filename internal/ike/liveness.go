@@ -552,32 +552,36 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 			rekey = notify
 		}
 	}
-	// A CREATE_CHILD_SA request without REKEY_SA asks to create an additional
-	// Child SA. This single-Child-SA implementation rejects it with the error
-	// required by RFC 7815 §2.2 and described by RFC 7296 §1.3.
-	if rekey.Type != N_REKEY_SA {
+	child := s.currentChild()
+	if rekey.Type != N_REKEY_SA && (child.LocalSPI != 0 || child.RemoteSPI != 0) {
+		// Without REKEY_SA this requests a new Child SA. Reject it as an
+		// additional SA only while this single-SA profile already has one;
+		// after state loss, RFC 7296 §2.25 expects creation from scratch.
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS)
-	}
-	if s.childRekeying.Load() {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
-	}
-	if rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
 	payloads, err := decodeChildExchangePayloads(inner)
 	if err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
-	child := s.currentChild()
-	if binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
-		// RFC 7296 §2.25 requires CHILD_SA_NOT_FOUND to identify the
-		// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
-		return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
+	var expected *ChildSA
+	if rekey.Type == N_REKEY_SA {
+		if s.childRekeying.Load() {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+		}
+		if rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
+		if child.LocalSPI == 0 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
+			// RFC 7296 §2.25 requires CHILD_SA_NOT_FOUND to identify the
+			// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
+			return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
+		}
+		expected = &child
 	}
 	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
-	p, encr, remoteSPI, err := selectChildRekeyProposal(payloads.sa.Body, child)
+	p, encr, remoteSPI, err := selectChildRequestProposal(payloads.sa.Body, expected)
 	if err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}

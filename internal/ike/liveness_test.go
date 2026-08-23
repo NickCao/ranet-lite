@@ -369,6 +369,50 @@ func TestChildRequestRejectionNotifications(t *testing.T) {
 	}
 }
 
+func TestChildRequestCreatesMissingChild(t *testing.T) {
+	mux, _ := lifecycleMuxes(t)
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ikeCtx := &ikeContext{
+		suite: suite,
+		spiI:  0x0102030405060708,
+		spiR:  0x1112131415161718,
+		skei:  make([]byte, 20),
+		sker:  make([]byte, 20),
+		skD:   []byte("test child creation SK_d material"),
+	}
+	s := &Session{mux: mux, current: ikeCtx}
+	remoteSPI := make([]byte, 4)
+	binary.BigEndian.PutUint32(remoteSPI, 0x50607080)
+	request := []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{
+			Number: 1, Protocol: ProtoESP, SPI: remoteSPI,
+			Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}},
+		}})},
+		{Type: PayloadNonce, Body: EncodeNonce(make([]byte, 32))},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	}
+	response, err := s.handleChildRekey(ikeCtx, 1, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeMessage(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ikeCtx.skei, response, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeChildExchangePayloads(inner); err != nil {
+		t.Fatalf("invalid Child SA creation response: %v", err)
+	}
+	child := s.currentChild()
+	if child.LocalSPI == 0 || child.RemoteSPI != 0x50607080 || len(child.InboundKey) == 0 || len(child.OutboundKey) == 0 {
+		t.Fatalf("created Child SA = %#v", child)
+	}
+}
+
 func TestInformationalDeletesEveryDesignatedChildSA(t *testing.T) {
 	mux, other := lifecycleMuxes(t)
 	current := ChildSA{LocalSPI: 0x10203040, RemoteSPI: 0x50607080}
