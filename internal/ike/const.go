@@ -53,6 +53,7 @@ type ProtocolID uint8
 
 const (
 	ProtoIKE ProtocolID = 1
+	ProtoAH  ProtocolID = 2
 	ProtoESP ProtocolID = 3
 )
 

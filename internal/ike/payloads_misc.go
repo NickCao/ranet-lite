@@ -88,11 +88,26 @@ func DecodeDelete(body []byte) (Delete, error) {
 	if len(body) < 4 {
 		return Delete{}, fmt.Errorf("ike: short delete payload")
 	}
+	protocol := ProtocolID(body[0])
 	spiSize, count := int(body[1]), int(binary.BigEndian.Uint16(body[2:4]))
+	// RFC 7296 §3.11 fixes the SPI size at zero for IKE and four octets for
+	// AH or ESP; an IKE Delete also has no SPI entries.
+	switch protocol {
+	case ProtoIKE:
+		if spiSize != 0 || count != 0 {
+			return Delete{}, fmt.Errorf("ike: IKE delete payload contains SPIs")
+		}
+	case ProtoAH, ProtoESP:
+		if spiSize != 4 {
+			return Delete{}, fmt.Errorf("ike: Child SA delete SPI size is %d, want 4", spiSize)
+		}
+	default:
+		return Delete{}, fmt.Errorf("ike: invalid delete protocol %d", protocol)
+	}
 	if len(body) != 4+spiSize*count {
 		return Delete{}, fmt.Errorf("ike: invalid delete payload length")
 	}
-	d := Delete{Protocol: ProtocolID(body[0])}
+	d := Delete{Protocol: protocol}
 	for rest := body[4:]; len(rest) > 0; rest = rest[spiSize:] {
 		d.SPIs = append(d.SPIs, append([]byte(nil), rest[:spiSize]...))
 	}

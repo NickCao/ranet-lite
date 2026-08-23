@@ -447,6 +447,7 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 		}
 	}
 	if hdr.ExchangeType == INFORMATIONAL {
+		var deletes []Delete
 		for _, p := range inner {
 			if p.Type != PayloadD {
 				continue
@@ -459,6 +460,7 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				}
 				return response, err
 			}
+			deletes = append(deletes, d)
 			if d.Protocol == ProtoIKE {
 				response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
 				if err != nil {
@@ -470,33 +472,31 @@ func (s *Session) handleRequest(ctx *ikeContext, hdr *Header, inner []RawPayload
 				}
 				return response, fmt.Errorf("peer deleted IKE SA")
 			}
-			child := s.currentChild()
-			retiring := s.retiringChild()
-			for _, spi := range d.SPIs {
-				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == child.RemoteSPI {
-					local := make([]byte, 4)
-					binary.BigEndian.PutUint32(local, child.LocalSPI)
-					response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
-					if err != nil {
-						return nil, err
-					}
-					return response, fmt.Errorf("peer deleted Child SA")
-				}
-				if d.Protocol == ProtoESP && len(spi) == 4 && binary.BigEndian.Uint32(spi) == retiring.RemoteSPI {
-					local := make([]byte, 4)
-					binary.BigEndian.PutUint32(local, retiring.LocalSPI)
-					response, err := s.response(ctx, hdr.MessageID, INFORMATIONAL, []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{local}})}})
-					if err != nil {
-						return nil, err
-					}
-					if err := s.retireChild(retiring.RemoteSPI); err != nil {
-						return nil, err
-					}
-					return response, nil
-				}
+		}
+		var responseSPIs [][]byte
+		for _, d := range deletes {
+			if d.Protocol != ProtoESP {
+				continue
+			}
+			remoteSPIs := make([]uint32, len(d.SPIs))
+			for i, spi := range d.SPIs {
+				remoteSPIs[i] = binary.BigEndian.Uint32(spi)
+			}
+			localSPIs, err := s.deleteChildren(remoteSPIs)
+			if err != nil {
+				return nil, err
+			}
+			for _, localSPI := range localSPIs {
+				spi := make([]byte, 4)
+				binary.BigEndian.PutUint32(spi, localSPI)
+				responseSPIs = append(responseSPIs, spi)
 			}
 		}
-		return s.response(ctx, hdr.MessageID, INFORMATIONAL, nil)
+		var responsePayloads []RawPayload
+		if len(responseSPIs) > 0 {
+			responsePayloads = []RawPayload{{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: responseSPIs})}}
+		}
+		return s.response(ctx, hdr.MessageID, INFORMATIONAL, responsePayloads)
 	}
 	if hdr.ExchangeType == CREATE_CHILD_SA {
 		if sa := findType(inner, PayloadSA); sa != nil {

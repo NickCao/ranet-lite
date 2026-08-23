@@ -27,6 +27,25 @@ func TestDecodeDeleteRejectsTruncatedSPI(t *testing.T) {
 	}
 }
 
+func TestDecodeDeleteEnforcesProtocolSPISize(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body []byte
+	}{
+		{"IKE SPI", []byte{byte(ProtoIKE), 4, 0, 1, 0, 0, 0, 1}},
+		{"IKE count", []byte{byte(ProtoIKE), 0, 0, 1}},
+		{"ESP size", []byte{byte(ProtoESP), 0, 0, 0}},
+		{"AH size", []byte{byte(ProtoAH), 8, 0, 0}},
+		{"protocol", []byte{99, 4, 0, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := DecodeDelete(test.body); err == nil {
+				t.Fatal("DecodeDelete accepted invalid Delete payload")
+			}
+		})
+	}
+}
+
 func TestDecodeTSRejectsUndersizedSelector(t *testing.T) {
 	body := []byte{1, 0, 0, 0, 7, 0, 0, 7, 0, 0, 0}
 	if _, err := DecodeTS(body); err == nil {

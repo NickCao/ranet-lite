@@ -386,6 +386,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		sa  *esp.InboundSA
 	}
 	inbound := []inboundSA{{spi: sess.Child.LocalSPI, sa: in}}
+	outboundSPI := sess.Child.LocalSPI
 	sess.SetChildHandler(func(child ike.ChildSA) error {
 		newOut, err := esp.NewOutbound(child)
 		if err != nil {
@@ -398,6 +399,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		saMu.Lock()
 		out, in = newOut, newIn
+		outboundSPI = child.LocalSPI
 		inbound = append([]inboundSA{{spi: child.LocalSPI, sa: in}}, inbound...)
 		saMu.Unlock()
 		return nil
@@ -408,6 +410,10 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		for i := range inbound {
 			if inbound[i].spi == localSPI {
 				inbound = append(inbound[:i], inbound[i+1:]...)
+				if outboundSPI == localSPI {
+					out = nil
+					outboundSPI = 0
+				}
 				return nil
 			}
 		}
@@ -417,6 +423,9 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		saMu.RLock()
 		sa := out
 		saMu.RUnlock()
+		if sa == nil {
+			return nil, fmt.Errorf("peer has no active Child SA")
+		}
 		sealed, err := sa.Seal(raw, nextHeader)
 		if err != nil {
 			// A non-ESN SA cannot safely keep transmitting after sequence

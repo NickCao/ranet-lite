@@ -292,6 +292,77 @@ func TestChildRequestRejectionNotifications(t *testing.T) {
 	}
 }
 
+func TestInformationalDeletesEveryDesignatedChildSA(t *testing.T) {
+	mux, other := lifecycleMuxes(t)
+	current := ChildSA{LocalSPI: 0x10203040, RemoteSPI: 0x50607080}
+	retiring := ChildSA{LocalSPI: 0x90a0b0c0, RemoteSPI: 0xd0e0f000}
+	if err := mux.RegisterESP(current.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+	if err := mux.RegisterESP(retiring.LocalSPI); err != nil {
+		t.Fatal(err)
+	}
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ikeCtx := &ikeContext{
+		suite: suite,
+		spiI:  0x0102030405060708,
+		spiR:  0x1112131415161718,
+		skei:  make([]byte, 20),
+		sker:  make([]byte, 20),
+	}
+	s := &Session{mux: mux, current: ikeCtx, Child: current, retiring: retiring}
+	var retired []uint32
+	s.SetChildRetireHandler(func(localSPI uint32) error {
+		retired = append(retired, localSPI)
+		return nil
+	})
+	spi := func(value uint32) []byte {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, value)
+		return b
+	}
+	response, err := s.handleRequest(ikeCtx, &Header{ExchangeType: INFORMATIONAL, MessageID: 4}, []RawPayload{
+		{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{spi(current.RemoteSPI), spi(0xdeadbeef)}})},
+		{Type: PayloadD, Body: EncodeDelete(Delete{Protocol: ProtoESP, SPIs: [][]byte{spi(retiring.RemoteSPI)}})},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeMessage(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ikeCtx.skei, response, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inner) != 1 || inner[0].Type != PayloadD {
+		t.Fatalf("Delete response payloads = %#v", inner)
+	}
+	deleted, err := DecodeDelete(inner[0].Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Protocol != ProtoESP || len(deleted.SPIs) != 2 || binary.BigEndian.Uint32(deleted.SPIs[0]) != current.LocalSPI || binary.BigEndian.Uint32(deleted.SPIs[1]) != retiring.LocalSPI {
+		t.Fatalf("Delete response = %#v", deleted)
+	}
+	if len(retired) != 2 || retired[0] != current.LocalSPI || retired[1] != retiring.LocalSPI {
+		t.Fatalf("retired SPIs = %08x", retired)
+	}
+	if got := s.currentChild(); got.LocalSPI != 0 || got.RemoteSPI != 0 {
+		t.Fatalf("current Child SA remains: %#v", got)
+	}
+	if got := s.retiringChild(); got.LocalSPI != 0 || got.RemoteSPI != 0 {
+		t.Fatalf("retiring Child SA remains: %#v", got)
+	}
+	if err := other.RegisterESP(current.LocalSPI); err != nil {
+		t.Fatalf("current inbound SPI remains registered: %v", err)
+	}
+	if err := other.RegisterESP(retiring.LocalSPI); err != nil {
+		t.Fatalf("retiring inbound SPI remains registered: %v", err)
+	}
+}
+
 func TestInitialResponseHeaderValidation(t *testing.T) {
 	req := &Header{SPIInitiator: 1, SPIResponder: 0, ExchangeType: IKE_SA_INIT, Flags: FlagInitiator, MessageID: 0}
 	valid := &Header{SPIInitiator: 1, SPIResponder: 2, MajorVersion: 2, ExchangeType: IKE_SA_INIT, Flags: FlagResponse, MessageID: 0, Length: HeaderLen}

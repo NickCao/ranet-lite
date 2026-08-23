@@ -200,8 +200,8 @@ func (s *Session) SetChildHandler(fn func(ChildSA) error) {
 	s.handlerMu.Unlock()
 }
 
-// SetChildRetireHandler removes an old inbound ESP SA after its paired Delete
-// exchange completes.
+// SetChildRetireHandler removes an inbound ESP SA when its paired Child SA is
+// deleted, either after a local rekey or at the peer's request.
 func (s *Session) SetChildRetireHandler(fn func(uint32) error) {
 	s.handlerMu.Lock()
 	s.onRetire = fn
@@ -264,6 +264,38 @@ func (s *Session) retireChild(remoteSPI uint32) error {
 	s.mux.UnregisterESP(retiring.LocalSPI)
 	s.retiring = ChildSA{}
 	return nil
+}
+
+// deleteChildren closes every locally known Child SA designated by the peer's
+// inbound SPIs and returns our paired inbound SPIs for the Delete response
+// (RFC 7296 §1.4.1). Unknown SPIs are ignored.
+func (s *Session) deleteChildren(remoteSPIs []uint32) ([]uint32, error) {
+	s.childMu.Lock()
+	defer s.childMu.Unlock()
+	localSPIs := make([]uint32, 0, len(remoteSPIs))
+	for _, remoteSPI := range remoteSPIs {
+		var child *ChildSA
+		switch {
+		case s.Child.LocalSPI != 0 && s.Child.RemoteSPI == remoteSPI:
+			child = &s.Child
+		case s.retiring.LocalSPI != 0 && s.retiring.RemoteSPI == remoteSPI:
+			child = &s.retiring
+		default:
+			continue
+		}
+		s.handlerMu.RLock()
+		fn := s.onRetire
+		s.handlerMu.RUnlock()
+		if fn != nil {
+			if err := fn(child.LocalSPI); err != nil {
+				return nil, err
+			}
+		}
+		s.mux.UnregisterESP(child.LocalSPI)
+		localSPIs = append(localSPIs, child.LocalSPI)
+		*child = ChildSA{}
+	}
+	return localSPIs, nil
 }
 
 // NoteTraffic records successfully authenticated ESP traffic for the DPD
