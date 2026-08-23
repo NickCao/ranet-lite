@@ -220,6 +220,83 @@ func TestReplayedRequestDoesNotRefreshOrAdoptEndpoint(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedMalformedRequestGetsInvalidSyntax(t *testing.T) {
+	peer := listenPeer(t)
+	peerAddr := peer.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", peerAddr.IP, peerAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ikeCtx := &ikeContext{
+		suite: suite,
+		spiI:  spiI,
+		spiR:  spiR,
+		skei:  make([]byte, 20),
+		sker:  make([]byte, 20),
+	}
+	s := &Session{mux: mux, current: ikeCtx}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+
+	// The authenticated plaintext contains a generic payload whose declared
+	// length is shorter than its four-byte header, followed by zero padding.
+	request, err := encryptMessagePlaintextIV(suite, ikeCtx.sker, Header{
+		SPIInitiator: spiI,
+		SPIResponder: spiR,
+		ExchangeType: INFORMATIONAL,
+		MessageID:    0,
+	}, nil, PayloadN, []byte{0, 0, 0, 3, 0}, make([]byte, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: mux.LocalAddr().(*net.UDPAddr).Port}
+	if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
+		t.Fatal(err)
+	}
+	raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending *pendingRequest
+	if !s.dispatch(raw, source, &pending) {
+		t.Fatal("authenticated malformed request was not handled")
+	}
+
+	buf := make([]byte, 2048)
+	if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := peer.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseRaw := buf[4:n]
+	response, err := DecodeMessage(responseRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := DecryptMessage(suite, ikeCtx.skei, responseRaw, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inner) != 1 || inner[0].Type != PayloadN {
+		t.Fatalf("response payloads = %#v, want INVALID_SYNTAX", inner)
+	}
+	notify, err := DecodeNotify(inner[0].Body)
+	if err != nil || notify.Type != N_INVALID_SYNTAX {
+		t.Fatalf("response notify = %#v, %v", notify, err)
+	}
+	if !mux.IsClosed() {
+		t.Fatal("IKE SA remained open after fatal INVALID_SYNTAX")
+	}
+}
+
 func TestChildRequestRejectionNotifications(t *testing.T) {
 	const unknownSPI = 0x10203040
 	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}

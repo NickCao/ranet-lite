@@ -30,6 +30,16 @@ func (c *ikeContext) encrypt(key []byte, hdr Header, cleartext, inner []RawPaylo
 }
 
 func encryptMessageIV(suite SASuite, key []byte, hdr Header, cleartext, inner []RawPayload, iv []byte) ([]byte, error) {
+	plain := encodePayloadChain(inner)
+	plain = append(plain, 0) // zero-length padding + the pad-length octet itself
+	innerFirst := PayloadNone
+	if len(inner) > 0 {
+		innerFirst = inner[0].Type
+	}
+	return encryptMessagePlaintextIV(suite, key, hdr, cleartext, innerFirst, plain, iv)
+}
+
+func encryptMessagePlaintextIV(suite SASuite, key []byte, hdr Header, cleartext []RawPayload, innerFirst PayloadType, plain, iv []byte) ([]byte, error) {
 	ap, err := aeadParams(suite.EncrID, suite.EncrKeyBits)
 	if err != nil {
 		return nil, err
@@ -48,15 +58,8 @@ func encryptMessageIV(suite SASuite, key []byte, hdr Header, cleartext, inner []
 	}
 	nonce := append(append([]byte{}, salt...), iv...)
 
-	plain := encodePayloadChain(inner)
-	plain = append(plain, 0) // zero-length padding + the pad-length octet itself
-
 	cleartextBytes := encodePayloadChain(cleartext)
 
-	innerFirst := PayloadNone
-	if len(inner) > 0 {
-		innerFirst = inner[0].Type
-	}
 	skHdr := make([]byte, genericPayloadHeaderLen)
 	skHdr[0] = byte(innerFirst)
 	ciphertextLen := len(plain) + ap.ICVLen
@@ -88,23 +91,35 @@ func encryptMessageIV(suite SASuite, key []byte, hdr Header, cleartext, inner []
 // exact bytes passed to DecodeMessage. key is SK_ei or SK_er depending on
 // which side sent the message.
 func DecryptMessage(suite SASuite, key []byte, raw []byte, m *Message) ([]RawPayload, error) {
+	innerFirst, plain, err := decryptMessagePlaintext(suite, key, raw, m)
+	if err != nil {
+		return nil, err
+	}
+	return decodeMessagePlaintext(innerFirst, plain)
+}
+
+// decryptMessagePlaintext returns only after the SK payload's AEAD tag has
+// authenticated. Keeping plaintext parsing separate lets post-handshake
+// request handling distinguish unauthenticated packets from authenticated
+// INVALID_SYNTAX errors as required by RFC 7296 §2.21.3.
+func decryptMessagePlaintext(suite SASuite, key []byte, raw []byte, m *Message) (PayloadType, []byte, error) {
 	sk := m.find(PayloadSK)
 	if sk == nil {
-		return nil, fmt.Errorf("ike: message has no SK payload")
+		return PayloadNone, nil, fmt.Errorf("ike: message has no SK payload")
 	}
 	ap, err := aeadParams(suite.EncrID, suite.EncrKeyBits)
 	if err != nil {
-		return nil, err
+		return PayloadNone, nil, err
 	}
 	if len(key) != ap.KeyLen+ap.SaltLen {
-		return nil, fmt.Errorf("ike: key length %d does not match suite (want %d)", len(key), ap.KeyLen+ap.SaltLen)
+		return PayloadNone, nil, fmt.Errorf("ike: key length %d does not match suite (want %d)", len(key), ap.KeyLen+ap.SaltLen)
 	}
 	if len(sk.Body) < ap.IVLen+ap.ICVLen {
-		return nil, fmt.Errorf("ike: SK payload too short")
+		return PayloadNone, nil, fmt.Errorf("ike: SK payload too short")
 	}
 	aead, err := newAEAD(suite.EncrID, key[:ap.KeyLen])
 	if err != nil {
-		return nil, err
+		return PayloadNone, nil, err
 	}
 	salt := key[ap.KeyLen:]
 	iv := sk.Body[:ap.IVLen]
@@ -114,8 +129,13 @@ func DecryptMessage(suite SASuite, key []byte, raw []byte, m *Message) ([]RawPay
 	aad := raw[:m.skHeaderOffset+genericPayloadHeaderLen]
 	plain, err := aead.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
-		return nil, fmt.Errorf("ike: SK payload authentication failed: %w", err)
+		return PayloadNone, nil, fmt.Errorf("ike: SK payload authentication failed: %w", err)
 	}
+	skGenericHeader := raw[m.skHeaderOffset : m.skHeaderOffset+genericPayloadHeaderLen]
+	return PayloadType(skGenericHeader[0]), plain, nil
+}
+
+func decodeMessagePlaintext(innerFirst PayloadType, plain []byte) ([]RawPayload, error) {
 	if len(plain) == 0 {
 		return nil, fmt.Errorf("ike: empty SK plaintext")
 	}
@@ -125,9 +145,5 @@ func DecryptMessage(suite SASuite, key []byte, raw []byte, m *Message) ([]RawPay
 	}
 	inner := plain[:len(plain)-1-padLen]
 
-	// Next Payload of the SK's generic header (captured at decode time)
-	// tells us the type of the first inner payload.
-	skGenericHeader := raw[m.skHeaderOffset : m.skHeaderOffset+genericPayloadHeaderLen]
-	innerFirst := PayloadType(skGenericHeader[0])
 	return decodePayloadChain(innerFirst, inner)
 }

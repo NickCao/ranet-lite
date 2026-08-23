@@ -378,33 +378,48 @@ func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pend
 	if err != nil {
 		return false
 	}
-	inner, err := DecryptMessage(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
+	innerFirst, plaintext, err := decryptMessagePlaintext(ctx.suite, ctx.peerEncryptionKey(), raw, outer)
 	if err != nil {
 		return false
+	}
+	if matching == nil {
+		s.stateMu.RLock()
+		nextPeerMID := ctx.nextPeerMID
+		lastPeerResponseID := ctx.lastPeerResponseID
+		lastPeerResponse := ctx.lastPeerResponse
+		s.stateMu.RUnlock()
+		if hdr.MessageID != nextPeerMID {
+			if nextPeerMID > 0 && hdr.MessageID == nextPeerMID-1 && lastPeerResponseID == hdr.MessageID {
+				if err := s.mux.SendIKETo(lastPeerResponse, source); err != nil {
+					s.mux.Close()
+				}
+			}
+			return false
+		}
+		// Authentication and a fresh Message ID prove this request came from
+		// the live peer rather than being a replay. Only now may it update the
+		// endpoint used for future IKE and ESP traffic after NAT port rebinding
+		// (RFC 7296 §2.4 and §2.23).
+		s.mux.AdoptEndpoint(source)
+	}
+	inner, err := decodeMessagePlaintext(innerFirst, plaintext)
+	if err != nil {
+		if matching != nil {
+			matching.result <- requestResult{err: fmt.Errorf("ike: malformed authenticated response: %w", err)}
+			*pending = nil
+		} else if response, responseErr := s.responseNotify(ctx, hdr.MessageID, hdr.ExchangeType, N_INVALID_SYNTAX); responseErr == nil {
+			_ = s.mux.SendIKETo(response, source)
+		}
+		// RFC 7296 §2.21.3 makes authenticated INVALID_SYNTAX fatal to the
+		// IKE SA. Responses never generate a further error response.
+		s.mux.Close()
+		return true
 	}
 	if matching != nil {
 		matching.result <- requestResult{inner: inner}
 		*pending = nil
 		return true
 	}
-	s.stateMu.RLock()
-	nextPeerMID := ctx.nextPeerMID
-	lastPeerResponseID := ctx.lastPeerResponseID
-	lastPeerResponse := ctx.lastPeerResponse
-	s.stateMu.RUnlock()
-	if hdr.MessageID != nextPeerMID {
-		if nextPeerMID > 0 && hdr.MessageID == nextPeerMID-1 && lastPeerResponseID == hdr.MessageID {
-			if err := s.mux.SendIKETo(lastPeerResponse, source); err != nil {
-				s.mux.Close()
-			}
-		}
-		return false
-	}
-	// Authentication and a fresh Message ID prove this request came from the
-	// live peer rather than being a replay. Only now may it update the endpoint
-	// used for future IKE and ESP traffic after NAT port rebinding (RFC 7296
-	// §2.4 and §2.23).
-	s.mux.AdoptEndpoint(source)
 	response, err := s.handleRequest(ctx, hdr, inner)
 	if err != nil {
 		if response != nil {
