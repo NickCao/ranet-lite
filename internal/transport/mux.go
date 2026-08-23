@@ -19,7 +19,11 @@ const (
 	nonESPMarkerLen = 4
 	readBufferSize  = 65536
 	espSendBatch    = 128
-	espChanSize     = 4096
+	// espChanSize absorbs receive bursts before a peer's workers can drain
+	// them. Some backends return only one or two datagrams per kernel batch,
+	// so this remains sized by observed burst count even though each channel
+	// element now carries a whole batch.
+	espChanSize = 4096
 )
 
 var espPackedPool = sync.Pool{New: func() any { return new([]byte) }}
@@ -74,7 +78,7 @@ func (h *Hub) NewMux(remoteIP net.IP, remotePort int) (*Mux, error) {
 	if err != nil {
 		return nil, fmt.Errorf("transport: parse remote endpoint: %w", err)
 	}
-	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan []byte, espChanSize), done: make(chan struct{})}
+	m := &Mux{hub: h, endpoint: endpoint, ikeCh: make(chan ikeDatagram, 16), espCh: make(chan [][]byte, espChanSize), done: make(chan struct{})}
 	h.mu.Lock()
 	if h.closed.Load() {
 		h.mu.Unlock()
@@ -120,6 +124,12 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 	for i := range bufs {
 		bufs[i] = make([]byte, readBufferSize)
 	}
+	type pendingIKE struct {
+		mux      *Mux
+		datagram ikeDatagram
+	}
+	espBatches := make(map[*Mux][][]byte)
+	ikeDatagrams := make([]pendingIKE, 0, batch)
 	for {
 		n, err := fn(bufs, sizes, eps)
 		if err != nil {
@@ -130,39 +140,47 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 			}
 			return
 		}
+		clear(espBatches)
+		ikeDatagrams = ikeDatagrams[:0]
+		h.mu.Lock()
 		for i := 0; i < n; i++ {
 			raw := bufs[i][:sizes[i]]
 			if len(raw) < nonESPMarkerLen {
 				continue
 			}
-			var m *Mux
-			var pkt []byte
-			h.mu.Lock()
 			if raw[0]|raw[1]|raw[2]|raw[3] == 0 {
 				if len(raw) >= nonESPMarkerLen+8 {
 					spi := uint64(raw[4])<<56 | uint64(raw[5])<<48 | uint64(raw[6])<<40 | uint64(raw[7])<<32 | uint64(raw[8])<<24 | uint64(raw[9])<<16 | uint64(raw[10])<<8 | uint64(raw[11])
-					m, pkt = h.ike[spi], append([]byte(nil), raw[nonESPMarkerLen:]...)
+					if m := h.ike[spi]; m != nil {
+						ikeDatagrams = append(ikeDatagrams, pendingIKE{
+							mux: m,
+							datagram: ikeDatagram{
+								raw:      append([]byte(nil), raw[nonESPMarkerLen:]...),
+								endpoint: eps[i],
+							},
+						})
+					}
 				}
 			} else {
 				spi := uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
-				m, pkt = h.esp[spi], append([]byte(nil), raw...)
-			}
-			h.mu.Unlock()
-			if m == nil {
-				continue
-			}
-			if len(pkt) >= nonESPMarkerLen && raw[0]|raw[1]|raw[2]|raw[3] == 0 {
-				select {
-				case m.ikeCh <- ikeDatagram{raw: pkt, endpoint: eps[i]}:
-				default:
-					log.Printf("transport: ikeCh full, dropping IKE message")
+				if m := h.esp[spi]; m != nil {
+					espBatches[m] = append(espBatches[m], append([]byte(nil), raw...))
 				}
-			} else {
-				select {
-				case m.espCh <- pkt:
-				default:
-					log.Printf("transport: espCh full, dropping ESP packet")
-				}
+			}
+		}
+		h.mu.Unlock()
+		for _, pending := range ikeDatagrams {
+			select {
+			case pending.mux.ikeCh <- pending.datagram:
+			default:
+				log.Printf("transport: ikeCh full, dropping IKE message")
+			}
+		}
+		for m, packets := range espBatches {
+			select {
+			case m.espCh <- packets:
+			default:
+				log.Printf("transport: espCh full, dropping %d ESP packets", len(packets))
 			}
 		}
 	}
@@ -174,7 +192,9 @@ type Mux struct {
 	endpointMu sync.RWMutex
 	endpoint   conn.Endpoint
 	ikeCh      chan ikeDatagram
-	espCh      chan []byte
+	espRecvMu  sync.Mutex
+	espCh      chan [][]byte
+	espPending [][]byte
 	done       chan struct{}
 	doneOnce   sync.Once
 	doneErr    atomic.Value
@@ -357,12 +377,18 @@ func (m *Mux) RecvIKEFromUntil(deadline time.Time) ([]byte, Endpoint, error) {
 	}
 }
 func (m *Mux) RecvESP() ([]byte, error) {
-	select {
-	case b := <-m.espCh:
-		return b, nil
-	case <-m.done:
-		return nil, m.doneError()
+	m.espRecvMu.Lock()
+	defer m.espRecvMu.Unlock()
+	if len(m.espPending) == 0 {
+		select {
+		case m.espPending = <-m.espCh:
+		case <-m.done:
+			return nil, m.doneError()
+		}
 	}
+	b := m.espPending[0]
+	m.espPending = m.espPending[1:]
+	return b, nil
 }
 
 // RecvESPBatch blocks for one ESP packet, then drains immediately available
@@ -370,39 +396,53 @@ func (m *Mux) RecvESP() ([]byte, error) {
 // batch capacity. Keeping the receive batch intact lets callers amortize
 // decrypt-pipeline and TUN write overhead without delaying a lone packet.
 func (m *Mux) RecvESPBatch(dst [][]byte) ([][]byte, error) {
+	m.espRecvMu.Lock()
+	defer m.espRecvMu.Unlock()
 	if cap(dst) == 0 {
 		dst = make([][]byte, 0, espSendBatch)
 	} else {
 		dst = dst[:0]
 	}
-	select {
-	case b := <-m.espCh:
-		dst = append(dst, b)
-	case <-m.done:
-		return nil, m.doneError()
-	}
 	for len(dst) < cap(dst) {
-		select {
-		case b := <-m.espCh:
-			dst = append(dst, b)
-		case <-m.done:
-			return dst, nil
-		default:
-			return dst, nil
+		if len(m.espPending) == 0 {
+			if len(dst) == 0 {
+				select {
+				case m.espPending = <-m.espCh:
+				case <-m.done:
+					return nil, m.doneError()
+				}
+			} else {
+				select {
+				case m.espPending = <-m.espCh:
+				case <-m.done:
+					return dst, nil
+				default:
+					return dst, nil
+				}
+			}
 		}
+		n := min(cap(dst)-len(dst), len(m.espPending))
+		dst = append(dst, m.espPending[:n]...)
+		m.espPending = m.espPending[n:]
 	}
 	return dst, nil
 }
 
 func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
-	select {
-	case b := <-m.espCh:
-		return b, nil
-	case <-m.done:
-		return nil, m.doneError()
-	case <-time.After(time.Until(deadline)):
-		return nil, errTimeout
+	m.espRecvMu.Lock()
+	defer m.espRecvMu.Unlock()
+	if len(m.espPending) == 0 {
+		select {
+		case m.espPending = <-m.espCh:
+		case <-m.done:
+			return nil, m.doneError()
+		case <-time.After(time.Until(deadline)):
+			return nil, errTimeout
+		}
 	}
+	b := m.espPending[0]
+	m.espPending = m.espPending[1:]
+	return b, nil
 }
 
 var errTimeout = fmt.Errorf("transport: receive timeout")

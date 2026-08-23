@@ -255,6 +255,70 @@ func TestReplayRejected(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedPacketsCommitInReceiveOrder(t *testing.T) {
+	child := testChild(t)
+	out, err := NewOutbound(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewInbound(ChildSA{
+		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := make([][]byte, 64)
+	for i := range packets {
+		packets[i], err = out.Seal([]byte{byte(i)}, NextHeaderIPv4)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Model a later worker completing first. Authentication alone must not
+	// advance the replay window far enough to reject the earlier batch.
+	later, err := in.Authenticate(packets[len(packets)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlier, err := in.Authenticate(packets[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := earlier.Commit(); err != nil {
+		t.Fatalf("commit earlier packet: %v", err)
+	}
+	if _, _, err := later.Commit(); err != nil {
+		t.Fatalf("commit later packet: %v", err)
+	}
+}
+
+func TestAuthenticatedPacketCommitRejectsReplay(t *testing.T) {
+	child := testChild(t)
+	out, _ := NewOutbound(child)
+	in, _ := NewInbound(ChildSA{
+		EncrID: child.EncrID, EncrKeyBits: child.EncrKeyBits,
+		LocalSPI: child.RemoteSPI, InboundKey: child.OutboundKey,
+	})
+	packet, _ := out.Seal([]byte("one"), NextHeaderIPv4)
+	first, err := in.Authenticate(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := in.Authenticate(packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := first.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := duplicate.Commit(); err == nil {
+		t.Fatal("second commit of an authenticated replay succeeded")
+	}
+}
+
 // TestReplayWindowWideReordering exercises the multi-word bitmap directly
 // (bypassing real ESP/AEAD): sequences arriving thousands of positions out
 // of order, as observed in practice under highly parallel real-world

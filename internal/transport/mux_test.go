@@ -121,10 +121,9 @@ func TestHubFailureIsTerminal(t *testing.T) {
 }
 
 func TestRecvESPBatchDrainsToDestinationCapacity(t *testing.T) {
-	m := &Mux{espCh: make(chan []byte, 3), done: make(chan struct{})}
-	m.espCh <- []byte("one")
-	m.espCh <- []byte("two")
-	m.espCh <- []byte("three")
+	m := &Mux{espCh: make(chan [][]byte, 2), done: make(chan struct{})}
+	m.espCh <- [][]byte{[]byte("one"), []byte("two")}
+	m.espCh <- [][]byte{[]byte("three")}
 
 	batch, err := m.RecvESPBatch(make([][]byte, 0, 2))
 	if err != nil {

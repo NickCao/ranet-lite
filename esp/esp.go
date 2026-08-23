@@ -74,6 +74,17 @@ type InboundSA struct {
 	window replayWindow
 }
 
+// AuthenticatedPacket is an ESP packet whose SPI and AEAD tag have been
+// verified, but whose sequence number has not yet been committed to the
+// anti-replay window. Receive workers authenticate in parallel, then call
+// Commit in wire-arrival order so scheduler timing cannot make a valid packet
+// appear older than the replay window.
+type AuthenticatedPacket struct {
+	sa    *InboundSA
+	seq   uint32
+	plain []byte
+}
+
 // InboundOption configures inbound ESP processing.
 type InboundOption func(*InboundSA)
 
@@ -199,23 +210,24 @@ func (o *OutboundSA) sealWithSequence(innerIPPacket []byte, nextHeader byte, seq
 	return o.aead.Seal(out[:framingLen], nonce, plain, aad), nil
 }
 
-// Open validates and decrypts one ESP packet addressed to this SA's SPI,
-// returning the encapsulated tunnel-mode IP packet and its protocol
-// (NextHeaderIPv4/IPv6).
-func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
+// Authenticate validates the SPI and AEAD tag without advancing the replay
+// window. The inexpensive preliminary replay check rejects obvious replays;
+// Commit repeats that check atomically with advancing the window after
+// parallel authentication completes.
+func (in *InboundSA) Authenticate(pkt []byte) (*AuthenticatedPacket, error) {
 	if len(pkt) < headerLen+in.params.IVLen+in.params.ICVLen {
-		return nil, 0, fmt.Errorf("esp: packet too short")
+		return nil, fmt.Errorf("esp: packet too short")
 	}
 	spi := binary.BigEndian.Uint32(pkt[0:4])
 	if spi != in.spi {
-		return nil, 0, fmt.Errorf("esp: SPI mismatch (got %08x, want %08x)", spi, in.spi)
+		return nil, fmt.Errorf("esp: SPI mismatch (got %08x, want %08x)", spi, in.spi)
 	}
 	seq := binary.BigEndian.Uint32(pkt[4:8])
 	in.mu.Lock()
 	err := in.window.check(seq)
 	in.mu.Unlock()
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	iv := pkt[headerLen : headerLen+in.params.IVLen]
@@ -229,19 +241,30 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	// to avoid holding the lock for its duration.
 	plain, err := in.aead.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
-		return nil, 0, fmt.Errorf("esp: authentication failed: %w", err)
+		return nil, fmt.Errorf("esp: authentication failed: %w", err)
+	}
+	return &AuthenticatedPacket{sa: in, seq: seq, plain: plain}, nil
+}
+
+// Commit advances the anti-replay window and interprets the authenticated ESP
+// trailer. Authentication consumes the sequence number even if the trailer is
+// malformed (RFC 4303 section 3.4.3), so the commit precedes trailer parsing.
+func (p *AuthenticatedPacket) Commit() ([]byte, byte, error) {
+	if p == nil || p.sa == nil {
+		return nil, 0, fmt.Errorf("esp: nil authenticated packet")
 	}
 	// Authentication, rather than successful trailer interpretation, consumes
 	// the sequence number (RFC 4303 section 3.4.3).
-	in.mu.Lock()
-	err = in.window.check(seq)
+	p.sa.mu.Lock()
+	err := p.sa.window.check(p.seq)
 	if err == nil {
-		in.window.commit(seq)
+		p.sa.window.commit(p.seq)
 	}
-	in.mu.Unlock()
+	p.sa.mu.Unlock()
 	if err != nil {
 		return nil, 0, err
 	}
+	plain := p.plain
 	if len(plain) < 2 {
 		return nil, 0, fmt.Errorf("esp: plaintext too short")
 	}
@@ -257,4 +280,15 @@ func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
 	}
 
 	return plain[:len(plain)-2-padLen], nextHeader, nil
+}
+
+// Open is the single-packet convenience path. Batch receive pipelines use
+// Authenticate and Commit separately to parallelize AEAD work while retaining
+// deterministic replay-window order.
+func (in *InboundSA) Open(pkt []byte) ([]byte, byte, error) {
+	authenticated, err := in.Authenticate(pkt)
+	if err != nil {
+		return nil, 0, err
+	}
+	return authenticated.Commit()
 }

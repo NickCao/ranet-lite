@@ -47,11 +47,6 @@ var (
 // too-small offset is an out-of-range slice.
 const writeOffset = 16
 
-// chanBufSize lets decrypted bursts accumulate for batched TUN writes. The
-// outbound path deliberately has no work channels: each worker owns a complete
-// read/reserve/encrypt/send operation.
-const chanBufSize = 4096
-
 type Mesh struct {
 	Routes *RouteTable
 	// Name is the TUN device's real interface name (e.g. "ranet0"), as
@@ -61,10 +56,8 @@ type Mesh struct {
 	Name string
 
 	dev                tun.Device
-	inbound            chan [][]byte
 	outboundReadMu     sync.Mutex
 	outboundBufferSize int
-	done               chan struct{}
 }
 
 // New creates an automatically named TUN device.
@@ -92,9 +85,7 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		Routes:             NewRouteTable(),
 		Name:               actualName,
 		dev:                dev,
-		inbound:            make(chan [][]byte, chanBufSize),
 		outboundBufferSize: max(mtu, outboundPacketBufferSize),
-		done:               make(chan struct{}),
 	}
 	// One long-lived worker per available Go execution context lets packet
 	// batches encrypt concurrently without per-packet goroutines or scheduler
@@ -103,7 +94,6 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 	for range max(1, runtime.GOMAXPROCS(0)) {
 		go m.outboundWorker()
 	}
-	go m.inboundLoop()
 	return m, nil
 }
 
@@ -205,17 +195,16 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 }
 
 // DeliverInbound injects an already-decapsulated tunnel-mode IP packet into
-// the TUN device, as if it had arrived on the wire. It hands off to inboundLoop
-// rather than writing directly so that packets arriving in a
-// tight burst (from one or several peers concurrently) get coalesced into
-// a single Device.Write call.
+// the TUN device, as if it had arrived on the wire.
 func (m *Mesh) DeliverInbound(raw []byte) {
 	m.DeliverInboundBatch([][]byte{raw})
 }
 
 // DeliverInboundBatch injects a group of already-decapsulated tunnel-mode IP
-// packets into the TUN device in one write batch. The buffers are copied
-// because their ESP plaintext storage is owned by the receive pipeline.
+// packets directly in one write batch. The calling receive worker retains
+// ownership through this TUN write; there is no channel handoff or separate
+// emitter. Buffers are copied to leave the headroom and tail capacity required
+// by the TUN backend's virtio/GRO implementation.
 func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	if len(raw) == 0 {
 		return
@@ -231,64 +220,16 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 		bufs[i] = buf
 		copy(bufs[i][writeOffset:], raw[i])
 	}
-	select {
-	case m.inbound <- bufs:
-	case <-m.done:
+	if _, err := m.dev.Write(bufs, writeOffset); err != nil {
+		log.Printf("netstack: write to tun device: %v", err)
 	}
-}
-
-// inboundLoop batches decrypted packets into as few Device.Write calls as
-// possible. Writing one packet per syscall, as a naive implementation
-// would, also means the TUN device never sees more than one buffer per
-// call, so it can never exercise its own GSO/GRO coalescing for
-// same-flow packets — batching here is what lets that actually kick in,
-// on top of the more basic win of fewer syscalls under load. It only
-// batches what's *already* waiting (a non-blocking drain), so a lone
-// packet with nothing queued behind it is written immediately with no
-// added latency; batching only happens when arrivals are bursty enough
-// that there's really something to gain from it.
-func (m *Mesh) inboundLoop() {
-	batch := m.dev.BatchSize()
-	bufs := make([][]byte, 0, batch)
-	var pending [][]byte
-	for {
-		if len(pending) == 0 {
-			select {
-			case <-m.done:
-				return
-			case pending = <-m.inbound:
-			}
+	for _, buf := range bufs {
+		if cap(buf) == inboundPacketBufferSize {
+			inboundPacketPool.Put(buf[:inboundPacketBufferSize])
 		}
-		n := min(batch-len(bufs), len(pending))
-		bufs = append(bufs, pending[:n]...)
-		pending = pending[n:]
-	drain:
-		for len(bufs) < batch {
-			select {
-			case incoming := <-m.inbound:
-				n := min(batch-len(bufs), len(incoming))
-				bufs = append(bufs, incoming[:n]...)
-				pending = incoming[n:]
-				if len(pending) != 0 {
-					break drain
-				}
-			default:
-				break drain
-			}
-		}
-		if _, err := m.dev.Write(bufs, writeOffset); err != nil {
-			log.Printf("netstack: write to tun device: %v", err)
-		}
-		for _, buf := range bufs {
-			if cap(buf) == inboundPacketBufferSize {
-				inboundPacketPool.Put(buf[:inboundPacketBufferSize])
-			}
-		}
-		bufs = bufs[:0]
 	}
 }
 
 func (m *Mesh) Close() {
-	close(m.done)
 	m.dev.Close()
 }

@@ -1,16 +1,53 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
 	"testing"
+	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
 	"github.com/NickCao/ranet-lite/internal/registry"
 )
+
+func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
+	order := newInboundBatchOrder()
+	first, err := order.receive(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := order.receive(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delivered := make(chan byte, 2)
+	secondDone := make(chan struct{})
+	go func() {
+		order.deliver(second, func() { delivered <- 2 })
+		close(secondDone)
+	}()
+	select {
+	case got := <-delivered:
+		t.Fatalf("later batch %d delivered before the first batch", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+	order.deliver(first, func() { delivered <- 1 })
+	<-secondDone
+	close(delivered)
+
+	var got []byte
+	for value := range delivered {
+		got = append(got, value)
+	}
+	if !bytes.Equal(got, []byte{1, 2}) {
+		t.Fatalf("delivery order = %v, want [1 2]", got)
+	}
+}
 
 func runtimeFixture(t *testing.T) (*config.Config, ed25519.PrivateKey, registry.Registry) {
 	t.Helper()

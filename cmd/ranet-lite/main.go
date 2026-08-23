@@ -44,16 +44,49 @@ import (
 
 const reconnectDelay = 10 * time.Second
 
-// inboundWorkers bounds how many goroutines decrypt a single peer's
-// inbound ESP traffic concurrently — see connectPeer's doc comment for
-// why this needs to be parallel at all. orderBufferSize bounds how many
-// packets can be mid-decrypt (reserved a delivery slot but not yet
-// resolved) at once; it doesn't need to match any particular buffer
-// elsewhere, just be comfortably larger than inboundWorkers so a slow
-// packet doesn't immediately stall new reads.
-var inboundWorkers = min(runtime.NumCPU(), 16)
+// One long-lived batch worker per Go execution context mirrors the outbound
+// data path. Blocked workers are cheap when a peer is idle, while an active
+// peer can use every core without creating a goroutine or channel per packet.
+var inboundWorkers = max(1, runtime.GOMAXPROCS(0))
 
-const orderBufferSize = 4096
+// inboundBatchOrder assigns receive-order tickets under the same lock that
+// reads from the transport, then admits completed batches to replay commit and
+// TUN delivery in ticket order.
+type inboundBatchOrder struct {
+	receiveMu sync.Mutex
+	reserved  uint64
+	deliverMu sync.Mutex
+	cond      *sync.Cond
+	next      uint64
+}
+
+func newInboundBatchOrder() *inboundBatchOrder {
+	o := new(inboundBatchOrder)
+	o.cond = sync.NewCond(&o.deliverMu)
+	return o
+}
+
+func (o *inboundBatchOrder) receive(receive func() error) (uint64, error) {
+	o.receiveMu.Lock()
+	defer o.receiveMu.Unlock()
+	if err := receive(); err != nil {
+		return 0, err
+	}
+	ticket := o.reserved
+	o.reserved++
+	return ticket, nil
+}
+
+func (o *inboundBatchOrder) deliver(ticket uint64, deliver func()) {
+	o.deliverMu.Lock()
+	for ticket != o.next {
+		o.cond.Wait()
+	}
+	deliver()
+	o.next++
+	o.cond.Broadcast()
+	o.deliverMu.Unlock()
+}
 
 func main() {
 	configPath := flag.String("config", "/etc/ranet-lite/config.yaml", "path to the ranet-lite config file")
@@ -438,16 +471,14 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	peerHandle := speaker.AddPeer(peer)
 	defer peerHandle.Close()
 
-	// Decrypt in parallel on multicore machines, but reserve result slots
-	// before dispatch so the emitter delivers packets in arrival order. On a
-	// single-core machine, process packets inline: creating a goroutine and a
-	// result channel per packet only adds scheduler work when no parallelism is
-	// possible, and it prevents the downstream TUN writer from accumulating a
-	// useful batch.
+	// Each receive worker owns a complete UDP batch through authentication,
+	// replay commit, validation, and TUN delivery. Packet intake and the cheap
+	// replay/delivery reservation are serialized, while AEAD work runs outside
+	// the lock. Completed batches wait only at the final commit/write boundary,
+	// preserving receive order without per-packet goroutines or channels.
 	type decrypted struct {
-		plain []byte
-		nh    byte
-		err   error
+		authenticated *esp.AuthenticatedPacket
+		err           error
 	}
 	decrypt := func(pkt []byte) decrypted {
 		saMu.RLock()
@@ -455,13 +486,10 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		saMu.RUnlock()
 		var r decrypted
 		for _, candidate := range candidates {
-			r.plain, r.nh, r.err = candidate.sa.Open(pkt)
+			r.authenticated, r.err = candidate.sa.Authenticate(pkt)
 			if r.err == nil {
 				break
 			}
-		}
-		if r.err == nil {
-			sess.NoteTraffic()
 		}
 		return r
 	}
@@ -470,7 +498,13 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
 			return nil
 		}
-		deliver, err := validateESPTunnelPayload(r.plain, r.nh)
+		plain, nh, err := r.authenticated.Commit()
+		if err != nil {
+			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, err)
+			return nil
+		}
+		sess.NoteTraffic()
+		deliver, err := validateESPTunnelPayload(plain, nh)
 		if err != nil {
 			log.Printf("peer %s: dropping invalid ESP tunnel payload: %v", name, err)
 			return nil
@@ -478,58 +512,59 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		if !deliver {
 			return nil
 		}
-		if !speaker.Receive(peer, r.plain) {
-			return r.plain
+		if !speaker.Receive(peer, plain) {
+			return plain
 		}
 		return nil
 	}
 
 	runESP := func() error {
-		if inboundWorkers == 1 {
+		order := newInboundBatchOrder()
+
+		worker := func() error {
 			var packets [][]byte
+			results := make([]decrypted, 0, 128)
 			plain := make([][]byte, 0, 128)
 			for {
-				var err error
-				packets, err = sess.Mux().RecvESPBatch(packets)
+				packets = packets[:0]
+				ticket, err := order.receive(func() (err error) {
+					packets, err = sess.Mux().RecvESPBatch(packets)
+					return err
+				})
 				if err != nil {
 					return err
 				}
-				plain = plain[:0]
+
+				results = results[:0]
 				for _, pkt := range packets {
-					if raw := innerPacket(decrypt(pkt)); raw != nil {
-						plain = append(plain, raw)
-					}
+					results = append(results, decrypt(pkt))
 				}
-				mesh.DeliverInboundBatch(plain)
+
+				order.deliver(ticket, func() {
+					plain = plain[:0]
+					for _, result := range results {
+						if raw := innerPacket(result); raw != nil {
+							plain = append(plain, raw)
+						}
+					}
+					mesh.DeliverInboundBatch(plain)
+				})
 			}
 		}
 
-		order := make(chan chan decrypted, orderBufferSize)
-		sem := make(chan struct{}, inboundWorkers)
-		emitterDone := make(chan struct{})
-		go func() {
-			defer close(emitterDone)
-			for slot := range order {
-				if raw := innerPacket(<-slot); raw != nil {
-					mesh.DeliverInbound(raw)
-				}
-			}
-		}()
-		for {
-			pkt, err := sess.Mux().RecvESP()
-			if err != nil {
-				close(order)
-				<-emitterDone
-				return err
-			}
-			slot := make(chan decrypted, 1)
-			order <- slot
-			sem <- struct{}{}
-			go func(pkt []byte, slot chan decrypted) {
-				defer func() { <-sem }()
-				slot <- decrypt(pkt)
-			}(pkt, slot)
+		errs := make(chan error, inboundWorkers)
+		var workers sync.WaitGroup
+		for range inboundWorkers {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				errs <- worker()
+			}()
 		}
+		err := <-errs
+		_ = sess.Mux().Close()
+		workers.Wait()
+		return err
 	}
 	type sessionResult struct {
 		component string

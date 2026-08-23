@@ -113,11 +113,8 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 		events: make(chan tun.Event),
 	}
 	m := &Mesh{
-		dev:     dev,
-		inbound: make(chan [][]byte, 1),
-		done:    make(chan struct{}),
+		dev: dev,
 	}
-	go m.inboundLoop()
 
 	want := [][]byte{{1, 2, 3}, {4, 5, 6, 7}}
 	m.DeliverInboundBatch(want)
@@ -141,5 +138,4 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for inbound TUN write")
 	}
-	close(m.done)
 }
