@@ -120,6 +120,28 @@ func TestHubFailureIsTerminal(t *testing.T) {
 	}
 }
 
+func TestRecvESPBatchDrainsToDestinationCapacity(t *testing.T) {
+	m := &Mux{espCh: make(chan []byte, 3), done: make(chan struct{})}
+	m.espCh <- []byte("one")
+	m.espCh <- []byte("two")
+	m.espCh <- []byte("three")
+
+	batch, err := m.RecvESPBatch(make([][]byte, 0, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 2 || string(batch[0]) != "one" || string(batch[1]) != "two" {
+		t.Fatalf("batch = %q, want [one two]", batch)
+	}
+	last, err := m.RecvESP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(last) != "three" {
+		t.Fatalf("remaining packet = %q, want three", last)
+	}
+}
+
 // TestSendIKEUnbatchedAndMarked confirms SendIKE still writes immediately
 // (not queued through the ESP batching path) and always carries the
 // 4-byte non-ESP marker, including for what would be the very first

@@ -437,39 +437,83 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 	peerHandle := speaker.AddPeer(peer)
 	defer peerHandle.Close()
 
-	// Decrypt in parallel, but reserve result slots before dispatch so the
-	// emitter delivers packets in their original arrival order.
+	// Decrypt in parallel on multicore machines, but reserve result slots
+	// before dispatch so the emitter delivers packets in arrival order. On a
+	// single-core machine, process packets inline: creating a goroutine and a
+	// result channel per packet only adds scheduler work when no parallelism is
+	// possible, and it prevents the downstream TUN writer from accumulating a
+	// useful batch.
 	type decrypted struct {
 		plain []byte
 		nh    byte
 		err   error
 	}
-	order := make(chan chan decrypted, orderBufferSize)
-	sem := make(chan struct{}, inboundWorkers)
-	emitterDone := make(chan struct{})
-	go func() {
-		defer close(emitterDone)
-		for slot := range order {
-			r := <-slot
-			if r.err != nil {
-				log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
-				continue
-			}
-			deliver, err := validateESPTunnelPayload(r.plain, r.nh)
-			if err != nil {
-				log.Printf("peer %s: dropping invalid ESP tunnel payload: %v", name, err)
-				continue
-			}
-			if !deliver {
-				continue
-			}
-			if !speaker.Receive(peer, r.plain) {
-				mesh.DeliverInbound(r.plain)
+	decrypt := func(pkt []byte) decrypted {
+		saMu.RLock()
+		candidates := append([]inboundSA(nil), inbound...)
+		saMu.RUnlock()
+		var r decrypted
+		for _, candidate := range candidates {
+			r.plain, r.nh, r.err = candidate.sa.Open(pkt)
+			if r.err == nil {
+				break
 			}
 		}
-	}()
+		if r.err == nil {
+			sess.NoteTraffic()
+		}
+		return r
+	}
+	innerPacket := func(r decrypted) []byte {
+		if r.err != nil {
+			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
+			return nil
+		}
+		deliver, err := validateESPTunnelPayload(r.plain, r.nh)
+		if err != nil {
+			log.Printf("peer %s: dropping invalid ESP tunnel payload: %v", name, err)
+			return nil
+		}
+		if !deliver {
+			return nil
+		}
+		if !speaker.Receive(peer, r.plain) {
+			return r.plain
+		}
+		return nil
+	}
 
 	runESP := func() error {
+		if inboundWorkers == 1 {
+			var packets [][]byte
+			plain := make([][]byte, 0, 128)
+			for {
+				var err error
+				packets, err = sess.Mux().RecvESPBatch(packets)
+				if err != nil {
+					return err
+				}
+				plain = plain[:0]
+				for _, pkt := range packets {
+					if raw := innerPacket(decrypt(pkt)); raw != nil {
+						plain = append(plain, raw)
+					}
+				}
+				mesh.DeliverInboundBatch(plain)
+			}
+		}
+
+		order := make(chan chan decrypted, orderBufferSize)
+		sem := make(chan struct{}, inboundWorkers)
+		emitterDone := make(chan struct{})
+		go func() {
+			defer close(emitterDone)
+			for slot := range order {
+				if raw := innerPacket(<-slot); raw != nil {
+					mesh.DeliverInbound(raw)
+				}
+			}
+		}()
 		for {
 			pkt, err := sess.Mux().RecvESP()
 			if err != nil {
@@ -482,22 +526,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 			sem <- struct{}{}
 			go func(pkt []byte, slot chan decrypted) {
 				defer func() { <-sem }()
-				saMu.RLock()
-				candidates := append([]inboundSA(nil), inbound...)
-				saMu.RUnlock()
-				var plain []byte
-				var nextHeader byte
-				var err error
-				for _, candidate := range candidates {
-					plain, nextHeader, err = candidate.sa.Open(pkt)
-					if err == nil {
-						break
-					}
-				}
-				if err == nil {
-					sess.NoteTraffic()
-				}
-				slot <- decrypted{plain: plain, nh: nextHeader, err: err}
+				slot <- decrypt(pkt)
 			}(pkt, slot)
 		}
 	}

@@ -34,12 +34,19 @@ var outboundWorkers = min(runtime.NumCPU(), 16)
 // ordered emission while their individual packets are encrypted.
 const outboundContainerBufSize = 64
 
-const outboundPacketBufferSize = 2048
+const (
+	outboundPacketBufferSize = 2048
+	// inboundPacketBufferSize leaves enough tail capacity for the TUN
+	// backend to merge adjacent TCP packets into a single GSO frame before
+	// writing it. Exact-capacity packet buffers silently disable that GRO.
+	inboundPacketBufferSize = writeOffset + 65535
+)
 
 var (
 	outboundPacketPool    = sync.Pool{New: func() any { return make([]byte, outboundPacketBufferSize) }}
 	outboundElementPool   = sync.Pool{New: func() any { return new(outboundElement) }}
 	outboundContainerPool = sync.Pool{New: func() any { return new(outboundElementsContainer) }}
+	inboundPacketPool     = sync.Pool{New: func() any { return make([]byte, inboundPacketBufferSize) }}
 )
 
 // writeOffset is how much leading space Device.Write needs in each buffer
@@ -69,7 +76,7 @@ type Mesh struct {
 	Name string
 
 	dev        tun.Device
-	inbound    chan []byte
+	inbound    chan [][]byte
 	encryption chan *outboundElement           // shared across all outboundWorkers
 	order      chan *outboundElementsContainer // one per Device.Read batch, in read order
 	done       chan struct{}
@@ -100,7 +107,7 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		Routes:     NewRouteTable(),
 		Name:       actualName,
 		dev:        dev,
-		inbound:    make(chan []byte, chanBufSize),
+		inbound:    make(chan [][]byte, chanBufSize),
 		encryption: make(chan *outboundElement, chanBufSize),
 		order:      make(chan *outboundElementsContainer, outboundContainerBufSize),
 		done:       make(chan struct{}),
@@ -290,10 +297,29 @@ func addrsOf(raw []byte) (src, dst netip.Addr, nextHeader byte, ok bool) {
 // tight burst (from one or several peers concurrently) get coalesced into
 // a single Device.Write call.
 func (m *Mesh) DeliverInbound(raw []byte) {
-	buf := make([]byte, writeOffset+len(raw))
-	copy(buf[writeOffset:], raw)
+	m.DeliverInboundBatch([][]byte{raw})
+}
+
+// DeliverInboundBatch injects a group of already-decapsulated tunnel-mode IP
+// packets into the TUN device in one write batch. The buffers are copied
+// because their ESP plaintext storage is owned by the receive pipeline.
+func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
+	if len(raw) == 0 {
+		return
+	}
+	bufs := make([][]byte, len(raw))
+	for i := range raw {
+		buf := inboundPacketPool.Get().([]byte)
+		if cap(buf) < writeOffset+len(raw[i]) {
+			buf = make([]byte, writeOffset+len(raw[i]))
+		} else {
+			buf = buf[:writeOffset+len(raw[i])]
+		}
+		bufs[i] = buf
+		copy(bufs[i][writeOffset:], raw[i])
+	}
 	select {
-	case m.inbound <- buf:
+	case m.inbound <- bufs:
 	case <-m.done:
 	}
 }
@@ -311,24 +337,39 @@ func (m *Mesh) DeliverInbound(raw []byte) {
 func (m *Mesh) inboundLoop() {
 	batch := m.dev.BatchSize()
 	bufs := make([][]byte, 0, batch)
+	var pending [][]byte
 	for {
-		select {
-		case <-m.done:
-			return
-		case buf := <-m.inbound:
-			bufs = append(bufs, buf)
+		if len(pending) == 0 {
+			select {
+			case <-m.done:
+				return
+			case pending = <-m.inbound:
+			}
 		}
+		n := min(batch-len(bufs), len(pending))
+		bufs = append(bufs, pending[:n]...)
+		pending = pending[n:]
 	drain:
 		for len(bufs) < batch {
 			select {
-			case buf := <-m.inbound:
-				bufs = append(bufs, buf)
+			case incoming := <-m.inbound:
+				n := min(batch-len(bufs), len(incoming))
+				bufs = append(bufs, incoming[:n]...)
+				pending = incoming[n:]
+				if len(pending) != 0 {
+					break drain
+				}
 			default:
 				break drain
 			}
 		}
 		if _, err := m.dev.Write(bufs, writeOffset); err != nil {
 			log.Printf("netstack: write to tun device: %v", err)
+		}
+		for _, buf := range bufs {
+			if cap(buf) == inboundPacketBufferSize {
+				inboundPacketPool.Put(buf[:inboundPacketBufferSize])
+			}
 		}
 		bufs = bufs[:0]
 	}

@@ -93,7 +93,7 @@ type Session struct {
 	handlerMu     sync.RWMutex
 	onChild       func(ChildSA) error
 	onRetire      func(uint32) error
-	lastTraffic   atomic.Int64
+	trafficSeen   atomic.Bool
 	childRekeying atomic.Bool
 
 	childRekeyInterval time.Duration
@@ -322,7 +322,10 @@ func (s *Session) deleteChildren(remoteSPIs []uint32) ([]uint32, error) {
 
 // NoteTraffic records successfully authenticated ESP traffic for the DPD
 // policy. RFC 7296 section 2.4 treats it as proof that the IKE SA is alive.
-func (s *Session) NoteTraffic() { s.lastTraffic.Store(time.Now().UnixNano()) }
+// Run consumes this edge and timestamps it at its existing 100 ms poll, so
+// the data plane only pays for an atomic store rather than a clock read for
+// every packet.
+func (s *Session) NoteTraffic() { s.trafficSeen.Store(true) }
 
 const (
 	requestTimeout = 2 * time.Second

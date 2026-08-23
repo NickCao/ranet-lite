@@ -376,6 +376,36 @@ func (m *Mux) RecvESP() ([]byte, error) {
 		return nil, m.doneError()
 	}
 }
+
+// RecvESPBatch blocks for one ESP packet, then drains immediately available
+// packets into dst up to its capacity. A nil dst gets the transport's normal
+// batch capacity. Keeping the receive batch intact lets callers amortize
+// decrypt-pipeline and TUN write overhead without delaying a lone packet.
+func (m *Mux) RecvESPBatch(dst [][]byte) ([][]byte, error) {
+	if cap(dst) == 0 {
+		dst = make([][]byte, 0, espSendBatch)
+	} else {
+		dst = dst[:0]
+	}
+	select {
+	case b := <-m.espCh:
+		dst = append(dst, b)
+	case <-m.done:
+		return nil, m.doneError()
+	}
+	for len(dst) < cap(dst) {
+		select {
+		case b := <-m.espCh:
+			dst = append(dst, b)
+		case <-m.done:
+			return dst, nil
+		default:
+			return dst, nil
+		}
+	}
+	return dst, nil
+}
+
 func (m *Mux) RecvESPUntil(deadline time.Time) ([]byte, error) {
 	select {
 	case b := <-m.espCh:

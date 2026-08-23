@@ -88,6 +88,23 @@ func TestOnlyDPDExhaustsPostHandshakeRetransmits(t *testing.T) {
 	}
 }
 
+func TestNoteTrafficCoalescesPacketsUntilRunConsumesThem(t *testing.T) {
+	var s Session
+	for range 1000 {
+		s.NoteTraffic()
+	}
+	if !s.trafficSeen.Swap(false) {
+		t.Fatal("authenticated traffic was not recorded")
+	}
+	if s.trafficSeen.Swap(false) {
+		t.Fatal("traffic indication was not consumed")
+	}
+	s.NoteTraffic()
+	if !s.trafficSeen.Swap(false) {
+		t.Fatal("traffic after consumption was not recorded")
+	}
+}
+
 func TestStartRequestConsumesMessageIDOnlyAfterSuccessfulSend(t *testing.T) {
 	mux, _ := lifecycleMuxes(t)
 	ctx := &ikeContext{

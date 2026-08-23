@@ -215,10 +215,8 @@ func (s *Session) Run(ctx context.Context) error {
 			schedule.poll()
 		}
 		startDueRekey()
-		if nanos := s.lastTraffic.Load(); nanos != 0 {
-			if traffic := time.Unix(0, nanos); traffic.After(lastAuthenticated) {
-				lastAuthenticated = traffic
-			}
+		if s.trafficSeen.Swap(false) {
+			lastAuthenticated = time.Now()
 		}
 		if pending == nil {
 			select {
