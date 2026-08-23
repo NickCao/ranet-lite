@@ -3,6 +3,7 @@ package ike
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -216,6 +217,78 @@ func TestReplayedRequestDoesNotRefreshOrAdoptEndpoint(t *testing.T) {
 	}
 	if got := readIKE(rebound); string(got) != "future" {
 		t.Fatalf("packet after fresh request = %q, want rebound endpoint", got)
+	}
+}
+
+func TestChildRequestRejectionNotifications(t *testing.T) {
+	const unknownSPI = 0x10203040
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ikeCtx := &ikeContext{
+		suite: suite,
+		spiI:  0x0102030405060708,
+		spiR:  0x1112131415161718,
+		skei:  make([]byte, 20),
+		sker:  make([]byte, 20),
+	}
+	s := &Session{current: ikeCtx, Child: ChildSA{RemoteSPI: 0x50607080}}
+	newSPI := make([]byte, 4)
+	binary.BigEndian.PutUint32(newSPI, 0x90a0b0c0)
+	base := []RawPayload{
+		{Type: PayloadSA, Body: EncodeSA([]Proposal{{
+			Number: 1, Protocol: ProtoESP, SPI: newSPI,
+			Transforms: []Transform{{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128}, {Type: TransESN, ID: ESN_NO}},
+		}})},
+		{Type: PayloadNonce, Body: EncodeNonce(make([]byte, 32))},
+		{Type: PayloadTSi, Body: fullRangeSelectors()},
+		{Type: PayloadTSr, Body: fullRangeSelectors()},
+	}
+
+	decodeResponse := func(raw []byte) Notify {
+		t.Helper()
+		message, err := DecodeMessage(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner, err := DecryptMessage(suite, ikeCtx.skei, raw, message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(inner) != 1 || inner[0].Type != PayloadN {
+			t.Fatalf("response payloads = %#v, want one Notify", inner)
+		}
+		notify, err := DecodeNotify(inner[0].Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return notify
+	}
+
+	dh, err := GenerateDH(DH_CURVE25519)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additionalRequest := append([]RawPayload(nil), base[:2]...)
+	additionalRequest = append(additionalRequest, RawPayload{Type: PayloadKE, Body: EncodeKE(DH_CURVE25519, dh.PublicBytes())})
+	additionalRequest = append(additionalRequest, base[2:]...)
+	response, err := s.handleChildRekey(ikeCtx, 1, additionalRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additional := decodeResponse(response)
+	if additional.Type != N_NO_ADDITIONAL_SAS || additional.Protocol != 0 || len(additional.SPI) != 0 {
+		t.Fatalf("additional Child SA rejection = %#v", additional)
+	}
+
+	unknown := make([]byte, 4)
+	binary.BigEndian.PutUint32(unknown, unknownSPI)
+	rekey := append([]RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: ProtoESP, SPI: unknown, Type: N_REKEY_SA})}}, base...)
+	response, err = s.handleChildRekey(ikeCtx, 2, rekey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notFound := decodeResponse(response)
+	if notFound.Type != N_CHILD_SA_NOT_FOUND || notFound.Protocol != ProtoESP || !bytes.Equal(notFound.SPI, unknown) {
+		t.Fatalf("unknown Child SA rejection = %#v", notFound)
 	}
 }
 

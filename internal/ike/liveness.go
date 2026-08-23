@@ -524,22 +524,40 @@ func supportedPayloadType(payloadType PayloadType) bool {
 }
 
 func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPayload) ([]byte, error) {
-	if s.childRekeying.Load() {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
-	}
 	var rekey Notify
-	payloads, err := decodeChildExchangePayloads(inner)
-	if err != nil {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
-	}
-	for _, notify := range payloads.notifies {
+	for _, payload := range inner {
+		if payload.Type != PayloadN {
+			continue
+		}
+		notify, err := DecodeNotify(payload.Body)
+		if err != nil {
+			return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+		}
 		if notify.Type == N_REKEY_SA {
 			rekey = notify
 		}
 	}
+	// A CREATE_CHILD_SA request without REKEY_SA asks to create an additional
+	// Child SA. This single-Child-SA implementation rejects it with the error
+	// required by RFC 7815 §2.2 and described by RFC 7296 §1.3.
+	if rekey.Type != N_REKEY_SA {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_ADDITIONAL_SAS)
+	}
+	if s.childRekeying.Load() {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_TEMPORARY_FAILURE)
+	}
+	if rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
+	payloads, err := decodeChildExchangePayloads(inner)
+	if err != nil {
+		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
+	}
 	child := s.currentChild()
-	if rekey.Type != N_REKEY_SA || rekey.Protocol != ProtoESP || len(rekey.SPI) != 4 || binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
-		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND)
+	if binary.BigEndian.Uint32(rekey.SPI) != child.RemoteSPI {
+		// RFC 7296 §2.25 requires CHILD_SA_NOT_FOUND to identify the
+		// nonexistent SA by copying the Protocol ID and SPI from REKEY_SA.
+		return s.responseNotifySA(ctx, msgID, CREATE_CHILD_SA, N_CHILD_SA_NOT_FOUND, rekey.Protocol, rekey.SPI)
 	}
 	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
@@ -603,4 +621,8 @@ func (s *Session) responseNotify(ctx *ikeContext, msgID uint32, exchange Exchang
 
 func (s *Session) responseNotifyData(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType, data []byte) ([]byte, error) {
 	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Type: notifyType, Data: data})}})
+}
+
+func (s *Session) responseNotifySA(ctx *ikeContext, msgID uint32, exchange ExchangeType, notifyType NotifyType, protocol ProtocolID, spi []byte) ([]byte, error) {
+	return s.response(ctx, msgID, exchange, []RawPayload{{Type: PayloadN, Body: EncodeNotify(Notify{Protocol: protocol, SPI: spi, Type: notifyType})}})
 }
