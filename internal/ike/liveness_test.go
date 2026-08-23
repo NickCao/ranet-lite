@@ -1,6 +1,7 @@
 package ike
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"testing"
@@ -116,6 +117,105 @@ func TestStartRequestConsumesMessageIDOnlyAfterSuccessfulSend(t *testing.T) {
 	}
 	if failedCtx.nextLocalMID != 11 {
 		t.Fatalf("Message ID after failed send = %d, want 11", failedCtx.nextLocalMID)
+	}
+}
+
+func TestReplayedRequestDoesNotRefreshOrAdoptEndpoint(t *testing.T) {
+	configured := listenPeer(t)
+	rebound := listenPeer(t)
+	configuredAddr := configured.LocalAddr().(*net.UDPAddr)
+	mux, err := transport.Dial("127.0.0.1:0", configuredAddr.IP, configuredAddr.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mux.Close()
+
+	const spiI = 0x0102030405060708
+	const spiR = 0x1112131415161718
+	suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128, PRFID: PRF_HMAC_SHA2_256}
+	ikeCtx := &ikeContext{
+		suite: suite,
+		spiI:  spiI,
+		spiR:  spiR,
+		skei:  make([]byte, 20),
+		sker:  make([]byte, 20),
+	}
+	s := &Session{mux: mux, current: ikeCtx}
+	if err := mux.RegisterIKE(spiI); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: mux.LocalAddr().(*net.UDPAddr).Port}
+	readIKE := func(peer *net.UDPConn) []byte {
+		t.Helper()
+		buf := make([]byte, 2048)
+		if err := peer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		n, _, err := peer.ReadFromUDP(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte(nil), buf[4:n]...)
+	}
+	dispatchFrom := func(peer *net.UDPConn, request []byte) bool {
+		t.Helper()
+		if _, err := peer.WriteToUDP(withNonESPMarker(request), dst); err != nil {
+			t.Fatal(err)
+		}
+		raw, source, err := mux.RecvIKEFromUntil(time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pending *pendingRequest
+		return s.dispatch(raw, source, &pending)
+	}
+
+	request, err := EncryptMessage(suite, ikeCtx.sker, Header{
+		SPIInitiator: spiI,
+		SPIResponder: spiR,
+		ExchangeType: INFORMATIONAL,
+		MessageID:    0,
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dispatchFrom(configured, request) {
+		t.Fatal("fresh request was not reported as peer activity")
+	}
+	response := readIKE(configured)
+
+	if dispatchFrom(rebound, request) {
+		t.Fatal("replayed request was reported as fresh peer activity")
+	}
+	if replayResponse := readIKE(rebound); !bytes.Equal(replayResponse, response) {
+		t.Fatal("replayed request did not receive the cached response")
+	}
+	if err := mux.SendIKE([]byte("probe")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIKE(configured); string(got) != "probe" {
+		t.Fatalf("packet after replay = %q, want configured endpoint", got)
+	}
+
+	freshRequest, err := EncryptMessage(suite, ikeCtx.sker, Header{
+		SPIInitiator: spiI,
+		SPIResponder: spiR,
+		ExchangeType: INFORMATIONAL,
+		MessageID:    1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dispatchFrom(rebound, freshRequest) {
+		t.Fatal("fresh request from rebound endpoint was not reported as peer activity")
+	}
+	_ = readIKE(rebound)
+	if err := mux.SendIKE([]byte("future")); err != nil {
+		t.Fatal(err)
+	}
+	if got := readIKE(rebound); string(got) != "future" {
+		t.Fatalf("packet after fresh request = %q, want rebound endpoint", got)
 	}
 }
 

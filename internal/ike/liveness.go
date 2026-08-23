@@ -349,6 +349,9 @@ func retransmitDelay(attempt int) time.Duration {
 	return requestTimeout << min(attempt-1, maxRetransmits-1)
 }
 
+// dispatch returns true only when raw is a fresh authenticated message. Run
+// uses that result as evidence of peer liveness; authenticated replays may
+// receive a cached response, but must not refresh DPD or migrate the endpoint.
 func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pendingRequest) bool {
 	hdr, err := decodeHeader(raw)
 	if err != nil {
@@ -384,9 +387,6 @@ func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pend
 		*pending = nil
 		return true
 	}
-	// Authentication proves the request's source endpoint belongs to this
-	// peer. Retain it for future IKE requests and ESP after NAT port rebinding.
-	s.mux.AdoptEndpoint(source)
 	s.stateMu.RLock()
 	nextPeerMID := ctx.nextPeerMID
 	lastPeerResponseID := ctx.lastPeerResponseID
@@ -398,8 +398,13 @@ func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pend
 				s.mux.Close()
 			}
 		}
-		return true
+		return false
 	}
+	// Authentication and a fresh Message ID prove this request came from the
+	// live peer rather than being a replay. Only now may it update the endpoint
+	// used for future IKE and ESP traffic after NAT port rebinding (RFC 7296
+	// §2.4 and §2.23).
+	s.mux.AdoptEndpoint(source)
 	response, err := s.handleRequest(ctx, hdr, inner)
 	if err != nil {
 		if response != nil {
