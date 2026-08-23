@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -119,6 +120,55 @@ func TestStartRequestConsumesMessageIDOnlyAfterSuccessfulSend(t *testing.T) {
 	if failedCtx.nextLocalMID != 11 {
 		t.Fatalf("Message ID after failed send = %d, want 11", failedCtx.nextLocalMID)
 	}
+}
+
+func TestMessageIDExhaustionCannotWrap(t *testing.T) {
+	t.Run("local request", func(t *testing.T) {
+		mux, _ := lifecycleMuxes(t)
+		ctx := &ikeContext{nextLocalMID: maxMessageID}
+		s := &Session{mux: mux, current: ctx, requests: make(chan *localRequest, 1)}
+		runDone := make(chan error, 1)
+		go func() { runDone <- s.Run(context.Background()) }()
+		if _, err := s.request(INFORMATIONAL, nil); !errors.Is(err, errMessageIDExhausted) {
+			t.Fatalf("request error = %v", err)
+		}
+		if ctx.nextLocalMID != maxMessageID {
+			t.Fatalf("local Message ID wrapped to %d", ctx.nextLocalMID)
+		}
+		if err := <-runDone; !errors.Is(err, errMessageIDExhausted) {
+			t.Fatalf("Run error = %v", err)
+		}
+		if !mux.IsClosed() {
+			t.Fatal("IKE SA remained open at local Message ID exhaustion")
+		}
+	})
+
+	t.Run("peer request", func(t *testing.T) {
+		mux, _ := lifecycleMuxes(t)
+		suite := SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128}
+		ctx := &ikeContext{
+			suite: suite, spiI: 1, spiR: 2, sker: make([]byte, 20),
+			nextPeerMID: maxMessageID,
+		}
+		s := &Session{mux: mux, current: ctx}
+		request, err := EncryptMessage(suite, ctx.sker, Header{
+			SPIInitiator: 1, SPIResponder: 2, ExchangeType: INFORMATIONAL,
+			MessageID: maxMessageID,
+		}, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pending *pendingRequest
+		if !s.dispatch(request, nil, &pending) {
+			t.Fatal("exhausting peer request was not authenticated")
+		}
+		if ctx.nextPeerMID != maxMessageID {
+			t.Fatalf("peer Message ID wrapped to %d", ctx.nextPeerMID)
+		}
+		if !mux.IsClosed() {
+			t.Fatal("IKE SA remained open at peer Message ID exhaustion")
+		}
+	})
 }
 
 func TestReplayedRequestDoesNotRefreshOrAdoptEndpoint(t *testing.T) {

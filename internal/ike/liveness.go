@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -15,7 +16,10 @@ import (
 const (
 	dpdInterval         = 10 * time.Second
 	requestPollInterval = 100 * time.Millisecond
+	maxMessageID        = ^uint32(0)
 )
+
+var errMessageIDExhausted = errors.New("ike: Message ID space exhausted")
 
 type localRequest struct {
 	exchange ExchangeType
@@ -223,6 +227,10 @@ func (s *Session) Run(ctx context.Context) error {
 				pending, err = s.startRequest(req)
 				if err != nil {
 					req.result <- requestResult{err: err}
+					if errors.Is(err, errMessageIDExhausted) {
+						s.mux.Close()
+						return err
+					}
 				}
 			default:
 			}
@@ -306,6 +314,11 @@ func (s *Session) startRequest(req *localRequest) (*pendingRequest, error) {
 	context := req.context
 	if context == nil {
 		context = s.currentContext()
+	}
+	// Leave the final 32-bit value unused so incrementing the next local ID
+	// can never wrap. RFC 7296 §2.2 requires rekeying or closing first.
+	if context.nextLocalMID == maxMessageID {
+		return nil, errMessageIDExhausted
 	}
 	msgID := context.nextLocalMID
 	flags := uint8(0)
@@ -395,6 +408,13 @@ func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pend
 				}
 			}
 			return false
+		}
+		// We cannot represent the next expected ID after this request. Close
+		// before accepting it instead of wrapping the replay window to zero
+		// (RFC 7296 §2.2).
+		if nextPeerMID == maxMessageID {
+			s.mux.Close()
+			return true
 		}
 		// Authentication and a fresh Message ID prove this request came from
 		// the live peer rather than being a replay. Only now may it update the
