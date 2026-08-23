@@ -374,6 +374,15 @@ func ikeGroupPreference(group uint16) int {
 }
 
 func selectIKERekeyProposal(proposal Proposal, keGroup uint16) ([]Transform, SASuite, uint16, bool) {
+	// RFC 7296 §3.3.6 makes an entire proposal unacceptable when it contains
+	// an unknown or unsupported Transform Type. Unknown attributes are marked
+	// on individual transforms by DecodeSA and skipped by exact matching below,
+	// allowing another transform of the same type to be selected.
+	for _, transform := range proposal.Transforms {
+		if transform.Type != TransEncr && transform.Type != TransPRF && transform.Type != TransDH {
+			return nil, SASuite{}, 0, false
+		}
+	}
 	offered := ikeProposal().Transforms
 	selected := make([]Transform, 0, 3)
 	for _, typ := range []TransformType{TransEncr, TransPRF} {

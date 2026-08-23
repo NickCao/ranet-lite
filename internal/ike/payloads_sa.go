@@ -7,9 +7,10 @@ import (
 
 // Transform is one Transform substructure of a Proposal, RFC 7296 §3.3.2.
 type Transform struct {
-	Type          TransformType
-	ID            uint16
-	KeyLengthBits uint16 // 0 => no Key Length attribute
+	Type                  TransformType
+	ID                    uint16
+	KeyLengthBits         uint16 // 0 => no Key Length attribute
+	UnsupportedAttributes bool   // decoded transform contains an unknown or invalid attribute
 }
 
 func (t Transform) encode(last bool) []byte {
@@ -49,14 +50,22 @@ func decodeTransform(b []byte) (Transform, bool, []byte, error) {
 		ID:   binary.BigEndian.Uint16(b[6:8]),
 	}
 	attrs := b[8:tlen]
+	haveKeyLength := false
 	for len(attrs) > 0 {
 		if len(attrs) < 4 {
 			return Transform{}, false, nil, fmt.Errorf("ike: truncated transform attribute")
 		}
 		at := binary.BigEndian.Uint16(attrs[0:2])
 		if at&0x8000 != 0 {
-			if (at & 0x7fff) == AttrKeyLength {
+			attributeType := at & 0x7fff
+			if attributeType != AttrKeyLength || haveKeyLength {
+				t.UnsupportedAttributes = true
+			} else {
 				t.KeyLengthBits = binary.BigEndian.Uint16(attrs[2:4])
+				haveKeyLength = true
+				if t.KeyLengthBits == 0 {
+					t.UnsupportedAttributes = true
+				}
 			}
 			attrs = attrs[4:]
 			continue
@@ -66,12 +75,10 @@ func decodeTransform(b []byte) (Transform, bool, []byte, error) {
 		if length > len(attrs) {
 			return Transform{}, false, nil, fmt.Errorf("ike: invalid transform attribute length %d", valueLength)
 		}
-		if at == AttrKeyLength {
-			if valueLength != 2 {
-				return Transform{}, false, nil, fmt.Errorf("ike: invalid key length attribute")
-			}
-			t.KeyLengthBits = binary.BigEndian.Uint16(attrs[4:6])
-		}
+		// RFC 7296 §3.3.5 defines Key Length in TV format. Every TLV
+		// attribute is therefore unsupported by this implementation, but it
+		// invalidates only this transform, not the surrounding proposal.
+		t.UnsupportedAttributes = true
 		attrs = attrs[length:]
 	}
 	return t, more, b[tlen:], nil

@@ -11,14 +11,15 @@ func encodedChildProposal(encryption Transform) []byte {
 
 func TestDecodeChildProposalNormalizesChaChaKeyLength(t *testing.T) {
 	want := ChildSA{EncrID: ENCR_CHACHA20_POLY1305, EncrKeyBits: 256}
-	for _, bits := range []uint16{0, 256} {
-		_, got, _, err := decodeChildProposal(encodedChildProposal(Transform{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305, KeyLengthBits: bits}), &want)
-		if err != nil {
-			t.Fatalf("key length %d: %v", bits, err)
-		}
-		if got.KeyLengthBits != 256 {
-			t.Fatalf("key length %d normalized to %d, want 256", bits, got.KeyLengthBits)
-		}
+	_, got, _, err := decodeChildProposal(encodedChildProposal(Transform{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305}), &want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.KeyLengthBits != 256 {
+		t.Fatalf("key length normalized to %d, want 256", got.KeyLengthBits)
+	}
+	if _, _, _, err := decodeChildProposal(encodedChildProposal(Transform{Type: TransEncr, ID: ENCR_CHACHA20_POLY1305, KeyLengthBits: 256}), &want); err == nil {
+		t.Fatal("accepted Key Length attribute for fixed-length ChaCha20-Poly1305")
 	}
 }
 
@@ -34,6 +35,26 @@ func TestDecodeChildProposalRejectsInvalidShape(t *testing.T) {
 		if _, _, _, err := decodeChildProposal(EncodeSA([]Proposal{proposal}), nil); err == nil {
 			t.Fatalf("accepted invalid proposal %+v", proposal)
 		}
+	}
+}
+
+func TestSelectChildRekeyProposalSkipsAttributedTransform(t *testing.T) {
+	want := ChildSA{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128}
+	proposal := Proposal{
+		Number: 1, Protocol: ProtoESP, SPI: []byte{1, 2, 3, 4},
+		Transforms: []Transform{
+			{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128},
+			{Type: TransEncr, ID: ENCR_AES_GCM_16, KeyLengthBits: 128},
+			{Type: TransESN, ID: ESN_NO},
+		},
+	}
+	raw := addUnknownTVAttributeToFirstTransform(EncodeSA([]Proposal{proposal}))
+	_, selected, _, err := selectChildRekeyProposal(raw, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.UnsupportedAttributes || selected.ID != want.EncrID || selected.KeyLengthBits != want.EncrKeyBits {
+		t.Fatalf("selected transform = %#v", selected)
 	}
 }
 

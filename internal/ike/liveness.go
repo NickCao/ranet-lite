@@ -577,7 +577,7 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
-	p, encr, remoteSPI, err := decodeChildProposal(payloads.sa.Body, &child)
+	p, encr, remoteSPI, err := selectChildRekeyProposal(payloads.sa.Body, child)
 	if err != nil {
 		return s.responseNotify(ctx, msgID, CREATE_CHILD_SA, N_NO_PROPOSAL_CHOSEN)
 	}
@@ -599,7 +599,13 @@ func (s *Session) handleChildRekey(ctx *ikeContext, msgID uint32, inner []RawPay
 	if err := s.replaceChild(replacement); err != nil {
 		return nil, err
 	}
-	response := Proposal{Number: p.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{{Type: TransEncr, ID: encr.ID, KeyLengthBits: encr.KeyLengthBits}, {Type: TransESN, ID: ESN_NO}}}
+	responseEncr := encr
+	if responseEncr.ID == ENCR_CHACHA20_POLY1305 {
+		// RFC 7296 §3.3.6 returns selected attributes unchanged; the fixed-key
+		// ChaCha20-Poly1305 transform was offered without Key Length.
+		responseEncr.KeyLengthBits = 0
+	}
+	response := Proposal{Number: p.Number, Protocol: ProtoESP, SPI: spi[:], Transforms: []Transform{responseEncr, {Type: TransESN, ID: ESN_NO}}}
 	return s.response(ctx, msgID, CREATE_CHILD_SA, []RawPayload{{Type: PayloadSA, Body: EncodeSA([]Proposal{response})}, {Type: PayloadNonce, Body: EncodeNonce(nr)}, {Type: PayloadTSi, Body: payloads.tsi.Body}, {Type: PayloadTSr, Body: payloads.tsr.Body}})
 }
 

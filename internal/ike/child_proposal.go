@@ -79,6 +79,12 @@ func canonicalEncryptionTransform(t Transform) (Transform, error) {
 	if t.Type != TransEncr {
 		return Transform{}, fmt.Errorf("ike: expected an encryption transform")
 	}
+	if t.UnsupportedAttributes {
+		return Transform{}, fmt.Errorf("ike: encryption transform has unsupported attributes")
+	}
+	if t.ID == ENCR_CHACHA20_POLY1305 && t.KeyLengthBits != 0 {
+		return Transform{}, fmt.Errorf("ike: ChaCha20-Poly1305 has a fixed key length")
+	}
 	if _, err := aeadParams(t.ID, t.KeyLengthBits); err != nil {
 		return Transform{}, err
 	}
@@ -117,7 +123,7 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 			}
 			haveEncryption = true
 		case TransESN:
-			if haveESN || transform.ID != ESN_NO || transform.KeyLengthBits != 0 {
+			if haveESN || transform.ID != ESN_NO || transform.KeyLengthBits != 0 || transform.UnsupportedAttributes {
 				return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal has an unsupported ESN transform")
 			}
 			haveESN = true
@@ -129,7 +135,11 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: incomplete Child SA proposal")
 	}
 	if expected != nil {
-		want, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: expected.EncrKeyBits})
+		wantBits := expected.EncrKeyBits
+		if expected.EncrID == ENCR_CHACHA20_POLY1305 {
+			wantBits = 0
+		}
+		want, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
 		if err != nil || encryption.ID != want.ID || encryption.KeyLengthBits != want.KeyLengthBits {
 			return Proposal{}, Transform{}, 0, fmt.Errorf("ike: Child SA proposal changed encryption transform")
 		}
@@ -150,4 +160,49 @@ func decodeChildProposal(body []byte, expected *ChildSA) (Proposal, Transform, u
 		}
 	}
 	return p, encryption, remoteSPI, nil
+}
+
+// selectChildRekeyProposal selects the current Child SA's encryption suite
+// from a peer's offer. RFC 7296 §3.3.6 requires skipping an unacceptable
+// transform while continuing with other transforms of the same type.
+func selectChildRekeyProposal(body []byte, expected ChildSA) (Proposal, Transform, uint32, error) {
+	props, err := DecodeSA(body)
+	if err != nil {
+		return Proposal{}, Transform{}, 0, fmt.Errorf("ike: invalid Child SA proposal")
+	}
+	wantBits := expected.EncrKeyBits
+	if expected.EncrID == ENCR_CHACHA20_POLY1305 {
+		wantBits = 0
+	}
+	want, err := canonicalEncryptionTransform(Transform{Type: TransEncr, ID: expected.EncrID, KeyLengthBits: wantBits})
+	if err != nil {
+		return Proposal{}, Transform{}, 0, err
+	}
+	for _, p := range props {
+		if p.Number == 0 || p.Protocol != ProtoESP || len(p.SPI) != 4 || binary.BigEndian.Uint32(p.SPI) == 0 {
+			continue
+		}
+		var encryption Transform
+		var haveEncryption, haveESN, unacceptable bool
+		for _, transform := range p.Transforms {
+			switch transform.Type {
+			case TransEncr:
+				candidate, err := canonicalEncryptionTransform(transform)
+				if err == nil && !haveEncryption && candidate.ID == want.ID && candidate.KeyLengthBits == want.KeyLengthBits {
+					encryption = candidate
+					haveEncryption = true
+				}
+			case TransESN:
+				if !haveESN && transform.ID == ESN_NO && transform.KeyLengthBits == 0 && !transform.UnsupportedAttributes {
+					haveESN = true
+				}
+			default:
+				unacceptable = true
+			}
+		}
+		if !unacceptable && haveEncryption && haveESN {
+			return p, encryption, binary.BigEndian.Uint32(p.SPI), nil
+		}
+	}
+	return Proposal{}, Transform{}, 0, fmt.Errorf("ike: no acceptable Child SA proposal")
 }
