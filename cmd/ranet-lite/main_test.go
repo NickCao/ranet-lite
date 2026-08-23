@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"testing"
-	"time"
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/config"
@@ -25,19 +24,31 @@ func TestInboundBatchOrderDeliversCompletedBatchesInReceiveOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	firstResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
+	secondResult := inboundDecrypted{authenticated: new(esp.AuthenticatedPacket)}
+	completed := make(chan *inboundBatch, 2)
+	recycled := make(chan *inboundBatch, 2)
 	delivered := make(chan byte, 2)
-	secondDone := make(chan struct{})
+	emitterDone := make(chan struct{})
 	go func() {
-		order.deliver(second, func() { delivered <- 2 })
-		close(secondDone)
+		emitInboundBatches(completed, recycled, func(results []inboundDecrypted) {
+			if results[0].authenticated == firstResult.authenticated {
+				delivered <- 1
+			} else {
+				delivered <- 2
+			}
+		})
+		close(emitterDone)
 	}()
+	completed <- &inboundBatch{ticket: second, results: []inboundDecrypted{secondResult}}
 	select {
 	case got := <-delivered:
 		t.Fatalf("later batch %d delivered before the first batch", got)
-	case <-time.After(20 * time.Millisecond):
+	default:
 	}
-	order.deliver(first, func() { delivered <- 1 })
-	<-secondDone
+	completed <- &inboundBatch{ticket: first, results: []inboundDecrypted{firstResult}}
+	close(completed)
+	<-emitterDone
 	close(delivered)
 
 	var got []byte

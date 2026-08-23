@@ -2,7 +2,9 @@ package netstack
 
 import (
 	"fmt"
+	"log"
 	"net/netip"
+	"runtime"
 	"sync"
 
 	"github.com/NickCao/ranet-lite/sadr"
@@ -17,9 +19,21 @@ type Peer struct {
 
 	reserveMu sync.Mutex
 	reserved  uint64
-	sendMu    sync.Mutex
-	sendCond  *sync.Cond
-	nextSend  uint64
+
+	// Reserved peers hand completed crypto batches to one sender. slots bounds
+	// the total number of batches that may be encrypting, queued out of order,
+	// or in the transport syscall at once.
+	completed  chan *peerBatch
+	slots      chan struct{}
+	stop       chan struct{}
+	senderDone chan struct{}
+	closeOnce  sync.Once
+
+	// Compatibility peers allocate their sequence number during encryption,
+	// so their complete encrypt/send operation remains synchronously ordered.
+	sendMu   sync.Mutex
+	sendCond *sync.Cond
+	nextSend uint64
 }
 
 // BatchSealer consumes a sequence range previously reserved from one outbound
@@ -54,8 +68,27 @@ func NewPeerReserved(id string, reserveFn func(count int) (BatchSealer, error), 
 
 func newPeer(id string, encryptFn func(raw []byte, nextHeader byte) ([]byte, error), reserveFn func(count int) (BatchSealer, error), transmitBatchFn func(sealed [][]byte) error) *Peer {
 	p := &Peer{ID: id, encryptFn: encryptFn, reserveFn: reserveFn, transmitBatchFn: transmitBatchFn}
-	p.sendCond = sync.NewCond(&p.sendMu)
+	if reserveFn == nil {
+		p.sendCond = sync.NewCond(&p.sendMu)
+	} else {
+		queueSize := max(2, 2*runtime.GOMAXPROCS(0))
+		p.completed = make(chan *peerBatch, queueSize)
+		p.slots = make(chan struct{}, queueSize)
+		p.stop = make(chan struct{})
+		p.senderDone = make(chan struct{})
+		go p.senderLoop()
+	}
 	return p
+}
+
+// Close stops the reserved peer's ordered sender. Compatibility peers do not
+// own a goroutine, so closing them is a no-op.
+func (p *Peer) Close() {
+	if p == nil || p.stop == nil {
+		return
+	}
+	p.closeOnce.Do(func() { close(p.stop) })
+	<-p.senderDone
 }
 
 // SendRaw transmits a hand-built tunnel-mode IP packet directly through this
@@ -77,16 +110,27 @@ type peerBatch struct {
 	raw      [][]byte
 	headers  []byte
 	err      error
+	done     chan error
+	hasSlot  bool
 }
 
 // reserveBatch assigns both the peer's transmission ticket and, when
 // supported, its ESP sequence range under one lock. Consequently ticket order,
 // sequence-range order, and the TUN intake order established by Mesh agree.
 func (p *Peer) reserveBatch(count int) *peerBatch {
+	hasSlot := false
+	if p.slots != nil {
+		select {
+		case p.slots <- struct{}{}:
+			hasSlot = true
+		case <-p.stop:
+			return &peerBatch{peer: p, reserved: true, err: fmt.Errorf("netstack: peer %s closed", p.ID)}
+		}
+	}
 	p.reserveMu.Lock()
 	ticket := p.reserved
 	p.reserved++
-	b := &peerBatch{peer: p, ticket: ticket, reserved: p.reserveFn != nil}
+	b := &peerBatch{peer: p, ticket: ticket, reserved: p.reserveFn != nil, hasSlot: hasSlot}
 	if p.reserveFn != nil {
 		b.sealer, b.err = p.reserveFn(count)
 	}
@@ -120,12 +164,41 @@ func (b *peerBatch) seal(raw []byte, nextHeader byte) {
 	b.headers = append(b.headers, nextHeader)
 }
 
-// transmit waits only at the final ordered-send boundary. Range-reserving
-// peers have already encrypted in parallel. The compatibility path encrypts
-// here so its scheduler-dependent sequence allocation cannot overtake an
-// earlier batch.
+// enqueue hands a completed reserved batch to the dedicated ordered sender and
+// returns as soon as the bounded queue accepts it. That keeps crypto workers
+// available while an earlier batch is in sendmmsg. Compatibility peers retain
+// their synchronous ordered path.
+func (b *peerBatch) enqueue() error {
+	p := b.peer
+	if p.completed == nil {
+		return b.transmit()
+	}
+	select {
+	case p.completed <- b:
+		return nil
+	case <-p.stop:
+		b.releaseSlot()
+		return fmt.Errorf("netstack: peer %s closed", p.ID)
+	}
+}
+
+// transmit is the synchronous form used by control traffic and tests. Routed
+// data uses enqueue so workers never wait for the transport syscall.
 func (b *peerBatch) transmit() error {
 	p := b.peer
+	if p.completed != nil {
+		b.done = make(chan error, 1)
+		if err := b.enqueue(); err != nil {
+			return err
+		}
+		select {
+		case err := <-b.done:
+			return err
+		case <-p.stop:
+			return fmt.Errorf("netstack: peer %s closed", p.ID)
+		}
+	}
+
 	p.sendMu.Lock()
 	for b.ticket != p.nextSend {
 		p.sendCond.Wait()
@@ -136,6 +209,11 @@ func (b *peerBatch) transmit() error {
 		p.sendMu.Unlock()
 	}()
 
+	return b.send()
+}
+
+func (b *peerBatch) send() error {
+	p := b.peer
 	if !b.reserved && b.err == nil {
 		for i, raw := range b.raw {
 			sealed, err := p.encryptFn(raw, b.headers[i])
@@ -152,6 +230,39 @@ func (b *peerBatch) transmit() error {
 		}
 	}
 	return b.err
+}
+
+func (b *peerBatch) releaseSlot() {
+	if b.hasSlot {
+		<-b.peer.slots
+		b.hasSlot = false
+	}
+}
+
+func (p *Peer) senderLoop() {
+	defer close(p.senderDone)
+	pending := make(map[uint64]*peerBatch, cap(p.completed))
+	next := uint64(0)
+	for {
+		if b := pending[next]; b != nil {
+			delete(pending, next)
+			err := b.send()
+			b.releaseSlot()
+			if b.done != nil {
+				b.done <- err
+			} else if err != nil {
+				log.Printf("netstack: send batch through peer %s: %v", p.ID, err)
+			}
+			next++
+			continue
+		}
+		select {
+		case b := <-p.completed:
+			pending[b.ticket] = b
+		case <-p.stop:
+			return
+		}
+	}
 }
 
 type routeKey struct {

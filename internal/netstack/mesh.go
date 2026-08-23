@@ -151,7 +151,7 @@ func (m *Mesh) outboundWorker() {
 			}
 		}
 		for _, peer := range peerOrder {
-			if err := batches[peer].transmit(); err != nil {
+			if err := batches[peer].enqueue(); err != nil {
 				log.Printf("netstack: send batch through peer %s: %v", peer.ID, err)
 			}
 		}

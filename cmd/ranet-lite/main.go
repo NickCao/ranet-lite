@@ -50,20 +50,15 @@ const reconnectDelay = 10 * time.Second
 var inboundWorkers = max(1, runtime.GOMAXPROCS(0))
 
 // inboundBatchOrder assigns receive-order tickets under the same lock that
-// reads from the transport, then admits completed batches to replay commit and
-// TUN delivery in ticket order.
+// reads from the transport. Workers authenticate independently; the dedicated
+// emitter later consumes completed batches in ticket order.
 type inboundBatchOrder struct {
 	receiveMu sync.Mutex
 	reserved  uint64
-	deliverMu sync.Mutex
-	cond      *sync.Cond
-	next      uint64
 }
 
 func newInboundBatchOrder() *inboundBatchOrder {
-	o := new(inboundBatchOrder)
-	o.cond = sync.NewCond(&o.deliverMu)
-	return o
+	return new(inboundBatchOrder)
 }
 
 func (o *inboundBatchOrder) receive(receive func() error) (uint64, error) {
@@ -77,15 +72,37 @@ func (o *inboundBatchOrder) receive(receive func() error) (uint64, error) {
 	return ticket, nil
 }
 
-func (o *inboundBatchOrder) deliver(ticket uint64, deliver func()) {
-	o.deliverMu.Lock()
-	for ticket != o.next {
-		o.cond.Wait()
+type inboundDecrypted struct {
+	authenticated *esp.AuthenticatedPacket
+	err           error
+}
+
+type inboundBatch struct {
+	ticket  uint64
+	results []inboundDecrypted
+}
+
+// emitInboundBatches absorbs out-of-order worker completions and emits only
+// the next receive-order batch. recycle bounds the entire pipeline: workers
+// cannot receive another batch until the emitter returns one of these objects.
+func emitInboundBatches(completed <-chan *inboundBatch, recycle chan<- *inboundBatch, emit func([]inboundDecrypted)) {
+	pending := make(map[uint64]*inboundBatch, cap(completed))
+	next := uint64(0)
+	for batch := range completed {
+		pending[batch.ticket] = batch
+		for {
+			ready := pending[next]
+			if ready == nil {
+				break
+			}
+			delete(pending, next)
+			emit(ready.results)
+			clear(ready.results)
+			ready.results = ready.results[:0]
+			recycle <- ready
+			next++
+		}
 	}
-	deliver()
-	o.next++
-	o.cond.Broadcast()
-	o.deliverMu.Unlock()
 }
 
 func main() {
@@ -468,23 +485,19 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		return sequenceRange.Seal, nil
 	}, sess.Mux().SendESPBatch)
+	defer peer.Close()
 	peerHandle := speaker.AddPeer(peer)
 	defer peerHandle.Close()
 
-	// Each receive worker owns a complete UDP batch through authentication,
-	// replay commit, validation, and TUN delivery. Packet intake and the cheap
-	// replay/delivery reservation are serialized, while AEAD work runs outside
-	// the lock. Completed batches wait only at the final commit/write boundary,
-	// preserving receive order without per-packet goroutines or channels.
-	type decrypted struct {
-		authenticated *esp.AuthenticatedPacket
-		err           error
-	}
-	decrypt := func(pkt []byte) decrypted {
+	// Fixed workers own complete UDP batches through authentication. Completed
+	// batches enter one bounded queue; a dedicated emitter commits replay state
+	// and writes TUN batches in receive order. Crypto workers therefore never
+	// occupy all execution contexts waiting for the serialized TUN boundary.
+	decrypt := func(pkt []byte) inboundDecrypted {
 		saMu.RLock()
 		candidates := append([]inboundSA(nil), inbound...)
 		saMu.RUnlock()
-		var r decrypted
+		var r inboundDecrypted
 		for _, candidate := range candidates {
 			r.authenticated, r.err = candidate.sa.Authenticate(pkt)
 			if r.err == nil {
@@ -493,7 +506,7 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		}
 		return r
 	}
-	innerPacket := func(r decrypted) []byte {
+	innerPacket := func(r inboundDecrypted) []byte {
 		if r.err != nil {
 			log.Printf("peer %s: dropping undecryptable ESP packet: %v", name, r.err)
 			return nil
@@ -520,35 +533,47 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 
 	runESP := func() error {
 		order := newInboundBatchOrder()
+		queueSize := max(2, 2*inboundWorkers)
+		freeBatches := make(chan *inboundBatch, queueSize)
+		completed := make(chan *inboundBatch, queueSize)
+		for range queueSize {
+			freeBatches <- &inboundBatch{results: make([]inboundDecrypted, 0, 128)}
+		}
+
+		emitterDone := make(chan struct{})
+		go func() {
+			defer close(emitterDone)
+			plain := make([][]byte, 0, 128)
+			emitInboundBatches(completed, freeBatches, func(results []inboundDecrypted) {
+				plain = plain[:0]
+				for _, result := range results {
+					if raw := innerPacket(result); raw != nil {
+						plain = append(plain, raw)
+					}
+				}
+				mesh.DeliverInboundBatch(plain)
+			})
+		}()
 
 		worker := func() error {
 			var packets [][]byte
-			results := make([]decrypted, 0, 128)
-			plain := make([][]byte, 0, 128)
 			for {
+				batch := <-freeBatches
 				packets = packets[:0]
 				ticket, err := order.receive(func() (err error) {
 					packets, err = sess.Mux().RecvESPBatch(packets)
 					return err
 				})
 				if err != nil {
+					freeBatches <- batch
 					return err
 				}
 
-				results = results[:0]
+				batch.ticket = ticket
 				for _, pkt := range packets {
-					results = append(results, decrypt(pkt))
+					batch.results = append(batch.results, decrypt(pkt))
 				}
-
-				order.deliver(ticket, func() {
-					plain = plain[:0]
-					for _, result := range results {
-						if raw := innerPacket(result); raw != nil {
-							plain = append(plain, raw)
-						}
-					}
-					mesh.DeliverInboundBatch(plain)
-				})
+				completed <- batch
 			}
 		}
 
@@ -564,6 +589,8 @@ func connectPeer(ctx context.Context, priv ed25519.PrivateKey, cfg *config.Confi
 		err := <-errs
 		_ = sess.Mux().Close()
 		workers.Wait()
+		close(completed)
+		<-emitterDone
 		return err
 	}
 	type sessionResult struct {

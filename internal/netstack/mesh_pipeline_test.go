@@ -67,6 +67,7 @@ func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
 		transmitted <- sealed[0][0]
 		return nil
 	})
+	defer peer.Close()
 
 	first := peer.reserveBatch(1)
 	second := peer.reserveBatch(1)
@@ -104,6 +105,66 @@ func TestReservedPeerBatchesEncryptParallelAndTransmitInOrder(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte{1, 2}) {
 		t.Fatalf("transmission sequence order = %v, want [1 2]", got)
+	}
+}
+
+func TestReservedPeerWorkersDoNotWaitForOrderedSender(t *testing.T) {
+	startedSend := make(chan struct{})
+	releaseSend := make(chan struct{})
+	var releaseOnce sync.Once
+	transmitted := make(chan byte, 2)
+	nextSequence := byte(1)
+	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
+		sequence := nextSequence
+		nextSequence++
+		return func([]byte, byte) ([]byte, error) { return []byte{sequence}, nil }, nil
+	}, func(sealed [][]byte) error {
+		if sealed[0][0] == 1 {
+			close(startedSend)
+			<-releaseSend
+		}
+		transmitted <- sealed[0][0]
+		return nil
+	})
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseSend) })
+		peer.Close()
+	})
+
+	first := peer.reserveBatch(1)
+	first.seal([]byte{1}, 0)
+	if err := first.enqueue(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-startedSend:
+	case <-time.After(time.Second):
+		t.Fatal("ordered sender did not start the first batch")
+	}
+
+	second := peer.reserveBatch(1)
+	second.seal([]byte{2}, 0)
+	enqueued := make(chan error, 1)
+	go func() { enqueued <- second.enqueue() }()
+	select {
+	case err := <-enqueued:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker waited for the ordered sender instead of enqueueing its batch")
+	}
+
+	releaseOnce.Do(func() { close(releaseSend) })
+	for want := byte(1); want <= 2; want++ {
+		select {
+		case got := <-transmitted:
+			if got != want {
+				t.Fatalf("transmitted sequence %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for transmitted sequence %d", want)
+		}
 	}
 }
 
