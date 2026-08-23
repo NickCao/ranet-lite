@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
-	"runtime"
 	"sync"
 
 	"github.com/NickCao/ranet-lite/esp"
@@ -26,9 +25,13 @@ import (
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
 
-// outboundWorkers is the number of long-lived encryption goroutines shared
-// across every peer.
-var outboundWorkers = min(runtime.NumCPU(), 16)
+// ESP sequence numbers are allocated by encryptFn, while emitter deliberately
+// restores the TUN's packet order. Multiple encryption workers could therefore
+// assign sequence numbers in worker-scheduling order but send them in TUN
+// order, pushing valid packets outside the receiver's anti-replay window. One
+// worker keeps those orders identical; profiling also shows AEAD is not the
+// outbound bottleneck on a single core.
+const outboundWorkers = 1
 
 // outboundContainerBufSize bounds how many Device.Read batches can wait for
 // ordered emission while their individual packets are encrypted.
