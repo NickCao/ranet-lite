@@ -1,6 +1,9 @@
 package ike
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func encodedChildProposal(encryption Transform) []byte {
 	return EncodeSA([]Proposal{{
@@ -73,6 +76,16 @@ func TestDecodeChildExchangePayloadsRejectsDuplicatesAndCriticalUnknowns(t *test
 		if _, err := decodeChildExchangePayloads(payloads); err == nil {
 			t.Fatalf("accepted invalid extra payload %+v", extra)
 		}
+	}
+}
+
+func TestDecodeChildRekeyResponseHandlesNotifyOnlyError(t *testing.T) {
+	_, err := decodeChildRekeyResponse([]RawPayload{{
+		Type: PayloadN,
+		Body: EncodeNotify(Notify{Type: N_TEMPORARY_FAILURE}),
+	}})
+	if err == nil || !strings.Contains(err.Error(), "rejected: notify type 43") {
+		t.Fatalf("notify-only response error = %v", err)
 	}
 }
 

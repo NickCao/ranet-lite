@@ -61,14 +61,9 @@ func (s *Session) rekeyChild(alreadyRunningIsSuccess bool) error {
 		return fmt.Errorf("ike: Child SA rekey request: %w", err)
 	}
 
-	payloads, err := decodeChildExchangePayloads(response)
+	payloads, err := decodeChildRekeyResponse(response)
 	if err != nil {
-		return fmt.Errorf("ike: invalid Child SA rekey response: %w", err)
-	}
-	for _, notify := range payloads.notifies {
-		if notify.Type < 16384 {
-			return fmt.Errorf("ike: Child SA rekey rejected: notify type %d", notify.Type)
-		}
+		return err
 	}
 	if err := validateFullRangeSelectors(payloads.tsi, payloads.tsr); err != nil {
 		return err
@@ -108,4 +103,23 @@ func (s *Session) rekeyChild(alreadyRunningIsSuccess bool) error {
 		}
 	}
 	return fmt.Errorf("ike: Child SA retire response did not delete peer inbound SPI")
+}
+
+func decodeChildRekeyResponse(response []RawPayload) (childExchangePayloads, error) {
+	payloads, err := parseChildExchangePayloads(response)
+	if err != nil {
+		return childExchangePayloads{}, fmt.Errorf("ike: invalid Child SA rekey response: %w", err)
+	}
+	// An error response can consist solely of a Notify payload. Interpret the
+	// authenticated error before requiring the SA, Nr, TSi, and TSr payloads
+	// that RFC 7296 §1.3.3 specifies for a successful rekey response.
+	for _, notify := range payloads.notifies {
+		if notify.Type < 16384 {
+			return childExchangePayloads{}, fmt.Errorf("ike: Child SA rekey rejected: notify type %d", notify.Type)
+		}
+	}
+	if err := validateCompleteChildExchange(payloads); err != nil {
+		return childExchangePayloads{}, fmt.Errorf("ike: invalid Child SA rekey response: %w", err)
+	}
+	return payloads, nil
 }

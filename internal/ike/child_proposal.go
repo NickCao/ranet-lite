@@ -30,6 +30,17 @@ type childExchangePayloads struct {
 }
 
 func decodeChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, error) {
+	out, err := parseChildExchangePayloads(payloads)
+	if err != nil {
+		return childExchangePayloads{}, err
+	}
+	if err := validateCompleteChildExchange(out); err != nil {
+		return childExchangePayloads{}, err
+	}
+	return out, nil
+}
+
+func parseChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, error) {
 	var out childExchangePayloads
 	setUnique := func(dst **RawPayload, payload *RawPayload) error {
 		if *dst != nil {
@@ -67,10 +78,14 @@ func decodeChildExchangePayloads(payloads []RawPayload) (childExchangePayloads, 
 			return childExchangePayloads{}, err
 		}
 	}
-	if out.sa == nil || out.nonce == nil || out.tsi == nil || out.tsr == nil || !validNonce(out.nonce.Body) {
-		return childExchangePayloads{}, fmt.Errorf("ike: incomplete Child SA exchange")
-	}
 	return out, nil
+}
+
+func validateCompleteChildExchange(payloads childExchangePayloads) error {
+	if payloads.sa == nil || payloads.nonce == nil || payloads.tsi == nil || payloads.tsr == nil || !validNonce(payloads.nonce.Body) {
+		return fmt.Errorf("ike: incomplete Child SA exchange")
+	}
+	return nil
 }
 
 func validNonce(nonce []byte) bool { return len(nonce) >= 16 && len(nonce) <= 256 }
