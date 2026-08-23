@@ -512,6 +512,10 @@ func Initiate(cfg PeerConfig) (*Session, error) {
 		}
 		break
 	}
+	if err := validateResponseCriticalFlags(resp.Payloads); err != nil {
+		mux.Close()
+		return nil, err
+	}
 
 	spiR := resp.Header.SPIResponder
 	supportsIdentity, err := supportsSignatureHash(resp.Payloads, HashIdentity)
@@ -706,6 +710,12 @@ func (s *Session) deleteAuthenticatedIKE() error {
 	if err != nil {
 		return err
 	}
+	if err := validateResponseCriticalFlags(resp.Payloads); err != nil {
+		return err
+	}
+	if err := validateResponseCriticalFlags(inner); err != nil {
+		return err
+	}
 	if len(inner) != 0 {
 		return fmt.Errorf("ike: IKE Delete response is not empty")
 	}
@@ -756,6 +766,12 @@ func (s *Session) doIKEAuth(cfg PeerConfig, realMessage1, realMessage2, ni, nr [
 	}
 	respInner, err := DecryptMessage(s.current.suite, s.current.sker, respRaw, resp)
 	if err != nil {
+		return false, err
+	}
+	if err := validateResponseCriticalFlags(resp.Payloads); err != nil {
+		return false, err
+	}
+	if err := validateResponseCriticalFlags(respInner); err != nil {
 		return false, err
 	}
 	respMsg := &Message{Header: resp.Header, Payloads: respInner}

@@ -32,6 +32,17 @@ type Message struct {
 	skHeaderOffset int
 }
 
+// RFC 7296 §2.5 forbids setting the Critical bit on every payload carried in
+// an IKE response, whether or not this implementation recognizes its type.
+func validateResponseCriticalFlags(payloads []RawPayload) error {
+	for _, payload := range payloads {
+		if payload.Critical {
+			return fmt.Errorf("ike: response payload type %d sets the critical flag", payload.Type)
+		}
+	}
+	return nil
+}
+
 // Encode serializes the message. It does not encrypt; callers that need an
 // SK payload must pre-build it (see sk.go) and pass it as the sole payload
 // after the header's cleartext payloads, i.e. call EncodeWithFirstNext with

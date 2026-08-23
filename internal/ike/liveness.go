@@ -416,6 +416,16 @@ func (s *Session) dispatch(raw []byte, source transport.Endpoint, pending **pend
 		return true
 	}
 	if matching != nil {
+		if err := validateResponseCriticalFlags(outer.Payloads); err != nil {
+			matching.result <- requestResult{err: err}
+			*pending = nil
+			return true
+		}
+		if err := validateResponseCriticalFlags(inner); err != nil {
+			matching.result <- requestResult{err: err}
+			*pending = nil
+			return true
+		}
 		matching.result <- requestResult{inner: inner}
 		*pending = nil
 		return true

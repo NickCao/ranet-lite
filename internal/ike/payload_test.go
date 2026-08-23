@@ -23,6 +23,17 @@ func TestDecodeMessageRejectsTrailingPayloadBytes(t *testing.T) {
 	}
 }
 
+func TestResponsePayloadsRejectCriticalFlag(t *testing.T) {
+	for _, payloadType := range []PayloadType{PayloadSA, PayloadType(250)} {
+		if err := validateResponseCriticalFlags([]RawPayload{{Type: payloadType, Critical: true}}); err == nil {
+			t.Fatalf("accepted critical response payload type %d", payloadType)
+		}
+	}
+	if err := validateResponseCriticalFlags([]RawPayload{{Type: PayloadType(250)}}); err != nil {
+		t.Fatalf("rejected ignorable noncritical response payload: %v", err)
+	}
+}
+
 func TestIKEContextAllocatesUniqueIVs(t *testing.T) {
 	context := &ikeContext{suite: SASuite{EncrID: ENCR_AES_GCM_16, EncrKeyBits: 128}}
 	key := make([]byte, 20)
