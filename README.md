@@ -58,6 +58,52 @@ separate routing daemon (e.g. BIRD) that peers with the embedded Babel
 speaker over the device for fully automatic route installation — is up to
 whoever runs it.
 
+## Deliberate protocol deviations
+
+ranet-lite uses a private IKEv2 transport profile tailored to a ranet
+deployment rather than general-purpose
+[RFC 7296 NAT traversal](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.23).
+The RFC uses UDP ports 500 and 4500, hashes the actual source and destination
+address/port pairs in the `NAT_DETECTION_*_IP` notifications, and moves
+subsequent traffic to port 4500 when NAT is detected. In contrast:
+
+- Each ranet node listens on its registry-assigned UDP port. The local and
+  remote ports are independent and need not have the same value; NAT may
+  rewrite either one again.
+- IKE and ESP always share that one UDP path. Every IKE packet, including
+  `IKE_SA_INIT`, has the four-byte Non-ESP Marker, while an ESP packet starts
+  directly with its nonzero SPI.
+- The initiator deliberately hashes a random IPv4 address and port zero in
+  `NAT_DETECTION_SOURCE_IP`, guaranteeing a mismatch so that strongSwan
+  installs UDP encapsulation even when no NAT is present. The destination
+  notification hashes the configured remote endpoint normally.
+- Received NAT-detection notifications are not used to select a transport:
+  there is no port-500-to-4500 transition and no dedicated
+  [RFC 3948](https://www.rfc-editor.org/rfc/rfc3948.html) NAT keepalive. The
+  userspace transport accepts UDP-encapsulated ESP only, not raw IP ESP.
+
+The strongSwan peer must therefore be provisioned for the same custom port
+and forced UDP encapsulation (`encap = true`). This profile remains usable
+when a NAT changes the observed source port: replies follow the observed
+source, and a fresh authenticated IKE request can update the stored peer
+endpoint. It is deliberately not interoperable with an otherwise generic
+peer expecting standard RFC 7296 port selection or raw ESP.
+
+There is one separate SHOULD-level deviation from
+[RFC 7296 section 2.25.1](https://www.rfc-editor.org/rfc/rfc7296.html#section-2.25.1).
+If both peers initiate a rekey of the same Child SA concurrently, ranet-lite
+answers the peer's rekey with `TEMPORARY_FAILURE`. The RFC recommends
+completing both exchanges, temporarily retaining the redundant SAs, and
+using the four nonces to decide which new SA to delete. Returning the error
+keeps ranet-lite's single-Child-SA state machine simple and causes the peer
+to retry after the local rekey finishes.
+
+The remaining narrow feature set is not counted as RFC non-compliance.
+Initiator-only establishment, raw-public-key authentication without
+certificates or EAP, omission of COOKIE handling, and refusal to create
+additional Child SAs are all within the
+[RFC 7815 minimal-initiator profile](https://www.rfc-editor.org/rfc/rfc7815.html).
+
 ## Building
 
 ```sh
