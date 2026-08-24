@@ -2,8 +2,11 @@ package esp
 
 import "fmt"
 
-// DefaultReplayWindow matches strongSwan's default Child SA replay window.
-const DefaultReplayWindow uint32 = 32
+// DefaultReplayWindow is deliberately wider than the minimum interoperable
+// window. RFC 4303 section 3.4.3 says receivers should increase the window in
+// high-speed environments; multicore IPsec senders routinely reorder bursts
+// by more than the 32-packet minimum before they reach userspace.
+const DefaultReplayWindow uint32 = 4096
 
 // replayWindow is an XFRM-style circular anti-replay bitmap. A zero window
 // disables replay checking, matching strongSwan's replay_window = 0 behavior.

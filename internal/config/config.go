@@ -31,8 +31,8 @@ type Config struct {
 	// TUN names an existing TUN device to attach to, or the device to create
 	// when it does not exist. Empty creates an automatically named ranet%d.
 	TUN string `yaml:"tun"`
-	// ReplayWindow matches strongSwan's child replay_window: omitted uses 32,
-	// while an explicit 0 disables replay checking.
+	// ReplayWindow controls the ESP receive window: omitted uses 4096 for
+	// high-speed multicore senders, while an explicit 0 disables checking.
 	ReplayWindow *uint32 `yaml:"replay_window"`
 	// Rekey intervals default to one hour for Child SAs and three hours for
 	// IKE SAs. An explicit zero disables the corresponding proactive rekey.
@@ -69,7 +69,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 
 func (c *Config) ReplayWindowSize() uint32 {
 	if c.ReplayWindow == nil {
-		return 32
+		return 4096
 	}
 	return *c.ReplayWindow
 }

@@ -70,6 +70,19 @@ func TestRekeyIntervals(t *testing.T) {
 	}
 }
 
+func TestReplayWindow(t *testing.T) {
+	if got := (&Config{}).ReplayWindowSize(); got != 4096 {
+		t.Fatalf("default replay window = %d, want 4096", got)
+	}
+
+	for _, want := range []uint32{0, 64, 8192} {
+		configured := want
+		if got := (&Config{ReplayWindow: &configured}).ReplayWindowSize(); got != want {
+			t.Fatalf("configured replay window = %d, want %d", got, want)
+		}
+	}
+}
+
 func TestLoadRejectsInvalidOperationalConfiguration(t *testing.T) {
 	for name, addition := range map[string]string{
 		"unknown field":         "unknown: true\n",

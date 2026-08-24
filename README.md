@@ -160,9 +160,10 @@ registry: /etc/ranet-lite/registry.json   # same registry.json ranet itself uses
 originate:
   - "10.66.0.5/32"
 
-# Optional anti-replay window. Omit for strongSwan's default of 32 packets;
-# set to 0 to disable replay checking.
-# replay_window: 32
+# Optional anti-replay window. Omit for the high-speed default of 4096
+# packets; RFC 4303 section 3.4.3 recommends increasing it for high-speed
+# environments. Set it to 0 only to explicitly disable replay checking.
+# replay_window: 4096
 
 # Proactive rekey intervals default to 1h for Child SAs and 3h for IKE SAs.
 # Set either to 0 to disable it. Rekeys run interval minus the 5m margin and
