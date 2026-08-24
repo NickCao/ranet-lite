@@ -97,6 +97,23 @@ func TestPackForGSOProvidesCoalescingCapacity(t *testing.T) {
 	}
 }
 
+func TestPackReceivedBatchDetachesReusableBuffers(t *testing.T) {
+	first := []byte("first")
+	second := []byte("second")
+	packets := packReceivedBatch([][]byte{first, second})
+
+	first[0] = 'x'
+	second[0] = 'y'
+	if string(packets[0]) != "first" || string(packets[1]) != "second" {
+		t.Fatalf("packed packets changed with receive buffers: got %q", packets)
+	}
+
+	packets[0][0] = 'F'
+	if packets[1][0] != 's' {
+		t.Fatalf("packet boundaries overlap: got %q", packets)
+	}
+}
+
 func TestHubFailureIsTerminal(t *testing.T) {
 	hub, err := NewHub(":0")
 	if err != nil {

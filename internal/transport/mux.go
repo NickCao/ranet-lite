@@ -169,7 +169,11 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 			} else {
 				spi := uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
 				if m := h.esp[spi]; m != nil {
-					espBatches[m] = append(espBatches[m], append([]byte(nil), raw...))
+					// Keep views into the receive buffers only until this socket
+					// batch has been demultiplexed. packReceivedBatch below moves
+					// all packets for a peer into one allocation before fn is
+					// allowed to reuse the buffers.
+					espBatches[m] = append(espBatches[m], raw)
 				}
 			}
 		}
@@ -182,11 +186,31 @@ func (h *Hub) receiveLoop(fn conn.ReceiveFunc) {
 			}
 		}
 		for m, packets := range espBatches {
+			packets = packReceivedBatch(packets)
 			if !m.dispatchESP(packets) {
 				log.Printf("transport: espCh full, dropping %d ESP packets", len(packets))
 			}
 		}
 	}
+}
+
+// packReceivedBatch detaches packets from receiveLoop's reusable recvmmsg
+// buffers with one allocation per peer and socket read, rather than one heap
+// allocation per datagram. Packet slice boundaries are retained so parallel
+// ESP workers can authenticate the batch without any further framing work.
+func packReceivedBatch(packets [][]byte) [][]byte {
+	total := 0
+	for _, packet := range packets {
+		total += len(packet)
+	}
+	storage := make([]byte, total)
+	offset := 0
+	for i, packet := range packets {
+		n := copy(storage[offset:], packet)
+		packets[i] = storage[offset : offset+n]
+		offset += n
+	}
+	return packets
 }
 
 // Mux is one peer's logical IKE and ESP channel on a Hub.

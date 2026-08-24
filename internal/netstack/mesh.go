@@ -29,6 +29,8 @@ const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 150
 
 const (
 	outboundPacketBufferSize = 2048
+	inboundWriteBatchSize    = 128
+	inboundWriteQueueSize    = 64
 	// inboundPacketBufferSize leaves enough tail capacity for the TUN
 	// backend to merge adjacent TCP packets into a single GSO frame before
 	// writing it. Exact-capacity packet buffers silently disable that GRO.
@@ -68,7 +70,7 @@ type Mesh struct {
 }
 
 type inboundWriteBatch struct {
-	bufs [][]byte
+	packets [][]byte
 }
 
 // New creates an automatically named TUN device.
@@ -254,11 +256,14 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 		if len(packets) == 0 {
 			continue
 		}
-		batch := inboundWriteBatch{bufs: copyInboundPackets(packets)}
+		// The authenticated plaintext remains owned by this queue entry.
+		// Deferring the required headroom copy to the writer keeps it off the
+		// ordered ESP commit path and lets the writer merge adjacent entries
+		// into a larger GRO batch.
+		batch := inboundWriteBatch{packets: packets}
 		select {
 		case m.inboundWriters[lane] <- batch:
 		case <-m.closed:
-			releaseInboundPackets(batch.bufs)
 		}
 	}
 }
@@ -269,33 +274,51 @@ func (m *Mesh) startInboundWriters() {
 	}
 	m.inboundWriters = make([]chan inboundWriteBatch, len(m.devs))
 	for lane := range m.devs {
-		queue := make(chan inboundWriteBatch, 2)
+		queue := make(chan inboundWriteBatch, inboundWriteQueueSize)
 		m.inboundWriters[lane] = queue
 		m.writerWG.Add(1)
 		go func() {
 			defer m.writerWG.Done()
+			pending := make([][]byte, 0, 2*inboundWriteBatchSize)
 			for {
+				var first inboundWriteBatch
 				select {
-				case batch := <-queue:
-					m.writeInbound(lane, batch.bufs)
+				case first = <-queue:
 				case <-m.closed:
 					// Deliveries that began before Close may still choose the
 					// buffered send arm after closed becomes readable. Wait for
-					// those sends before the final drain so no pooled buffer is
-					// stranded in an abandoned queue.
+					// those sends before abandoning their plaintext references.
 					m.deliveryWG.Wait()
-					for {
-						select {
-						case batch := <-queue:
-							releaseInboundPackets(batch.bufs)
-						default:
-							return
-						}
-					}
+					return
 				}
+
+				pending = collectReadyInbound(first, queue, pending)
+				for len(pending) != 0 {
+					n := min(len(pending), inboundWriteBatchSize)
+					m.writeInbound(lane, copyInboundPackets(pending[:n]))
+					clear(pending[:n])
+					pending = pending[n:]
+				}
+				pending = pending[:0]
 			}
 		}()
 	}
+}
+
+// collectReadyInbound drains only work that is already available. This keeps
+// the idle-path latency unchanged while giving a busy writer a full batch for
+// NativeTun.Write's GRO pass, reducing the number of TUN write syscalls.
+func collectReadyInbound(first inboundWriteBatch, queue <-chan inboundWriteBatch, pending [][]byte) [][]byte {
+	pending = append(pending, first.packets...)
+	for len(pending) < inboundWriteBatchSize {
+		select {
+		case batch := <-queue:
+			pending = append(pending, batch.packets...)
+		default:
+			return pending
+		}
+	}
+	return pending
 }
 
 func copyInboundPackets(raw [][]byte) [][]byte {

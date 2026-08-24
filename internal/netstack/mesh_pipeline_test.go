@@ -274,3 +274,23 @@ func TestDeliverInboundBatchUsesFlowAffineQueues(t *testing.T) {
 		t.Fatal("opposite directions of one flow mapped to different queues")
 	}
 }
+
+func TestCollectReadyInboundCoalescesQueuedDeliveries(t *testing.T) {
+	queue := make(chan inboundWriteBatch, 2)
+	queue <- inboundWriteBatch{packets: [][]byte{{2}, {3}}}
+	queue <- inboundWriteBatch{packets: [][]byte{{4}}}
+
+	got := collectReadyInbound(
+		inboundWriteBatch{packets: [][]byte{{1}}},
+		queue,
+		make([][]byte, 0, inboundWriteBatchSize),
+	)
+	if len(got) != 4 {
+		t.Fatalf("collected %d packets, want 4", len(got))
+	}
+	for i, packet := range got {
+		if len(packet) != 1 || packet[0] != byte(i+1) {
+			t.Fatalf("packet %d = %v, want [%d]", i, packet, i+1)
+		}
+	}
+}
