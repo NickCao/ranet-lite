@@ -312,8 +312,12 @@ Run as an ordinary user with unprivileged user namespaces available. The
 harness creates private client/gateway network namespaces, a private `/run`,
 strongSwan, BIRD, and a real TUN/XFRM tunnel using the synthetic test keys. It
 records binary identity, CPU affinity, iperf3 JSON, CPU profiles, socket drops,
-and key-free XFRM counters in a new output directory. All processes and
-interfaces are removed when the namespaces exit.
+TCP state, TUN queue statistics, and key-free XFRM counters in a new output
+directory. Each `*-cpu.json` records user/system CPU seconds and average cores
+used by the client and gateway processes, plus host CPU counters including
+softirq time. Host counters include other activity on the machine; process
+accounting and sampled profiles provide separate views of CPU use. All processes
+and interfaces are removed when the namespaces exit.
 
 `--cores` sets GOMAXPROCS; `--affinity` restricts the client to actual CPUs.
 Use `--cores 1 --affinity 0` for a pinned single-core comparison. Keep flow

@@ -67,6 +67,7 @@ if not args.client.is_file():
 commands = {}
 for name in [
     "ip",
+    "ss",
     "mount",
     "unshare",
     "nsenter",
@@ -126,6 +127,7 @@ with args.client.open("rb") as binary:
     + "\n"
 )
 processes = []
+process_names = {}
 
 
 def run(command, gateway=False, check=True, **kwargs):
@@ -153,6 +155,7 @@ def start(command, name, gateway=False, env=None):
     with (args.output / (name + ".log")).open("w") as log:
         proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
     processes.append(proc)
+    process_names[proc.pid] = name
     return proc
 
 
@@ -191,10 +194,84 @@ def sample_state(direction):
     (args.output / (direction + "-udp.txt")).write_text(
         run(["cat", "/proc/net/snmp"]).stdout
     )
+    (args.output / (direction + "-qdisc.txt")).write_text(
+        run(["tc", "-s", "qdisc", "show", "dev", "ranet0"]).stdout
+    )
     for side, gateway in [("client", False), ("gateway", True)]:
         (args.output / f"{direction}-{side}-packet-sockets.txt").write_text(
             run(["cat", "/proc/net/packet"], gateway=gateway).stdout
         )
+        (args.output / f"{direction}-{side}-tcp.txt").write_text(
+            run(["ss", "-tin"], gateway=gateway).stdout
+        )
+
+
+def cpu_snapshot():
+    """Read CPU time charged to the whole process, including kernel work.
+
+    Pair the sampled Go profile with process accounting and system counters.
+    System counters include both namespaces and any other activity on this
+    shared host, including softirq time not charged to individual processes.
+    """
+    snapshot = {"time": time.monotonic(), "processes": {}, "system": {}}
+    for proc in processes:
+        try:
+            # comm may contain spaces and parentheses. Fields after its final
+            # ')' start at field 3 (state); utime and stime are fields 14/15.
+            fields = (
+                Path(f"/proc/{proc.pid}/stat").read_text().rsplit(")", 1)[1].split()
+            )
+        except FileNotFoundError:
+            continue
+        snapshot["processes"][proc.pid] = {
+            "name": process_names[proc.pid],
+            "user": int(fields[11]),
+            "system": int(fields[12]),
+        }
+    for line in Path("/proc/stat").read_text().splitlines():
+        fields = line.split()
+        if fields[0] == "cpu":
+            # guest time is already included in user/nice. Do not add it twice.
+            snapshot["system"] = dict(
+                zip(
+                    [
+                        "user",
+                        "nice",
+                        "system",
+                        "idle",
+                        "iowait",
+                        "irq",
+                        "softirq",
+                        "steal",
+                    ],
+                    map(int, fields[1:9]),
+                )
+            )
+            break
+    return snapshot
+
+
+def cpu_usage(before, after):
+    elapsed = after["time"] - before["time"]
+    ticks = os.sysconf("SC_CLK_TCK")
+    result = {"elapsed_seconds": elapsed, "processes": {}, "system_average_cores": {}}
+    for pid, end in after["processes"].items():
+        start = before["processes"].get(pid)
+        if start is None:
+            continue
+        user = (end["user"] - start["user"]) / ticks
+        system = (end["system"] - start["system"]) / ticks
+        result["processes"][end["name"]] = {
+            "pid": pid,
+            "user_seconds": user,
+            "system_seconds": system,
+            "average_cores": (user + system) / elapsed,
+        }
+    result["system_average_cores"] = {
+        key: (value - before["system"][key]) / ticks / elapsed
+        for key, value in after["system"].items()
+    }
+    return result
 
 
 def traffic(label, address, flags, collect_profile=False):
@@ -221,11 +298,16 @@ def traffic(label, address, flags, collect_profile=False):
             + {"plain-bidir": 0, "outbound": 100, "inbound": 200, "bidir": 300}[label]
         )
         flags = flags + ["--cport", str(port)]
+        before = cpu_snapshot()
         result = run(
             ["iperf3", "-c", address, "-P", args.streams, "-t", args.duration, "--json"]
             + flags,
             check=False,
             timeout=args.duration + 15,
+        )
+        usage = cpu_usage(before, cpu_snapshot())
+        (args.output / (label + "-cpu.json")).write_text(
+            json.dumps(usage, indent=2) + "\n"
         )
         (args.output / (label + ".json")).write_text(result.stdout)
         if result.returncode:
