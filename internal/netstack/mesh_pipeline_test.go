@@ -3,12 +3,13 @@ package netstack
 import (
 	"bytes"
 	"errors"
+	"net/netip"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/tailscale/wireguard-go/tun"
 )
 
 type recordedWrite struct {
@@ -23,7 +24,7 @@ type recordingDevice struct {
 }
 
 func (d *recordingDevice) File() *os.File { return nil }
-func (d *recordingDevice) Read([][]byte, []int, int) (int, error) {
+func (d *recordingDevice) Read([]byte, []tun.ReadPacket) (int, error) {
 	return 0, errors.New("not implemented")
 }
 func (d *recordingDevice) Write(bufs [][]byte, offset int) (int, error) {
@@ -44,6 +45,94 @@ func (d *recordingDevice) Name() (string, error)    { return "test0", nil }
 func (d *recordingDevice) Events() <-chan tun.Event { return d.events }
 func (d *recordingDevice) Close() error             { return nil }
 func (d *recordingDevice) BatchSize() int           { return 128 }
+
+type recordingMultiQueueDevice struct {
+	*recordingDevice
+	devices []*recordingDevice
+}
+
+func (d *recordingMultiQueueDevice) Queues() []tun.Queue {
+	queues := make([]tun.Queue, len(d.devices))
+	for i, device := range d.devices {
+		queues[i] = device
+	}
+	return queues
+}
+
+func (d *recordingMultiQueueDevice) WriteTo(lane int, bufs [][]byte, offset int) (int, error) {
+	return d.devices[lane].Write(bufs, offset)
+}
+
+type scriptedReadDevice struct {
+	read func([]byte, []tun.ReadPacket) (int, error)
+}
+
+func (*scriptedReadDevice) File() *os.File { return nil }
+func (d *scriptedReadDevice) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
+	return d.read(slab, packets)
+}
+
+func TestOutboundReaderUsesSlabOffsetsAndProcessesPartialReads(t *testing.T) {
+	want := [][]byte{ipv6TCPPacket(40000, 5201, 1), ipv6TCPPacket(40000, 5201, 2)}
+	sent := make(chan [][]byte, 1)
+	peer := NewPeerReserved("peer", func(int) (BatchSealer, error) {
+		return func(raw [][]byte, _ []byte, _ [][]byte) ([][]byte, error) {
+			out := make([][]byte, len(raw))
+			for i := range raw {
+				out[i] = bytes.Clone(raw[i])
+			}
+			return out, nil
+		}, nil
+	}, func(raw [][]byte) error {
+		copyOfBatch := make([][]byte, len(raw))
+		for i := range raw {
+			copyOfBatch[i] = bytes.Clone(raw[i])
+		}
+		sent <- copyOfBatch
+		return nil
+	})
+	t.Cleanup(peer.Close)
+	reads := 0
+	dev := &scriptedReadDevice{read: func(slab []byte, packets []tun.ReadPacket) (int, error) {
+		reads++
+		if reads > 1 {
+			return 0, os.ErrClosed
+		}
+		offset := tun.ReadPacketSpacing
+		for i, packet := range want {
+			copy(slab[offset:], packet)
+			packets[i] = tun.ReadPacket{Offset: offset, Size: len(packet)}
+			offset += len(packet) + tun.ReadPacketSpacing
+		}
+		return len(want), tun.ErrTooManySegments
+	}}
+	m := &Mesh{
+		Routes: NewRouteTable(), closed: make(chan struct{}),
+		outboundJobs: make(chan *outboundBatch, 2), outboundFree: make(chan *outboundBatch, 2),
+	}
+	m.Routes.Set(netip.MustParsePrefix("::/0"), netip.MustParsePrefix("::/0"), peer)
+	for range cap(m.outboundFree) {
+		m.outboundFree <- m.newOutboundBatch(len(want))
+	}
+	m.outboundWorkerWG.Add(1)
+	go m.outboundWorker()
+	m.outboundReaderWG.Add(1)
+	go m.outboundReader(dev)
+	t.Cleanup(m.Close)
+	select {
+	case got := <-sent:
+		if len(got) != len(want) {
+			t.Fatalf("sent %d packets, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if !bytes.Equal(got[i], want[i]) {
+				t.Fatalf("packet %d = %v, want %v", i, got[i], want[i])
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("partial TUN read did not reach the sender")
+	}
+}
 
 func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T) {
 	started := make(chan byte, 2)
@@ -92,7 +181,6 @@ func TestOutboundWorkersEncryptOneQueueInParallelAndTransmitInOrder(t *testing.T
 		b := &outboundBatch{
 			n:         1,
 			bufs:      [][]byte{{marker}},
-			sizes:     []int{1},
 			peers:     []*Peer{peer},
 			headers:   []byte{0},
 			counts:    map[*Peer]int{peer: 1},
@@ -246,13 +334,14 @@ func TestReservedSenderMergesReadyBatchesAndCompletesEveryTicket(t *testing.T) {
 	}
 }
 
-func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
+func TestDeliverInboundBatchUsesPooledBuffersWithHeadroom(t *testing.T) {
 	dev := &recordingDevice{
 		writes: make(chan recordedWrite, 1),
 		events: make(chan tun.Event),
 	}
 	m := &Mesh{
-		devs:   []tun.Device{dev},
+		dev:    dev,
+		queues: tun.QueuesOf(dev),
 		closed: make(chan struct{}),
 	}
 
@@ -271,8 +360,8 @@ func TestDeliverInboundBatchLeavesCapacityForGRO(t *testing.T) {
 			if !bytes.Equal(got.packets[i], want[i]) {
 				t.Errorf("packet %d = %v, want %v", i, got.packets[i], want[i])
 			}
-			if got.capacity[i] < inboundPacketBufferSize {
-				t.Errorf("packet %d capacity = %d, want at least %d for GRO", i, got.capacity[i], inboundPacketBufferSize)
+			if got.capacity[i] != inboundPacketBufferSize {
+				t.Errorf("packet %d capacity = %d, want %d", i, got.capacity[i], inboundPacketBufferSize)
 			}
 		}
 	case <-time.After(time.Second):
@@ -295,16 +384,15 @@ func ipv6TCPPacket(srcPort, dstPort uint16, marker byte) []byte {
 
 func TestDeliverInboundBatchUsesFlowAffineQueues(t *testing.T) {
 	const queueCount = 8
-	devices := make([]tun.Device, queueCount)
 	recorders := make([]*recordingDevice, queueCount)
-	for i := range devices {
+	for i := range recorders {
 		recorders[i] = &recordingDevice{
 			writes: make(chan recordedWrite, 1),
 			events: make(chan tun.Event),
 		}
-		devices[i] = recorders[i]
 	}
-	m := &Mesh{devs: devices, closed: make(chan struct{})}
+	dev := &recordingMultiQueueDevice{recordingDevice: recorders[0], devices: recorders}
+	m := &Mesh{dev: dev, queues: tun.QueuesOf(dev), closed: make(chan struct{})}
 	m.startInboundWriters()
 	t.Cleanup(m.Close)
 

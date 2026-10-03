@@ -14,6 +14,7 @@ package netstack
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
@@ -22,18 +23,19 @@ import (
 
 	"github.com/NickCao/ranet-lite/esp"
 	"github.com/NickCao/ranet-lite/internal/packet"
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/tailscale/wireguard-go/tun"
 )
 
 const DefaultMTU = 1400 // leaves room for outer IP/UDP/ESP overhead under a 1500-byte link MTU
 
 const (
-	outboundPacketBufferSize = 2048
-	inboundWriteBatchSize    = 128
-	inboundWriteQueueSize    = 64
-	// inboundPacketBufferSize leaves enough tail capacity for the TUN
-	// backend to merge adjacent TCP packets into a single GSO frame before
-	// writing it. Exact-capacity packet buffers silently disable that GRO.
+	// Match wireguard-go's batching slab: room for a 64 KiB GSO read plus
+	// the headers and spacing added when it is split into individual packets.
+	outboundSlabSize      = 2 * (1<<16 - 1)
+	inboundWriteBatchSize = 128
+	inboundWriteQueueSize = 64
+	// Preserve the original receive-pool capacity for throughput. The initial
+	// fork migration with 2 KiB buffers regressed in the NixOS comparison.
 	inboundPacketBufferSize = writeOffset + 65535
 )
 
@@ -41,13 +43,9 @@ var (
 	inboundPacketPool = sync.Pool{New: func() any { return make([]byte, inboundPacketBufferSize) }}
 )
 
-// writeOffset is how much leading space Device.Write needs in each buffer
-// to prepend its virtio-net header (the tun package always requests
-// IFF_VNET_HDR) — the same offset wireguard-go's own device code uses
-// (device.MessageTransportOffsetContent) for exactly this reason. Passing
-// offset 0 doesn't just lose performance, it fails outright: Write()
-// computes offset-virtioNetHdrLen internally and slices from there, so a
-// too-small offset is an out-of-range slice.
+// writeOffset supplies the headroom required by the platform TUN backends.
+// Linux emits its virtio header as a separate writev fragment, but still
+// requires an offset of at least the header's length.
 const writeOffset = 16
 
 type Mesh struct {
@@ -58,8 +56,8 @@ type Mesh struct {
 	// name exactly.
 	Name string
 
-	devs               []tun.Device
-	outboundBufferSize int
+	dev                tun.Device
+	queues             []tun.Queue
 	outboundJobs       chan *outboundBatch
 	outboundFree       chan *outboundBatch
 	outboundDispatchMu sync.Mutex
@@ -80,8 +78,9 @@ type Mesh struct {
 // queue (and to whatever flows the kernel happened to hash onto that queue).
 type outboundBatch struct {
 	n         int
+	slab      []byte
+	packets   []tun.ReadPacket
 	bufs      [][]byte
-	sizes     []int
 	peers     []*Peer
 	headers   []byte
 	counts    map[*Peer]int
@@ -106,37 +105,25 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 		name = "ranet%d"
 	}
 	queueCount := max(1, runtime.GOMAXPROCS(0))
-	devs, actualName, err := createTUNQueues(name, mtu, queueCount)
-	if err != nil && queueCount == 1 {
-		// A pre-existing single-queue TUN rejects an IFF_MULTI_QUEUE attach.
-		// Preserve the single-core compatibility path while new interfaces and
-		// multicore processes use the scalable multiqueue setup.
-		var dev tun.Device
-		dev, err = tun.CreateTUN(name, mtu)
-		if err == nil {
-			actualName, err = dev.Name()
-			if err == nil {
-				devs = []tun.Device{dev}
-			} else {
-				_ = dev.Close()
-			}
-		}
-	}
+	dev, err := createTUN(name, mtu, queueCount)
 	if err != nil {
 		return nil, fmt.Errorf("netstack: create tun device: %w", err)
 	}
+	actualName, err := dev.Name()
+	if err != nil {
+		_ = dev.Close()
+		return nil, fmt.Errorf("netstack: get tun device name: %w", err)
+	}
 	if err := bringTUNUp(actualName); err != nil {
-		for _, dev := range devs {
-			_ = dev.Close()
-		}
+		_ = dev.Close()
 		return nil, fmt.Errorf("netstack: bring tun device up: %w", err)
 	}
 	m := &Mesh{
-		Routes:             NewRouteTable(),
-		Name:               actualName,
-		devs:               devs,
-		outboundBufferSize: max(mtu, outboundPacketBufferSize),
-		closed:             make(chan struct{}),
+		Routes: NewRouteTable(),
+		Name:   actualName,
+		dev:    dev,
+		queues: tun.QueuesOf(dev),
+		closed: make(chan struct{}),
 	}
 	m.startInboundWriters()
 	m.startOutboundPipeline()
@@ -144,16 +131,13 @@ func NewNamed(mtu int, name string) (*Mesh, error) {
 }
 
 // QueueCount reports the number of independent TUN I/O lanes.
-func (m *Mesh) QueueCount() int { return len(m.devs) }
+func (m *Mesh) QueueCount() int { return len(m.queues) }
 
 func (m *Mesh) startOutboundPipeline() {
 	workers := max(1, runtime.GOMAXPROCS(0))
 	m.outboundJobs = make(chan *outboundBatch, 2*workers)
-	batchSize := 1
-	for _, dev := range m.devs {
-		batchSize = max(batchSize, dev.BatchSize())
-	}
-	m.outboundFree = make(chan *outboundBatch, cap(m.outboundJobs)+len(m.devs))
+	batchSize := m.dev.BatchSize()
+	m.outboundFree = make(chan *outboundBatch, cap(m.outboundJobs)+len(m.queues))
 	for range cap(m.outboundFree) {
 		m.outboundFree <- m.newOutboundBatch(batchSize)
 	}
@@ -161,24 +145,22 @@ func (m *Mesh) startOutboundPipeline() {
 		m.outboundWorkerWG.Add(1)
 		go m.outboundWorker()
 	}
-	for _, dev := range m.devs {
+	for _, queue := range m.queues {
 		m.outboundReaderWG.Add(1)
-		go m.outboundReader(dev)
+		go m.outboundReader(queue)
 	}
 }
 
 func (m *Mesh) newOutboundBatch(size int) *outboundBatch {
 	b := &outboundBatch{
+		slab:      make([]byte, outboundSlabSize),
+		packets:   make([]tun.ReadPacket, size),
 		bufs:      make([][]byte, size),
-		sizes:     make([]int, size),
 		peers:     make([]*Peer, size),
 		headers:   make([]byte, size),
 		counts:    make(map[*Peer]int),
 		batches:   make(map[*Peer]*peerBatch),
 		peerOrder: make([]*Peer, 0, size),
-	}
-	for i := range b.bufs {
-		b.bufs[i] = make([]byte, m.outboundBufferSize)
 	}
 	return b
 }
@@ -186,7 +168,7 @@ func (m *Mesh) newOutboundBatch(size int) *outboundBatch {
 // outboundReader only reads and classifies packets. Reserving each peer's ESP
 // sequence range here fixes the order before independently scheduled workers
 // encrypt later batches, so the ordered sender can restore per-flow FIFO.
-func (m *Mesh) outboundReader(dev tun.Device) {
+func (m *Mesh) outboundReader(queue tun.Queue) {
 	defer m.outboundReaderWG.Done()
 	for {
 		var b *outboundBatch
@@ -195,13 +177,20 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 		case <-m.closed:
 			return
 		}
-		n, err := dev.Read(b.bufs, b.sizes, 0)
+		n, err := queue.Read(b.slab, b.packets)
 		if err != nil {
-			return // device closed
+			select {
+			case <-m.closed:
+				return
+			default:
+				log.Printf("netstack: read from tun device: %v", err)
+			}
 		}
 		b.n = n
 		for i := 0; i < n; i++ {
-			raw := b.bufs[i][:b.sizes[i]]
+			meta := b.packets[i]
+			raw := b.slab[meta.Offset : meta.Offset+meta.Size : meta.Offset+meta.Size]
+			b.bufs[i] = raw
 			if src, dst, nh, ok := addrsOf(raw); ok {
 				if peer, ok := m.Routes.Lookup(src, dst); ok {
 					b.peers[i], b.headers[i] = peer, nh
@@ -215,9 +204,14 @@ func (m *Mesh) outboundReader(dev tun.Device) {
 		if len(b.peerOrder) == 0 {
 			b.reset()
 			m.outboundFree <- b
-			continue
+		} else {
+			m.dispatchOutbound(b)
 		}
-		m.dispatchOutbound(b)
+		// Read's populated entries remain valid on error. Segment overflow
+		// drops only the tail; other errors stop this reader after its batch.
+		if err != nil && !errors.Is(err, tun.ErrTooManySegments) {
+			return
+		}
 	}
 }
 
@@ -241,7 +235,7 @@ func (m *Mesh) outboundWorker() {
 	for b := range m.outboundJobs {
 		for i := 0; i < b.n; i++ {
 			if peer := b.peers[i]; peer != nil {
-				b.batches[peer].append(b.bufs[i][:b.sizes[i]], b.headers[i])
+				b.batches[peer].append(b.bufs[i], b.headers[i])
 			}
 		}
 		for _, peer := range b.peerOrder {
@@ -260,7 +254,7 @@ func (m *Mesh) outboundWorker() {
 func (b *outboundBatch) reset() {
 	for i := 0; i < b.n; i++ {
 		b.peers[i] = nil
-		b.sizes[i] = 0
+		b.bufs[i] = nil
 	}
 	b.n = 0
 	clear(b.counts)
@@ -294,8 +288,8 @@ func (m *Mesh) DeliverInbound(raw []byte) {
 // packets. On a multiqueue TUN, packets are assigned by their inner flow to a
 // persistent writer lane. That preserves each flow's packet order and lets the
 // kernel process unrelated streams in parallel. Buffers are copied to leave
-// the headroom and tail capacity required by the TUN backend's virtio/GRO
-// implementation.
+// the headroom required by the platform TUN backend. Linux GRO gathers
+// fragments directly from these packet-sized buffers without repacking them.
 func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	if len(raw) == 0 {
 		return
@@ -308,7 +302,7 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 	m.deliveryWG.Add(1)
 	m.deliveryMu.Unlock()
 	defer m.deliveryWG.Done()
-	if len(m.devs) == 1 {
+	if len(m.queues) == 1 {
 		for len(raw) != 0 {
 			n := min(len(raw), inboundWriteBatchSize)
 			m.writeInbound(0, copyInboundPackets(raw[:n]))
@@ -317,9 +311,9 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 		return
 	}
 
-	groups := make([][][]byte, len(m.devs))
+	groups := make([][][]byte, len(m.queues))
 	for _, packet := range raw {
-		lane := int(innerFlowHash(packet) % uint64(len(m.devs)))
+		lane := int(innerFlowHash(packet) % uint64(len(m.queues)))
 		groups[lane] = append(groups[lane], packet)
 	}
 	for lane, packets := range groups {
@@ -339,11 +333,11 @@ func (m *Mesh) DeliverInboundBatch(raw [][]byte) {
 }
 
 func (m *Mesh) startInboundWriters() {
-	if len(m.devs) <= 1 {
+	if len(m.queues) <= 1 {
 		return
 	}
-	m.inboundWriters = make([]chan inboundWriteBatch, len(m.devs))
-	for lane := range m.devs {
+	m.inboundWriters = make([]chan inboundWriteBatch, len(m.queues))
+	for lane := range m.queues {
 		queue := make(chan inboundWriteBatch, inboundWriteQueueSize)
 		m.inboundWriters[lane] = queue
 		m.writerWG.Add(1)
@@ -414,7 +408,7 @@ func releaseInboundPackets(bufs [][]byte) {
 }
 
 func (m *Mesh) writeInbound(lane int, bufs [][]byte) {
-	if _, err := m.devs[lane].Write(bufs, writeOffset); err != nil {
+	if _, err := tun.WriteToOf(m.dev)(lane, bufs, writeOffset); err != nil {
 		select {
 		case <-m.closed:
 		default:
@@ -478,8 +472,8 @@ func (m *Mesh) Close() {
 		m.closing = true
 		close(m.closed)
 		m.deliveryMu.Unlock()
-		for _, dev := range m.devs {
-			_ = dev.Close()
+		if m.dev != nil {
+			_ = m.dev.Close()
 		}
 		m.outboundReaderWG.Wait()
 		if m.outboundJobs != nil {

@@ -71,6 +71,14 @@ its `[Tun]` section). Single-core processes can also attach to a legacy
 single-queue TUN. TUN readers hand bounded batches to shared encryption workers;
 sequence reservation and queue submission preserve packet order across workers.
 
+The TUN backend uses a pinned revision of the
+[Tailscale wireguard-go fork](https://github.com/tailscale/wireguard-go/tree/tailscale).
+Its native multiqueue API owns the descriptors and offload state. TUN readers
+retain packet views inside reusable 128 KiB slabs until encryption finishes,
+and Linux GRO writes gather packet fragments with `writev`. The inbound packet
+pool retains its original 64 KiB capacity. Repeated NixOS VM comparisons with
+matching inbound buffers showed near parity.
+
 The Babel control state and forwarding publication share one mutex. A stub
 selects the cheapest live candidate without a feasibility/source table, as
 permitted by [RFC 8966 Appendix E](https://www.rfc-editor.org/rfc/rfc8966.html#appendix-E).
@@ -262,10 +270,10 @@ either; only synthetic fixtures belong in version control (see
 ## Testing
 
 ```sh
-go test ./... -race
+nix build .#checks.x86_64-linux.unit --no-link -L
 ```
 
-None of the unit tests require root or any privileged resource. Protocol-level
+The full race-test suite runs inside a sandboxed Nix builder. Protocol-level
 interoperability is covered by the NixOS VM test exposed by `flake.nix`. It
 boots separate client and gateway VMs; the client runs the packaged,
 user-facing `ranet-lite` binary with a real TUN device, while the gateway runs
@@ -293,29 +301,27 @@ The kernel profiler runs as root inside the disposable VM. It does not require
 host root or changes to the host's profiling permissions. Profiles are copied
 into the test result.
 
-`nix build .#namespace-profile --no-link -L` runs the namespace harness below
-inside one six-core VM and captures a system-wide kernel profile. This keeps
-the veth topology used by host measurements and avoids the virtual switch
-between integration-test VMs; the guest's CPU and clock still affect results.
+`nix build .#namespace-profile --no-link -L` runs the namespace harness
+inside one six-core VM and captures a system-wide kernel profile. Its private
+veth topology avoids the virtual switch between integration-test VMs; the
+guest's CPU and clock still affect results. Run project binaries, tests,
+benchmarks, and profilers inside Nix builders or NixOS test VMs.
 
-For measurements without VM overhead, use the namespace harness:
+For comparisons between versions, [nixos-throughput.nix](integration/nixos-throughput.nix)
+accepts two Nix-built client packages and runs them sequentially in one VM,
+alternating their order across trials. It disables profilers and reports
+received TCP throughput, including simultaneous traffic in both directions,
+alongside a plain veth control. Each run and the summary remain in the Nix
+test result.
 
-```sh
-nix develop -c go build -o /tmp/ranet-bench ./cmd/ranet-lite
-nix develop -c unshare --user --map-root-user --mount --net \
-  python3 integration/performance.py --client /tmp/ranet-bench \
-  --output /tmp/ranet-perf-6 --cores 6 --affinity 0-5 \
-  --directions outbound,inbound,bidir
-```
-
-Run as an ordinary user with unprivileged user namespaces available. The
-harness creates private client/gateway network namespaces, a private `/run`,
-strongSwan, BIRD, and a real TUN/XFRM tunnel using the synthetic test keys. It
+Inside the VM, the harness creates private client/gateway network namespaces,
+a private `/run`, strongSwan, BIRD, and a real TUN/XFRM tunnel using the synthetic
+test keys. It
 records binary identity, CPU affinity, iperf3 JSON, CPU profiles, socket drops,
 TCP state, TUN queue statistics, and key-free XFRM counters in a new output
 directory. Each `*-cpu.json` records user/system CPU seconds and average cores
-used by the client and gateway processes, plus host CPU counters including
-softirq time. Host counters include other activity on the machine; process
+used by the client and gateway processes, plus VM CPU counters including
+softirq time. These counters include other activity in the VM; process
 accounting and sampled profiles provide separate views of CPU use. All processes
 and interfaces are removed when the namespaces exit.
 
@@ -326,7 +332,7 @@ versions. The default gateway replay window is strongSwan's 32 packets;
 `--replay-window 4096` can distinguish replay drops from processing limits.
 `--protocol udp --rate 10` offers an aggregate 10 Gbit/s per direction with
 UDP GSO/GRO and 4 MiB iperf socket buffers; inspect received throughput and loss,
-not just the offered rate. The Nix development shell uses the
+not just the offered rate. The NixOS performance VM uses the
 `iperf3-benchmark` package, which changes
 [iperf 3.21's GRO receive call](https://github.com/esnet/iperf/blob/3.21/src/net.c#L521-L595) to block
 instead of busy-polling. With the upstream receive loop, eight bidirectional
@@ -334,30 +340,18 @@ streams can occupy every CPU even when waiting for packets, starving the
 tunnel on a shared host. The harness records the exact iperf executable and
 version along with the client binary identity. TCP behavior is unchanged.
 
-Raw ESP encryption and decryption have separate benchmarks:
-
-```sh
-nix develop -c go test ./esp -run '^$' -bench 'BenchmarkESP' \
-  -benchmem -cpu=1,2,4,8 -count=5
-```
-
-These include ESP framing, AEAD, sequence reservation or replay commits, and
-reusable batch buffers. Decryption also includes copying the input
+Raw ESP encryption and decryption have separate benchmarks in
+[benchmark_test.go](esp/benchmark_test.go). These include ESP framing, AEAD,
+sequence reservation or replay commits, and reusable batch buffers. Decryption
+also includes copying the input
 ciphertext into reusable buffers. They exclude UDP, TUN, and the client queues;
 cipher throughput cannot establish full-duplex tunnel throughput. Namespace
 measurements share CPU resources with the Linux gateway and traffic generators
 and do not establish performance on a physical NIC.
 
-To compare routing and packet classification across CPU counts:
-
-```sh
-go test ./sadr ./internal/babel -run '^$' \
-  -bench 'BenchmarkLookup|BenchmarkRouteChange|BenchmarkReceiveData' \
-  -benchmem -cpu=1,2,4,8 -count=5
-```
-
-Compare runs on the same idle host. Lookup throughput, route-update cost, and
-full-tunnel TCP bandwidth measure different work; VM throughput also includes
+Routing and packet classification also have microbenchmarks. Lookup
+throughput, route-update cost, and full-tunnel TCP bandwidth measure different
+work; VM throughput also includes
 the gateway's kernel IPsec and virtual networking overhead.
 
 Immutable snapshots favor packet lookups over route-write latency. Each changed

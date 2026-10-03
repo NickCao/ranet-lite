@@ -2,7 +2,7 @@
 
 package transport
 
-import "golang.zx2c4.com/wireguard/conn"
+import "github.com/tailscale/wireguard-go/conn"
 
 type portableBind struct{ conn.Bind }
 type portableEndpoint struct{ conn.Endpoint }
@@ -15,7 +15,7 @@ func (b *portableBind) ParseEndpoint(s string) (Endpoint, error) {
 }
 
 func (b *portableBind) Send(packets [][]byte, endpoint Endpoint) error {
-	return b.Bind.Send(packets, endpoint.(*portableEndpoint).Endpoint)
+	return b.Bind.Send(packets, endpoint.(*portableEndpoint).Endpoint, 0)
 }
 
 func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
@@ -27,16 +27,13 @@ func openPacketBind(port uint16) (packetBind, []receiveFunc, uint16, error) {
 	var receivers []receiveFunc
 	for _, fn := range fns {
 		size := b.BatchSize()
-		eps := make([]conn.Endpoint, size)
+		slab := make([]byte, readBufferSize*size)
+		packets := make([]conn.ReceivedPacket, size)
 		receivers = append(receivers, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
-			for i := range size {
-				if bufs[i] == nil {
-					bufs[i] = make([]byte, readBufferSize)
-				}
-			}
-			n, err := fn(bufs[:size], sizes[:size], eps)
+			n, err := fn(slab, packets)
 			for i := range n {
-				endpoints[i] = &portableEndpoint{eps[i]}
+				bufs[i], sizes[i] = packets[i].Bytes(slab), packets[i].Size
+				endpoints[i] = &portableEndpoint{packets[i].Endpoint}
 			}
 			return n, err
 		})

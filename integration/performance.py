@@ -25,6 +25,9 @@ parser.add_argument("--cores", type=int, default=6)
 parser.add_argument("--duration", type=int, default=15)
 parser.add_argument("--streams", type=int, default=8)
 parser.add_argument("--directions", default="bidir")
+parser.add_argument(
+    "--no-profile", action="store_true", help="disable CPU profiles and mid-run state sampling"
+)
 parser.add_argument("--gro", choices=["on", "off"])
 parser.add_argument("--delay", default=None)
 parser.add_argument("--protocol", choices=["tcp", "udp"], default="tcp")
@@ -591,7 +594,7 @@ babel:
         flags = {"bidir": ["--bidir"], "outbound": [], "inbound": ["--reverse"]}[
             direction
         ]
-        traffic(direction, "fd00:99::1", flags, collect_profile=True)
+        traffic(direction, "fd00:99::1", flags, collect_profile=not args.no_profile)
     (args.output / "xfrm-state.txt").write_text(
         run(["ip", "-s", "xfrm", "state", "list", "nokeys"], gateway=True).stdout
     )

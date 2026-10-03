@@ -13,7 +13,7 @@
         pname = "ranet-lite";
         version = "0.1.0";
         src = ./.;
-        vendorHash = "sha256-3FRdONnzY53jXsC7j6Ig6BwjCF09Qn2PZxnqXzAYoBY=";
+        vendorHash = "sha256-29o8/jPaEReTYPKrNTjIHoeRfxjcMrvLwXm3oVprW6w=";
         subPackages = [ "cmd/ranet-lite" ];
       };
       integration =
@@ -61,6 +61,14 @@
       };
 
       checks.${system} = {
+        unit = ranet-lite.overrideAttrs {
+          name = "ranet-lite-unit-tests";
+          checkPhase = ''
+            runHook preCheck
+            go test -race ./...
+            runHook postCheck
+          '';
+        };
         integration = integration { };
         integration-multicore = integration { cores = 4; };
       };

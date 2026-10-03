@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/tun"
+	"github.com/tailscale/wireguard-go/tun"
 )
 
 func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
@@ -48,7 +48,7 @@ func TestOutboundDispatchKeepsMixedPeerReservationsTogether(t *testing.T) {
 	})
 	dispatch := func(peers []*Peer) {
 		batch := &outboundBatch{
-			n: 2, bufs: [][]byte{{1}, {2}}, sizes: []int{1, 1}, headers: []byte{0, 0}, peers: peers,
+			n: 2, bufs: [][]byte{{1}, {2}}, headers: []byte{0, 0}, peers: peers,
 			peerOrder: append([]*Peer(nil), peers...), counts: map[*Peer]int{a: 1, b: 1}, batches: make(map[*Peer]*peerBatch),
 		}
 		m.outboundReaderWG.Add(1)
@@ -90,7 +90,7 @@ func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
 	go func() {
 		defer m.outboundReaderWG.Done()
 		m.dispatchOutbound(&outboundBatch{
-			n: 1, bufs: [][]byte{{1}}, sizes: []int{1}, headers: []byte{0}, peers: []*Peer{peer},
+			n: 1, bufs: [][]byte{{1}}, headers: []byte{0}, peers: []*Peer{peer},
 			peerOrder: []*Peer{peer}, counts: map[*Peer]int{peer: 1}, batches: make(map[*Peer]*peerBatch),
 		})
 	}()
@@ -110,7 +110,7 @@ func TestMeshCloseCancelsReservationsAndDrainsQueuedTickets(t *testing.T) {
 
 func TestSingleQueueInboundSplitsLargeBatches(t *testing.T) {
 	dev := &recordingDevice{writes: make(chan recordedWrite, 2)}
-	m := &Mesh{devs: []tun.Device{dev}, closed: make(chan struct{})}
+	m := &Mesh{dev: dev, queues: tun.QueuesOf(dev), closed: make(chan struct{})}
 	packets := make([][]byte, inboundWriteBatchSize+1)
 	for i := range packets {
 		packets[i] = []byte{byte(i)}
